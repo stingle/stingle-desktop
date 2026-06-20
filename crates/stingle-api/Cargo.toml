@@ -1,0 +1,21 @@
+[package]
+name = "stingle-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Typed client for the api.stingle.org v2 server."
+
+[dependencies]
+stingle-crypto = { path = "../stingle-crypto" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+base64.workspace = true
+hex.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }

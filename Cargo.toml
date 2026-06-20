@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/stingle-crypto",
+    "crates/stingle-api",
+    "crates/stingle-db",
+    "crates/stingle-core",
+    "app/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+authors = ["Stingle Photos Desktop contributors"]
+rust-version = "1.77"
+
+[workspace.dependencies]
+# Crypto: the REAL libsodium, built from source. Never swap for a reimplementation —
+# byte-exact Argon2/KDF/AEAD behavior is required for compatibility with existing accounts/files.
+libsodium-sys-stable = "1.22"
+zeroize = "1.8"
+
+# Async / networking
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Media / platform
+image = "0.25"
+dirs = "5"
+
+# Encoding / errors / logging
+base64 = "0.22"
+hex = "0.4"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,26 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Node / Vite (UI, added later)
+node_modules/
+dist/
+.vite/
+
+# Tauri build output (added later)
+/src-tauri/target
+
+# Local secrets / fixtures that must never be committed
+tests/fixtures/*.private
+*.key
+.env
+.env.local
+.live_account.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

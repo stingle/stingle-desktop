@@ -1,0 +1,26 @@
+[package]
+name = "stingle-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Session, sync, import, takeout and sharing — ties crypto + api + db together."
+
+[dependencies]
+stingle-crypto = { path = "../stingle-crypto" }
+stingle-api = { path = "../stingle-api" }
+stingle-db = { path = "../stingle-db" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+base64.workspace = true
+hex.workspace = true
+tracing.workspace = true
+image.workspace = true
+dirs.workspace = true
+ffmpeg-sidecar = "2"
+futures = "0.3"
+
+[dev-dependencies]
