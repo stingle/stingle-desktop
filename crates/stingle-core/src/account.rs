@@ -194,6 +194,33 @@ impl Account {
         })
     }
 
+    /// Rebuild a live session at a new storage base dir, reusing the already
+    /// in-memory `info`/`keypair` (no password, no server round-trip). The
+    /// caller must have moved the on-disk files to `new_base` first. Used by
+    /// "change storage location" so the user is not logged out by the move.
+    pub fn reopen_at(
+        new_base: &Path,
+        info: AccountInfo,
+        keypair: KeyPair,
+        server_pk: Vec<u8>,
+    ) -> Result<Account> {
+        let key = account_key(&info.server_url, &info.email);
+        let paths = AccountPaths::new(new_base, &key);
+        paths.ensure()?;
+        let client = Client::new(Some(&info.server_url))?;
+        let db = Db::open(paths.db_file())?;
+        Ok(Account {
+            client,
+            db,
+            paths,
+            info,
+            server_pk,
+            keypair,
+            download_sem: tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS),
+            last_cache_check_ms: std::sync::atomic::AtomicI64::new(0),
+        })
+    }
+
     /// List locally-known accounts (their account-key directories).
     pub fn list_local(base_dir: &Path) -> Vec<(String, AccountInfo)> {
         let mut out = Vec::new();

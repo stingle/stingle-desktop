@@ -17,12 +17,31 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-autostart = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-drag = "2"
 
 stingle-core = { path = "../../crates/stingle-core" }
+stingle-crypto = { path = "../../crates/stingle-crypto" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 base64 = "0.22"
+dirs = "5"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+# Auto-unlock secure key storage, gated behind a biometric prompt.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Foundation",
+    "Security_Credentials",
+    "Security_Credentials_UI",
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_UI_Shell",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"

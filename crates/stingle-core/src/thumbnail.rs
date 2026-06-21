@@ -7,6 +7,7 @@
 use std::io::{Cursor, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Once;
 
 use image::imageops::FilterType;
@@ -33,11 +34,24 @@ static mut FFMPEG_OK: bool = false;
 /// Ensure an ffmpeg binary is available (downloads a managed copy on first use).
 fn ensure_ffmpeg() -> bool {
     FFMPEG_INIT.call_once(|| {
-        let ok = ffmpeg_sidecar::download::auto_download().is_ok();
+        let ok = install_ffmpeg().is_ok();
         // SAFETY: written exactly once inside call_once.
         unsafe { FFMPEG_OK = ok };
     });
     unsafe { FFMPEG_OK }
+}
+
+/// Install ffmpeg if needed (ffmpeg-sidecar's managed "essentials" build, which
+/// does decode HEIC/HEIF — see [`transcode_to_jpeg`] for the seekable-input
+/// caveat).
+fn install_ffmpeg() -> Result<()> {
+    ffmpeg_sidecar::download::auto_download().map_err(|e| CoreError::Other(e.to_string()))
+}
+
+/// Pre-install the media toolchain (ffmpeg) on a background thread at startup so
+/// the first HEIC preview/copy or video frame-grab doesn't stall on the download.
+pub fn prepare_media_tools() {
+    let _ = ensure_ffmpeg();
 }
 
 fn ffmpeg_path() -> Result<std::path::PathBuf> {
@@ -92,13 +106,39 @@ pub fn video_thumbnail(path: &Path) -> Result<Vec<u8>> {
     image_thumbnail(&frame)
 }
 
+static XCODE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Temp dir for the short-lived seekable input used by [`transcode_to_jpeg`].
+pub fn transcode_temp_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("stingle-xcode")
+}
+
 /// Transcode an in-memory image the webview can't render (HEIC/HEIF/TIFF) into a
-/// JPEG for full-screen preview. Pure stdin→stdout; nothing hits the disk.
-pub fn transcode_to_jpeg(bytes: &[u8], _ext: &str) -> Result<Vec<u8>> {
-    run_ffmpeg(
-        &["-i", "pipe:0", "-frames:v", "1", "-q:v", "3", "-f", "mjpeg", "pipe:1"],
-        Some(bytes.to_vec()),
-    )
+/// JPEG for full-screen preview / clipboard copy.
+///
+/// SECURITY NOTE: unlike video frame-grabs, this cannot use a stdin pipe.
+/// iPhone HEICs are "grid" (tiled) images and ffmpeg can only assemble the grid
+/// from a SEEKABLE input — a pipe fails with "grid box with non seekable input".
+/// There is no in-memory seekable input for the ffmpeg CLI, so we write the
+/// (already-decrypted) bytes to a temp file for the single transcode call and
+/// delete it immediately afterwards (on success or error). Output still streams
+/// over stdout — only the input briefly touches disk.
+pub fn transcode_to_jpeg(bytes: &[u8], ext: &str) -> Result<Vec<u8>> {
+    let dir = transcode_temp_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| CoreError::Other(format!("temp dir: {e}")))?;
+    let safe_ext = if ext.is_empty() { "bin" } else { ext };
+    let seq = XCODE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let in_path = dir.join(format!("x_{}_{}.{}", std::process::id(), seq, safe_ext));
+    std::fs::write(&in_path, bytes).map_err(|e| CoreError::Other(format!("temp write: {e}")))?;
+
+    let in_str = in_path.to_string_lossy().to_string();
+    let result = run_ffmpeg(
+        &["-y", "-i", &in_str, "-frames:v", "1", "-q:v", "3", "-f", "mjpeg", "pipe:1"],
+        None,
+    );
+    // Always remove the decrypted input, success or failure.
+    let _ = std::fs::remove_file(&in_path);
+    result
 }
 
 /// A simple solid placeholder thumbnail (fallback when no frame can be grabbed).

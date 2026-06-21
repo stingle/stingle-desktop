@@ -148,6 +148,80 @@ impl Account {
         self.import_files(&files, set, album_id).await
     }
 
+    /// Import already-decoded image bytes (e.g. pasted from the clipboard).
+    /// Always treated as a photo. Deduped by content hash, so pasting the same
+    /// image twice is a no-op. Returns the generated filename, or `None`.
+    pub async fn import_bytes(
+        &self,
+        data: &[u8],
+        orig_name: &str,
+        set: FileSet,
+        album_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let dest = album_id.unwrap_or("gallery");
+        let content = hex::encode(sodium::sha256(data)?);
+        let key = format!("{}|{}|{}", content, set.id(), dest);
+        let media_id = hex::encode(sodium::sha256(key.as_bytes())?);
+        if self.db.is_imported(&media_id)? {
+            return Ok(None);
+        }
+
+        let file_type = FILE_TYPE_PHOTO;
+        let thumb_plain =
+            thumbnail::image_thumbnail(data).or_else(|_| thumbnail::placeholder_thumbnail())?;
+        let file_id = file::new_file_id()?;
+        let target_pk = self.target_public_key(set, album_id)?;
+        let (sp_file, _) =
+            file::encrypt_bytes(data, orig_name, file_type, file_id.clone(), 0, &target_pk)?;
+        let (sp_thumb, _) =
+            file::encrypt_bytes(&thumb_plain, orig_name, file_type, file_id, 0, &target_pk)?;
+        let headers = headers_string(&sp_file, &sp_thumb)?;
+
+        let filename = new_encrypted_filename()?;
+        std::fs::write(self.paths.original(&filename), &sp_file)?;
+        std::fs::write(self.paths.thumb(&filename), &sp_thumb)?;
+
+        let date = crate::util::now_ms();
+        let row = DbFile {
+            id: 0,
+            album_id: album_id.map(|s| s.to_string()),
+            filename: filename.clone(),
+            is_local: true,
+            is_remote: false,
+            version: 1,
+            reupload: false,
+            date_created: date,
+            date_modified: date,
+            headers,
+        };
+        if set == FileSet::Album {
+            self.db.insert_album_file(&row)?;
+        } else {
+            self.db.insert_file(set, &row)?;
+        }
+        self.db.mark_imported(&media_id)?;
+        Ok(Some(filename))
+    }
+
+    /// Import raw RGBA pixels (an image read from the clipboard) by encoding to
+    /// PNG first, then [`import_bytes`].
+    pub async fn import_rgba(
+        &self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        set: FileSet,
+        album_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let img = image::RgbaImage::from_raw(width, height, rgba.to_vec())
+            .ok_or_else(|| CoreError::Other("clipboard image has invalid dimensions".into()))?;
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .map_err(|e| CoreError::Other(format!("encode png: {e}")))?;
+        self.import_bytes(&png, "pasted.png", set, album_id).await
+    }
+
     /// The public key files are sealed to: user PK for gallery/trash, album PK
     /// for album imports.
     fn target_public_key(&self, set: FileSet, album_id: Option<&str>) -> Result<Vec<u8>> {

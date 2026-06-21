@@ -18,6 +18,7 @@ export type FileItem = {
   date_modified: number;
   is_local: boolean;
   is_remote: boolean;
+  is_video: boolean;
 };
 
 export type Album = {
@@ -91,12 +92,42 @@ export const api = {
   // File actions
   saveFiles: (set: number, albumId: string | null, filenames: string[], destDir: string) =>
     invoke<number>("save_files", { set, albumId, filenames, destDir }),
-  moveToAlbum: (set: number, albumId: string | null, filenames: string[], toAlbum: string) =>
-    invoke("move_to_album", { set, albumId, filenames, toAlbum }),
-  moveToGallery: (albumId: string, filenames: string[]) =>
-    invoke("move_to_gallery", { albumId, filenames }),
+  moveToAlbum: (set: number, albumId: string | null, filenames: string[], toAlbum: string, isMoving: boolean) =>
+    invoke("move_to_album", { set, albumId, filenames, toAlbum, isMoving }),
+  moveToGallery: (albumId: string, filenames: string[], isMoving: boolean) =>
+    invoke("move_to_gallery", { albumId, filenames, isMoving }),
   trashCtx: (set: number, albumId: string | null, filenames: string[]) =>
     invoke("trash_ctx", { set, albumId, filenames }),
+  // Login screen / returning user
+  lastAccount: () => invoke<LocalAccount | null>("last_account"),
+  forgetAccount: (accountKey: string) =>
+    invoke("forget_account", { accountKey }),
+  // Auto-unlock
+  secureStoreStatus: () => invoke<{ biometric: boolean }>("secure_store_status"),
+  isAutoUnlockEnabled: () => invoke<boolean>("is_auto_unlock_enabled"),
+  enableAutoUnlock: (password: string, allowPlaintext: boolean) =>
+    invoke<{ used_plaintext: boolean }>("enable_auto_unlock", { password, allowPlaintext }),
+  disableAutoUnlock: () => invoke("disable_auto_unlock"),
+  tryAutoUnlock: () => invoke<Session>("try_auto_unlock"),
+  // App options
+  getAutostart: () => invoke<boolean>("get_autostart"),
+  setAutostart: (enabled: boolean) => invoke("set_autostart", { enabled }),
+  getMinimizeToTray: () => invoke<boolean>("get_minimize_to_tray"),
+  setMinimizeToTray: (enabled: boolean) => invoke("set_minimize_to_tray", { enabled }),
+  getSyncEverything: () => invoke<boolean>("get_sync_everything"),
+  setSyncEverything: (enabled: boolean) => invoke("set_sync_everything", { enabled }),
+  getStoragePath: () => invoke<string>("get_storage_path"),
+  changeStoragePath: (newPath: string) => invoke("change_storage_path", { newPath }),
+  // Clipboard
+  copyFilesToClipboard: (set: number, albumId: string | null, filenames: string[]) =>
+    invoke<number>("copy_files_to_clipboard", { set, albumId, filenames }),
+  clipboardFiles: () => invoke<string[]>("clipboard_files"),
+  pasteFromClipboard: (albumId: string | null) =>
+    invoke<number>("paste_from_clipboard", { albumId }),
+  // Drag-out (decrypts to a temp file for the OS drag, cleaned up after)
+  exportForDrag: (set: number, albumId: string | null, filenames: string[]) =>
+    invoke<{ files: string[]; icon: string }>("export_for_drag", { set, albumId, filenames }),
+  cleanupDragExport: (paths: string[]) => invoke("cleanup_drag_export", { paths }),
 };
 
 /** URL for a decrypted thumbnail/original served via the `stingle://` protocol. */

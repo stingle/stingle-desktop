@@ -1,5 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import {
   api, mediaUrl, pickFiles, pickFolder,
   Session, FileItem, Album, LocalAccount,
@@ -44,20 +46,60 @@ function groupByDate(items: FileItem[]): DateGroup[] {
   return groups;
 }
 
+/** Start a native OS drag of one or more library items out to other apps
+ *  (Explorer, Telegram, …). Files are decrypted to a temp folder for the drag
+ *  and cleaned up when it ends. Returns immediately if the export fails. */
+async function nativeDragOut(set: number, albumId: string | null, filenames: string[]) {
+  if (filenames.length === 0) return;
+  try {
+    const exp = await api.exportForDrag(set, albumId, filenames);
+    const cleanup = exp.icon ? [...exp.files, exp.icon] : exp.files;
+    await startDrag(
+      { item: exp.files, icon: exp.icon, mode: "copy" },
+      () => { api.cleanupDragExport(cleanup); }
+    );
+  } catch { /* drag export failed — ignore */ }
+}
+
+/** Copy library items to the OS clipboard as real files (Explorer-style), so a
+ *  multi-select copy pastes all of them into Telegram/Explorer/etc. */
+async function copyToClipboard(
+  set: number, albumId: string | null, filenames: string[],
+  showToast?: (m: string) => void
+) {
+  if (filenames.length === 0) return;
+  try {
+    const n = await api.copyFilesToClipboard(set, albumId, filenames);
+    showToast?.(`Copied ${n} item${n === 1 ? "" : "s"} to clipboard`);
+  } catch (e) {
+    showToast?.("Copy failed: " + e);
+  }
+}
+
+/** True if a keyboard event targets a text input (so we don't hijack copy/paste). */
+function inTextField(e: KeyboardEvent): boolean {
+  const t = e.target as HTMLElement | null;
+  return !!t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+}
+
 /** A selectable photo grid: click opens; checkbox/Ctrl-click toggles; Shift-click
- *  selects a range; drag a marquee box to lasso. Optionally date-grouped. */
-function PhotoGrid({ items, set, albumId, grouped, sel, setSel, onOpen, renderExtra }: {
+ *  selects a range; drag a thumbnail to drag the file(s) out; drag from empty
+ *  space to lasso a marquee selection. Optionally date-grouped. */
+function PhotoGrid({ items, set, albumId, grouped, sel, setSel, onOpen, renderExtra, showToast }: {
   items: FileItem[]; set: number; albumId: string | null; grouped: boolean;
   sel: Set<string>; setSel: (s: Set<string>) => void;
   onOpen: (idx: number) => void;
   renderExtra?: (f: FileItem) => React.ReactNode;
+  showToast?: (m: string) => void;
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const anchorRef = useRef<number | null>(null);
   const drag = useRef<{ x: number; y: number; base: Set<string> } | null>(null);
   const last = useRef({ x: 0, y: 0 });
   const moved = useRef(false);
-  const pendingIdx = useRef(-1);     // tile under a plain press (resolved on mouseup)
+  // A plain press on a thumbnail: resolves to a click (open/toggle) on mouseup,
+  // or to a native file drag once the pointer moves past the threshold.
+  const tilePress = useRef<{ x: number; y: number; idx: number; started: boolean } | null>(null);
   const isMarquee = useRef(false);
   const raf = useRef<number | null>(null);
   const vel = useRef(0);
@@ -102,6 +144,30 @@ function PhotoGrid({ items, set, albumId, grouped, sel, setSel, onOpen, renderEx
     };
 
     const onMove = (e: MouseEvent) => {
+      // Explorer-style: a press that started on a thumbnail turns into a native
+      // file drag once the pointer moves past the threshold (never a marquee).
+      const tp = tilePress.current;
+      if (tp) {
+        if (!tp.started && Math.hypot(e.clientX - tp.x, e.clientY - tp.y) >= 6) {
+          tp.started = true;
+          tilePress.current = null;
+          const st = stateRef.current;
+          const fn = st.items[tp.idx]?.filename;
+          if (fn !== undefined) {
+            // Drag the whole selection if this tile is part of it; otherwise drag
+            // just this tile (and make it the selection, like Explorer).
+            let files: string[];
+            if (st.sel.has(fn) && st.sel.size > 0) {
+              files = [...st.sel];
+            } else {
+              files = [fn];
+              setSel(new Set([fn]));
+            }
+            nativeDragOut(set, albumId, files);
+          }
+        }
+        return;
+      }
       const d = drag.current;
       if (!d) return;
       last.current = { x: e.clientX, y: e.clientY };
@@ -119,28 +185,29 @@ function PhotoGrid({ items, set, albumId, grouped, sel, setSel, onOpen, renderEx
       applySelection();
     };
     const onUp = () => {
-      if (drag.current) {
-        // A plain press with no marquee drag = a click → open or toggle.
-        if (!isMarquee.current && pendingIdx.current >= 0) {
-          const st = stateRef.current;
-          const fn = st.items[pendingIdx.current]?.filename;
-          if (fn !== undefined) {
-            if (st.sel.size > 0) {
-              const next = new Set(st.sel);
-              next.has(fn) ? next.delete(fn) : next.add(fn);
-              setSel(next);
-            } else {
-              st.onOpen(pendingIdx.current);
-            }
-            anchorRef.current = pendingIdx.current;
+      // A press on a thumbnail that never moved = a click → open or toggle.
+      const tp = tilePress.current;
+      if (tp && !tp.started) {
+        const st = stateRef.current;
+        const fn = st.items[tp.idx]?.filename;
+        if (fn !== undefined) {
+          if (st.sel.size > 0) {
+            const next = new Set(st.sel);
+            next.has(fn) ? next.delete(fn) : next.add(fn);
+            setSel(next);
+          } else {
+            st.onOpen(tp.idx);
           }
+          anchorRef.current = tp.idx;
         }
+      }
+      tilePress.current = null;
+      if (drag.current) {
         drag.current = null;
         vel.current = 0;
         if (raf.current !== null) { cancelAnimationFrame(raf.current); raf.current = null; }
         setBox(null);
       }
-      pendingIdx.current = -1;
       isMarquee.current = false;
     };
     window.addEventListener("mousemove", onMove);
@@ -151,6 +218,19 @@ function PhotoGrid({ items, set, albumId, grouped, sel, setSel, onOpen, renderEx
       if (raf.current !== null) cancelAnimationFrame(raf.current);
     };
   }, [setSel]);
+
+  // Ctrl/Cmd+C copies the current selection to the clipboard as files.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "c") return;
+      if (inTextField(e)) return;
+      const cur = stateRef.current;
+      if (cur.sel.size === 0) return;
+      copyToClipboard(set, albumId, [...cur.sel], showToast);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [set, albumId, showToast]);
 
   const tileIndexFrom = (target: HTMLElement): number => {
     const el = target.closest("[data-fn]") as HTMLElement | null;
@@ -189,19 +269,25 @@ function PhotoGrid({ items, set, albumId, grouped, sel, setSel, onOpen, renderEx
       toggleOne(idx);
       return;
     }
-    // Plain press: begin a marquee; if it doesn't move, mouseup treats it as a click.
-    drag.current = { x: e.clientX, y: e.clientY, base: new Set() };
-    last.current = { x: e.clientX, y: e.clientY };
-    moved.current = false;
-    isMarquee.current = false;
-    pendingIdx.current = idx;
-    if (idx >= 0) anchorRef.current = idx;
+    if (idx >= 0) {
+      // Press on a thumbnail: a click, or (once it moves) a native file drag.
+      // Marquee is deliberately NOT started here — only from empty space.
+      tilePress.current = { x: e.clientX, y: e.clientY, idx, started: false };
+      anchorRef.current = idx;
+    } else {
+      // Press on empty space: begin a marquee; if it doesn't move it's a no-op.
+      drag.current = { x: e.clientX, y: e.clientY, base: new Set() };
+      last.current = { x: e.clientX, y: e.clientY };
+      moved.current = false;
+      isMarquee.current = false;
+    }
   };
 
   const Tile = (f: FileItem) => (
     <div key={f.filename} data-fn={f.filename}
       className={"tile" + (sel.has(f.filename) ? " sel" : "")}>
       <img loading="lazy" draggable={false} src={mediaUrl(set, f.filename, true, albumId)} />
+      {f.is_video && <div className="vid-badge" aria-label="Video"><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M8 5v14l11-7z" /></svg></div>}
       <div className="check">{sel.has(f.filename) ? "✓" : ""}</div>
       {sel.size === 0 && renderExtra?.(f)}
     </div>
@@ -223,11 +309,13 @@ function PhotoGrid({ items, set, albumId, grouped, sel, setSel, onOpen, renderEx
 }
 
 /** Full-screen image with instant (unblurred) thumbnail, silent swap to full, and zoom/pan. */
-function ZoomableImage({ thumbUrl, fullUrl }: { thumbUrl: string; fullUrl: string }) {
+function ZoomableImage({ thumbUrl, fullUrl, onDragOut }: { thumbUrl: string; fullUrl: string; onDragOut?: () => void }) {
   const [scale, setScale] = useState(1);
   const [pos, setPos] = useState({ x: 0, y: 0 });
   const [fullLoaded, setFullLoaded] = useState(false);
   const drag = useRef<{ x: number; y: number } | null>(null);
+  // Press tracked when NOT zoomed → a small move drags the file out (Explorer-style).
+  const press = useRef<{ x: number; y: number } | null>(null);
   const stageRef = useRef<HTMLDivElement>(null);
 
   const clamp = (s: number) => Math.min(8, Math.max(1, s));
@@ -250,12 +338,19 @@ function ZoomableImage({ thumbUrl, fullUrl }: { thumbUrl: string; fullUrl: strin
   }, []);
 
   const onMouseDown = (e: React.MouseEvent) => {
+    if (e.button !== 0) return;
     if (scale > 1) drag.current = { x: e.clientX - pos.x, y: e.clientY - pos.y };
+    else press.current = { x: e.clientX, y: e.clientY };
   };
   const onMouseMove = (e: React.MouseEvent) => {
-    if (drag.current) setPos({ x: e.clientX - drag.current.x, y: e.clientY - drag.current.y });
+    if (drag.current) { setPos({ x: e.clientX - drag.current.x, y: e.clientY - drag.current.y }); return; }
+    const p = press.current;
+    if (p && onDragOut && Math.hypot(e.clientX - p.x, e.clientY - p.y) >= 6) {
+      press.current = null;
+      onDragOut();
+    }
   };
-  const endDrag = () => { drag.current = null; };
+  const endDrag = () => { drag.current = null; press.current = null; };
   const zoomIn = () => setScale((s) => clamp(s * 1.3));
   const zoomOut = () => setScale((s) => { const ns = clamp(s / 1.3); if (ns === 1) setPos({ x: 0, y: 0 }); return ns; });
   const reset = () => { setScale(1); setPos({ x: 0, y: 0 }); };
@@ -288,6 +383,10 @@ function ZoomableImage({ thumbUrl, fullUrl }: { thumbUrl: string; fullUrl: strin
   );
 }
 
+// Guards the one-time startup init. React StrictMode double-invokes effects in
+// dev, which would otherwise trigger the auto-unlock biometric prompt twice.
+let didInit = false;
+
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
@@ -304,10 +403,22 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    api.session().then((s) => {
-      setSession(s.logged_in ? s : null);
+    if (didInit) return;
+    didInit = true;
+    (async () => {
+      try {
+        const s = await api.session();
+        if (s.logged_in) { setSession(s); setLoading(false); return; }
+        // Not logged in: if auto-unlock is armed, try it (may prompt biometric).
+        if (await api.isAutoUnlockEnabled().catch(() => false)) {
+          try {
+            const u = await api.tryAutoUnlock();
+            if (u.logged_in) { setSession(u); setLoading(false); return; }
+          } catch { /* fall through to the login screen */ }
+        }
+      } catch { /* ignore */ }
       setLoading(false);
-    });
+    })();
   }, []);
 
   if (loading) return <div className="auth"><div className="spinner" /></div>;
@@ -320,6 +431,9 @@ export default function App() {
 function AuthView({ onAuthed }: { onAuthed: (s: Session) => void }) {
   const [mode, setMode] = useState<"login" | "register" | "recover">("login");
   const [accounts, setAccounts] = useState<LocalAccount[]>([]);
+  const [lastAcc, setLastAcc] = useState<LocalAccount | null>(null);
+  const [useOther, setUseOther] = useState(false);
+  const [ready, setReady] = useState(false);
   const [server, setServer] = useState("https://api.stingle.org/");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -327,7 +441,10 @@ function AuthView({ onAuthed }: { onAuthed: (s: Session) => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
-  useEffect(() => { api.localAccounts().then(setAccounts).catch(() => {}); }, []);
+  useEffect(() => {
+    api.localAccounts().then(setAccounts).catch(() => {});
+    api.lastAccount().then((a) => { setLastAcc(a); setReady(true); }).catch(() => setReady(true));
+  }, []);
 
   const submit = async () => {
     setBusy(true); setError("");
@@ -341,7 +458,59 @@ function AuthView({ onAuthed }: { onAuthed: (s: Session) => void }) {
     } finally { setBusy(false); }
   };
 
+  // Returning user: unlock the last account. Try offline resume first, then a
+  // full online login if that fails (e.g. token/password rotated elsewhere).
+  const unlock = async () => {
+    if (!lastAcc) return;
+    setBusy(true); setError("");
+    try {
+      let s: Session;
+      try { s = await api.resume(lastAcc.account_key, password); }
+      catch { s = await api.login(lastAcc.server_url, lastAcc.email, password); }
+      onAuthed(s);
+    } catch (e: any) {
+      setError(String(e));
+    } finally { setBusy(false); }
+  };
+
+  const logoutLast = async () => {
+    if (!lastAcc) return;
+    await api.forgetAccount(lastAcc.account_key).catch(() => {});
+    setLastAcc(null); setPassword(""); setUseOther(true);
+  };
+
   const title = mode === "login" ? "Sign In" : mode === "register" ? "Create Account" : "Recover Account";
+
+  if (!ready) return <div className="auth"><div className="spinner" /></div>;
+
+  // Returning-user view: just a password field for the last account.
+  if (lastAcc && !useOther && mode === "login") {
+    return (
+      <div className="auth">
+        <div className="auth-card">
+          <h1>Stingle Photos</h1>
+          <div className="sub">Welcome back</div>
+          <div className="field">
+            <label>Account</label>
+            <div className="muted" style={{ fontSize: 15 }}>{lastAcc.email}</div>
+          </div>
+          <div className="field">
+            <label>Password</label>
+            <input type="password" autoFocus value={password} onChange={(e) => setPassword(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && unlock()} />
+          </div>
+          {error && <div className="error">{error}</div>}
+          <button className="primary" style={{ width: "100%", marginTop: 10 }} disabled={busy} onClick={unlock}>
+            {busy ? <span className="spinner" /> : "Unlock"}
+          </button>
+          <div className="link-row">
+            <a onClick={logoutLast}>Log out</a>
+            <a onClick={() => { setUseOther(true); setEmail(""); setPassword(""); setError(""); }}>Use another account</a>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="auth">
@@ -406,6 +575,11 @@ function AuthView({ onAuthed }: { onAuthed: (s: Session) => void }) {
             {mode === "recover" ? "Back to sign in" : "Recover with phrase"}
           </a>
         </div>
+        {lastAcc && useOther && mode === "login" && (
+          <div className="link-row" style={{ justifyContent: "center" }}>
+            <a onClick={() => { setUseOther(false); setError(""); }}>← Back to {lastAcc.email}</a>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -421,6 +595,7 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
   const [syncing, setSyncing] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
   const [thumbs, setThumbs] = useState<{ done: number; total: number } | null>(null);
+  const [originals, setOriginals] = useState<{ done: number; total: number } | null>(null);
   const reload = () => setReloadKey((k) => k + 1);
 
   useEffect(() => {
@@ -431,7 +606,14 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
       setThumbs(null);
       reload();
     });
-    return () => { u1.then((f) => f()); u2.then((f) => f()); };
+    const u3 = listen<[number, number]>("originals-progress", (e) =>
+      setOriginals(e.payload[1] > 0 ? { done: e.payload[0], total: e.payload[1] } : null)
+    );
+    const u4 = listen<number>("originals-done", () => {
+      setOriginals(null);
+      reload();
+    });
+    return () => { u1.then((f) => f()); u2.then((f) => f()); u3.then((f) => f()); u4.then((f) => f()); };
   }, []);
 
   const doSync = useCallback(async () => {
@@ -452,6 +634,55 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Drag files from the OS into the app → import them (encrypted on the way in).
+  const [dropActive, setDropActive] = useState(false);
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    let cancelled = false;
+    getCurrentWebview().onDragDropEvent((event) => {
+      const p = event.payload as { type: string; paths?: string[] };
+      if (p.type === "enter" || p.type === "over") setDropActive(true);
+      else if (p.type === "leave") setDropActive(false);
+      else if (p.type === "drop") {
+        setDropActive(false);
+        const paths = p.paths ?? [];
+        if (paths.length) {
+          api.importPaths(paths, null)
+            .then((n) => {
+              showToast(n > 0 ? `Imported ${n} item(s) — syncing…` : "Nothing new to import");
+              if (n > 0) { reload(); doSync(); } // show now, sync in background
+            })
+            .catch((err) => showToast("Import failed: " + err));
+        }
+      }
+    }).then((f) => { if (cancelled) f(); else un = f; });
+    return () => { cancelled = true; un?.(); };
+  }, [doSync, showToast]);
+
+  // Ctrl/Cmd+V anywhere (outside text fields) → paste from the clipboard:
+  // files (copied in Explorer or from the app) are imported; otherwise an image
+  // (e.g. copied from Telegram) is imported.
+  useEffect(() => {
+    const onPaste = async (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "v") return;
+      if (inTextField(e)) return;
+      try {
+        const files = await api.clipboardFiles().catch(() => []);
+        if (files.length > 0) {
+          const n = await api.importPaths(files, null);
+          if (n > 0) { showToast(`Pasted ${n} item(s) — syncing…`); reload(); doSync(); }
+          else showToast("Those items are already in your library");
+          return;
+        }
+        const n = await api.pasteFromClipboard(null);
+        if (n > 0) { showToast(`Pasted ${n} image — syncing…`); reload(); doSync(); }
+        else showToast("Nothing to paste from the clipboard");
+      } catch (err) { showToast("Paste failed: " + err); }
+    };
+    window.addEventListener("keydown", onPaste);
+    return () => window.removeEventListener("keydown", onPaste);
+  }, [doSync, showToast]);
+
   const pct = session.space_quota > 0 ? Math.min(100, (session.space_used / session.space_quota) * 100) : 0;
 
   return (
@@ -471,6 +702,9 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
         {thumbs && thumbs.total > 0 && (
           <div className="acct">⤓ Thumbnails {thumbs.done}/{thumbs.total}</div>
         )}
+        {originals && originals.total > 0 && (
+          <div className="acct">⤓ Originals {originals.done}/{originals.total}</div>
+        )}
       </div>
 
       <div className="main">
@@ -481,6 +715,11 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
       </div>
 
       {toast && <div className="toast">{toast}</div>}
+      {dropActive && (
+        <div className="drop-overlay">
+          <div className="drop-card">⤓ Drop photos &amp; videos to import</div>
+        </div>
+      )}
     </div>
   );
 }
@@ -502,7 +741,8 @@ function GalleryView({ syncing, onSync, showToast, onChanged, reloadSignal }: {
     if (files.length === 0) return;
     const n = await api.importPaths(files, null);
     showToast(`Imported ${n} file(s) — syncing…`);
-    onSync();
+    load();    // show the imported files immediately
+    onSync();  // then sync in the background
   };
 
   const doImportFolder = async () => {
@@ -510,6 +750,7 @@ function GalleryView({ syncing, onSync, showToast, onChanged, reloadSignal }: {
     if (!dir) return;
     const n = await api.importPaths([dir], null);
     showToast(`Imported ${n} file(s) — syncing…`);
+    load();
     onSync();
   };
 
@@ -542,7 +783,7 @@ function GalleryView({ syncing, onSync, showToast, onChanged, reloadSignal }: {
           <div className="empty">No photos yet.<br />Import files to get started.</div>
         ) : (
           <PhotoGrid items={items} set={SET_GALLERY} albumId={null} grouped
-            sel={sel} setSel={setSel} onOpen={setViewerIdx} />
+            sel={sel} setSel={setSel} onOpen={setViewerIdx} showToast={showToast} />
         )}
       </div>
       {viewerIdx !== null && (
@@ -612,8 +853,8 @@ function AlbumDetail({ album, onBack, showToast }: { album: Album; onBack: () =>
     if (!files.length) return;
     const n = await api.importPaths(files, album.album_id);
     showToast(`Imported ${n} — syncing…`);
-    await api.sync();
-    load();
+    load();                       // show immediately
+    api.sync().then(() => load()); // sync in the background, refresh when done
   };
   const rename = async () => {
     const name = prompt("Rename album:", album.name);
@@ -670,7 +911,7 @@ function AlbumDetail({ album, onBack, showToast }: { album: Album; onBack: () =>
       <div className="content">
         {items.length === 0 ? <div className="empty">Empty album.</div> : (
           <PhotoGrid items={items} set={SET_ALBUM} albumId={album.album_id} grouped={false}
-            sel={sel} setSel={setSel} onOpen={setViewerIdx}
+            sel={sel} setSel={setSel} onOpen={setViewerIdx} showToast={showToast}
             renderExtra={(f) => album.is_owner ? (
               <button className="cover-btn" onClick={(e) => {
                 e.stopPropagation();
@@ -713,7 +954,7 @@ function TrashView({ showToast, onChanged, reloadSignal }: { showToast: (m: stri
       <div className="content">
         {items.length === 0 ? <div className="empty">Trash is empty.</div> : (
           <PhotoGrid items={items} set={SET_TRASH} albumId={null} grouped
-            sel={sel} setSel={setSel}
+            sel={sel} setSel={setSel} showToast={showToast}
             onOpen={(idx) => setSel(new Set([items[idx].filename]))} />
         )}
       </div>
@@ -730,11 +971,93 @@ function SettingsView({ session, setSession, showToast }: {
   const [cacheLimit, setCacheLimit] = useState<string>("0");
   const [cacheSizeMB, setCacheSizeMB] = useState<number | null>(null);
 
+  // App options
+  const [autostart, setAutostart] = useState(false);
+  const [minTray, setMinTray] = useState(false);
+  const [syncEvery, setSyncEvery] = useState(false);
+  const [autoUnlock, setAutoUnlock] = useState(false);
+  const [biometric, setBiometric] = useState(false);
+  const [auPrompt, setAuPrompt] = useState(false);
+  const [auPassword, setAuPassword] = useState("");
+  const [storagePath, setStoragePath] = useState("");
+  const [moving, setMoving] = useState<{ done: number; total: number } | null>(null);
+
   const refreshCache = () => { api.cacheSize().then((b) => setCacheSizeMB(b / 1048576)); };
   useEffect(() => {
     api.getCacheLimit().then((b) => setCacheLimit(String(Math.round(b / 1048576))));
     refreshCache();
+    api.getAutostart().then(setAutostart).catch(() => {});
+    api.getMinimizeToTray().then(setMinTray).catch(() => {});
+    api.getSyncEverything().then(setSyncEvery).catch(() => {});
+    api.isAutoUnlockEnabled().then(setAutoUnlock).catch(() => {});
+    api.secureStoreStatus().then((s) => setBiometric(s.biometric)).catch(() => {});
+    api.getStoragePath().then(setStoragePath).catch(() => {});
   }, []);
+
+  // Progress bar while the storage folder is being moved.
+  useEffect(() => {
+    const u = listen<[number, number]>("storage-move-progress", (e) =>
+      setMoving({ done: e.payload[0], total: e.payload[1] })
+    );
+    return () => { u.then((f) => f()); };
+  }, []);
+
+  const toggleAutostart = async (v: boolean) => {
+    try { await api.setAutostart(v); setAutostart(v); }
+    catch (e) { showToast("Failed: " + e); }
+  };
+  const toggleMinTray = async (v: boolean) => {
+    try { await api.setMinimizeToTray(v); setMinTray(v); }
+    catch (e) { showToast("Failed: " + e); }
+  };
+  const toggleSyncEvery = async (v: boolean) => {
+    try { await api.setSyncEverything(v); setSyncEvery(v); showToast(v ? "Syncing everything locally" : "Continuous sync off"); }
+    catch (e) { showToast("Failed: " + e); }
+  };
+
+  const onAutoUnlockToggle = async (v: boolean) => {
+    if (!v) {
+      try { await api.disableAutoUnlock(); setAutoUnlock(false); showToast("Auto-unlock disabled"); }
+      catch (e) { showToast("Failed: " + e); }
+      return;
+    }
+    setAuPrompt(true); // ask for the password before arming
+  };
+  const confirmAutoUnlock = async () => {
+    try {
+      let allowPlaintext = false;
+      if (!biometric) {
+        const ok = window.confirm(
+          "This device has no biometric secure store (Windows Hello / Touch ID).\n\n" +
+          "To unlock automatically, your password will be saved to disk, encrypted with a key " +
+          "that is itself stored IN PLAIN TEXT on this PC. Anyone with access to this computer " +
+          "could recover your password and decrypt your photos.\n\nEnable anyway?"
+        );
+        if (!ok) return;
+        allowPlaintext = true;
+      }
+      const r = await api.enableAutoUnlock(auPassword, allowPlaintext);
+      setAutoUnlock(true); setAuPrompt(false); setAuPassword("");
+      showToast(r.used_plaintext ? "Auto-unlock enabled (plaintext key)" : "Auto-unlock enabled");
+    } catch (e) { showToast("Failed: " + e); }
+  };
+
+  const changeStorage = async () => {
+    const dir = await pickFolder();
+    if (!dir || dir === storagePath) return;
+    if (!window.confirm(`Move all local data to:\n${dir}\n\nThe app will lock during the move.`)) return;
+    setMoving({ done: 0, total: 0 });
+    try {
+      await api.changeStoragePath(dir);
+      setStoragePath(dir);
+      // The session is kept alive across the move (re-opened at the new path),
+      // so no re-login is needed. Refresh in case re-open failed.
+      const s = await api.session();
+      if (s.logged_in) showToast("Storage moved to " + dir);
+      else { showToast("Storage moved — please unlock again"); setSession(null); }
+    } catch (e) { showToast("Move failed: " + e); }
+    finally { setMoving(null); }
+  };
   const saveCacheLimit = async () => {
     const mb = Math.max(0, parseInt(cacheLimit) || 0);
     await api.setCacheLimit(mb * 1048576);
@@ -791,6 +1114,67 @@ function SettingsView({ session, setSession, showToast }: {
         </div>
 
         <div className="settings-section">
+          <h3>General</h3>
+          <label className="opt-row">
+            <input type="checkbox" checked={autostart} onChange={(e) => toggleAutostart(e.target.checked)} />
+            <span>Start automatically when I sign in to this computer</span>
+          </label>
+          <label className="opt-row">
+            <input type="checkbox" checked={minTray} onChange={(e) => toggleMinTray(e.target.checked)} />
+            <span>Minimize to the tray instead of quitting when I close the window</span>
+          </label>
+          <label className="opt-row">
+            <input type="checkbox" checked={autoUnlock} onChange={(e) => onAutoUnlockToggle(e.target.checked)} />
+            <span>
+              Unlock automatically on startup
+              <span className="muted" style={{ display: "block", fontSize: 12 }}>
+                {biometric
+                  ? "Your password is encrypted with a key protected by Windows Hello / Touch ID."
+                  : "No biometric store on this device — enabling will save a key in plain text (you'll be warned)."}
+              </span>
+            </span>
+          </label>
+          {auPrompt && (
+            <div className="row" style={{ maxWidth: 360, marginTop: 8, gap: 8 }}>
+              <input type="password" placeholder="Confirm your password" value={auPassword}
+                onChange={(e) => setAuPassword(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && confirmAutoUnlock()} />
+              <button onClick={confirmAutoUnlock} disabled={!auPassword}>Enable</button>
+              <button onClick={() => { setAuPrompt(false); setAuPassword(""); }}>Cancel</button>
+            </div>
+          )}
+        </div>
+
+        <div className="settings-section">
+          <h3>Sync</h3>
+          <label className="opt-row">
+            <input type="checkbox" checked={syncEvery} onChange={(e) => toggleSyncEvery(e.target.checked)} />
+            <span>
+              Keep everything on this device
+              <span className="muted" style={{ display: "block", fontSize: 12 }}>
+                Continuously sync and download all original files so your whole library stays available offline.
+              </span>
+            </span>
+          </label>
+        </div>
+
+        <div className="settings-section">
+          <h3>Storage location</h3>
+          <p className="muted" style={{ fontSize: 13, wordBreak: "break-all" }}>{storagePath}</p>
+          <button onClick={changeStorage} disabled={!!moving}>Change…</button>
+          {moving && (
+            <div style={{ marginTop: 10, maxWidth: 360 }}>
+              <div className="storage-bar">
+                <div style={{ width: (moving.total > 0 ? Math.min(100, (moving.done / moving.total) * 100) : 0) + "%" }} />
+              </div>
+              <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+                Moving… {fmtMB(Math.round(moving.done / 1048576))} / {fmtMB(Math.round(moving.total / 1048576))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="settings-section">
           <h3>Takeout</h3>
           <p className="muted" style={{ fontSize: 13 }}>Download and decrypt your entire library to a folder.</p>
           <button onClick={doTakeout}>Export library…</button>
@@ -814,9 +1198,12 @@ type MoveDest = { type: "gallery" } | { type: "album"; id: string };
 
 function MoveDialog({ fromSet, fromAlbum, count, onPick, onClose }: {
   fromSet: number; fromAlbum: string | null; count: number;
-  onPick: (dest: MoveDest) => void; onClose: () => void;
+  onPick: (dest: MoveDest, isMoving: boolean) => void; onClose: () => void;
 }) {
   const [albums, setAlbums] = useState<Album[]>([]);
+  // The core choice, in plain file-manager terms. Default to Move (keeps parity
+  // with the mobile app and the previous desktop behavior).
+  const [isMoving, setIsMoving] = useState(true);
   useEffect(() => {
     api.listAlbums().then(setAlbums);
     const h = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
@@ -827,16 +1214,17 @@ function MoveDialog({ fromSet, fromAlbum, count, onPick, onClose }: {
   const targets = albums.filter((a) => a.album_id !== fromAlbum && a.is_owner);
   const priv = targets.filter((a) => !a.is_shared);
   const shared = targets.filter((a) => a.is_shared);
+  const verb = isMoving ? "Move" : "Copy";
 
   const newAlbum = async () => {
     const name = prompt("New album name:");
     if (!name) return;
     const id = await api.createAlbum(name);
-    onPick({ type: "album", id });
+    onPick({ type: "album", id }, isMoving);
   };
 
   const Card = (a: Album) => (
-    <div key={a.album_id} className="move-card" onClick={() => onPick({ type: "album", id: a.album_id })}>
+    <div key={a.album_id} className="move-card" onClick={() => onPick({ type: "album", id: a.album_id }, isMoving)}>
       <div className="move-cover">
         {a.cover ? <img src={mediaUrl(SET_ALBUM, a.cover, true, a.album_id)} /> : <span>📁</span>}
       </div>
@@ -849,12 +1237,23 @@ function MoveDialog({ fromSet, fromAlbum, count, onPick, onClose }: {
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal move-dialog" onClick={(e) => e.stopPropagation()}>
         <div className="move-head">
-          <h3>Move {count} item{count === 1 ? "" : "s"} to…</h3>
+          <h3>{verb} {count} item{count === 1 ? "" : "s"} to…</h3>
           <button className="icon-btn" onClick={onClose}>✕</button>
         </div>
+
+        <div className="seg" role="tablist">
+          <button className={isMoving ? "active" : ""} aria-selected={isMoving} onClick={() => setIsMoving(true)}>Move</button>
+          <button className={!isMoving ? "active" : ""} aria-selected={!isMoving} onClick={() => setIsMoving(false)}>Copy</button>
+        </div>
+        <p className="seg-hint">
+          {isMoving
+            ? "Adds them to the destination and removes them from their current location."
+            : "Adds them to the destination and keeps them where they are now."}
+        </p>
+
         <div className="move-grid">
           {fromSet === SET_ALBUM && (
-            <div className="move-card" onClick={() => onPick({ type: "gallery" })}>
+            <div className="move-card" onClick={() => onPick({ type: "gallery" }, isMoving)}>
               <div className="move-cover special"><span>🖼️</span></div>
               <div className="move-name">Gallery</div>
               <div className="move-count">Main library</div>
@@ -863,7 +1262,7 @@ function MoveDialog({ fromSet, fromAlbum, count, onPick, onClose }: {
           <div className="move-card" onClick={newAlbum}>
             <div className="move-cover special"><span>＋</span></div>
             <div className="move-name">New album</div>
-            <div className="move-count">Create &amp; move</div>
+            <div className="move-count">Create &amp; {verb.toLowerCase()}</div>
           </div>
         </div>
         {priv.length > 0 && <><div className="move-section">My albums</div><div className="move-grid">{priv.map(Card)}</div></>}
@@ -890,14 +1289,14 @@ function ActionButtons({ set, albumId, filenames, onDone, showToast }: {
     showToast("Moved to trash");
     onDone();
   };
-  const move = async (dest: MoveDest) => {
+  const move = async (dest: MoveDest, isMoving: boolean) => {
     setMoving(false);
     try {
-      if (dest.type === "gallery") await api.moveToGallery(albumId!, filenames);
-      else await api.moveToAlbum(set, albumId, filenames, dest.id);
-      showToast("Moved");
+      if (dest.type === "gallery") await api.moveToGallery(albumId!, filenames, isMoving);
+      else await api.moveToAlbum(set, albumId, filenames, dest.id, isMoving);
+      showToast(isMoving ? "Moved" : "Copied");
       onDone();
-    } catch (e) { showToast("Move failed: " + e); }
+    } catch (e) { showToast((isMoving ? "Move" : "Copy") + " failed: " + e); }
   };
   return (
     <>
@@ -917,6 +1316,7 @@ function Viewer({ items, index, set, albumId, onClose, onChanged, showToast }: {
 }) {
   const [i, setI] = useState(index);
   const [isVid, setIsVid] = useState<boolean | null>(null);
+  const vidPress = useRef<{ x: number; y: number } | null>(null);
   const f = items[i];
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
@@ -935,6 +1335,17 @@ function Viewer({ items, index, set, albumId, onClose, onChanged, showToast }: {
     return () => { alive = false; };
   }, [i, f, set, albumId]);
 
+  // Ctrl/Cmd+C copies the currently-viewed item.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "c") return;
+      if (inTextField(e) || !f) return;
+      copyToClipboard(set, albumId, [f.filename], showToast);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [f, set, albumId, showToast]);
+
   if (!f) return null;
   const thumbUrl = mediaUrl(set, f.filename, true, albumId);
   const fullUrl = mediaUrl(set, f.filename, false, albumId);
@@ -948,8 +1359,22 @@ function Viewer({ items, index, set, albumId, onClose, onChanged, showToast }: {
       </div>
       {i > 0 && <button className="nav-btn prev" onClick={(e) => { e.stopPropagation(); setI(i - 1); }}>‹</button>}
       {isVid === null ? <div className="spinner" />
-        : isVid ? <video src={fullUrl} controls autoPlay onClick={stop} />
-        : <ZoomableImage key={f.filename} thumbUrl={thumbUrl} fullUrl={fullUrl} />}
+        : isVid ? <video src={fullUrl} controls autoPlay onClick={stop}
+            onMouseDown={(e) => {
+              // Start a drag only from the video frame, not the bottom controls bar.
+              const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+              vidPress.current = e.clientY < r.bottom - 56 ? { x: e.clientX, y: e.clientY } : null;
+            }}
+            onMouseMove={(e) => {
+              const p = vidPress.current;
+              if (p && Math.hypot(e.clientX - p.x, e.clientY - p.y) >= 6) {
+                vidPress.current = null;
+                nativeDragOut(set, albumId, [f.filename]);
+              }
+            }}
+            onMouseUp={() => { vidPress.current = null; }} />
+        : <ZoomableImage key={f.filename} thumbUrl={thumbUrl} fullUrl={fullUrl}
+            onDragOut={() => nativeDragOut(set, albumId, [f.filename])} />}
       {i < items.length - 1 && <button className="nav-btn next" onClick={(e) => { e.stopPropagation(); setI(i + 1); }}>›</button>}
       <div className="name">{i + 1} / {items.length}</div>
     </div>

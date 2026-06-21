@@ -102,6 +102,12 @@ a { color: var(--accent2); cursor: pointer; }
   color: #fff; border-radius: 6px; padding: 2px 7px; font-size: 12px;
 }
 .tile.sel { border-color: var(--accent2); }
+.tile .vid-badge {
+  position: absolute; top: 6px; right: 6px; width: 22px; height: 22px; border-radius: 50%;
+  background: rgba(0,0,0,0.55); color: #fff; display: flex; align-items: center; justify-content: center;
+  pointer-events: none;
+}
+.tile .vid-badge svg { margin-left: 1px; }
 .grid-wrap { position: relative; user-select: none; }
 .marquee { position: fixed; border: 1px solid var(--accent2); background: rgba(59,130,246,0.18); border-radius: 2px; z-index: 60; pointer-events: none; }
 .tile .check {
@@ -152,14 +158,24 @@ a { color: var(--accent2); cursor: pointer; }
 .modal h3 { margin-top: 0; }
 .settings-section { background: var(--bg2); border:1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 14px; max-width: 640px; }
 .settings-section h3 { margin: 0 0 10px; font-size: 15px; }
+.opt-row { display: flex; align-items: flex-start; gap: 10px; padding: 7px 0; cursor: pointer; }
+.opt-row input[type="checkbox"] { width: 16px; height: 16px; margin: 2px 0 0; padding: 0; flex: 0 0 auto; }
+.opt-row > span { flex: 1; min-width: 0; }
 .phrase { background: var(--bg); border:1px solid var(--border); border-radius: 8px; padding: 12px; font-family: monospace; line-height: 1.7; word-spacing: 4px; }
 .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--bg3); border:1px solid var(--border); border-radius: 8px; padding: 10px 16px; z-index: 200; }
+.drop-overlay { position: fixed; inset: 0; z-index: 300; display: flex; align-items: center; justify-content: center; background: rgba(21,22,26,0.72); backdrop-filter: blur(2px); pointer-events: none; }
+.drop-card { border: 2px dashed var(--accent2); color: var(--fg); border-radius: 16px; padding: 40px 56px; font-size: 18px; font-weight: 600; background: var(--bg2); }
 .viewer-actions { position: absolute; top: 14px; left: 16px; display: flex; gap: 8px; z-index: 2; }
 .viewer-actions button { background: rgba(0,0,0,0.6); border-color: rgba(255,255,255,0.15); }
 /* Move dialog */
 .move-dialog { width: 600px; max-width: 92vw; max-height: 82vh; overflow-y: auto; }
 .move-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
 .move-head h3 { margin: 0; }
+.seg { display: inline-flex; background: var(--bg); border: 1px solid var(--border); border-radius: 9px; padding: 3px; gap: 3px; margin-top: 4px; }
+.seg button { border: none; background: transparent; color: var(--muted); border-radius: 6px; padding: 6px 22px; font-weight: 600; }
+.seg button:hover { background: var(--bg3); color: var(--fg); }
+.seg button.active { background: var(--accent2); color: #fff; }
+.seg-hint { color: var(--muted); font-size: 12px; margin: 8px 2px 4px; }
 .icon-btn { background: transparent; border: none; font-size: 18px; padding: 4px 8px; cursor: pointer; }
 .move-section { font-size: 12px; color: var(--muted); font-weight: 600; margin: 16px 0 8px; }
 .move-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(116px, 1fr)); gap: 10px; }

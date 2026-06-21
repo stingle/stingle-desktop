@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create an album and MOVE photo 1 into it (re-seals headers to album key).
     let album = acc.create_album("Move Target").await?;
-    acc.move_to_album(FileSet::Gallery, None, &[fn1.clone()], &album).await?;
+    acc.move_to_album(FileSet::Gallery, None, &[fn1.clone()], &album, true).await?;
     println!("[+] moved {fn1} into album {album}");
 
     let gcount = acc.db.count_files(FileSet::Gallery)?;
@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[+] moved album file decrypts correctly (re-seal works)");
 
     // Move it back to the gallery (reverse re-seal).
-    acc.move_to_gallery(&album, &[fn1.clone()]).await?;
+    acc.move_to_gallery(&album, &[fn1.clone()], true).await?;
     assert_eq!(acc.db.count_files(FileSet::Gallery)?, 2, "gallery back to 2");
     assert_eq!(acc.db.count_album_files(&album)?, 0, "album empty");
     let back = acc.get_decrypted(FileSet::Gallery, None, &fn1, false).await?;

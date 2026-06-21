@@ -8,7 +8,7 @@ use stingle_crypto::file;
 use stingle_db::FileSet;
 
 use crate::account::Account;
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 use crate::sync::headers_part;
 
 /// Max bytes returned for a single open-ended/large range request, so video
@@ -76,6 +76,41 @@ impl Account {
         let kp = self.keypair_for(set, album_id)?;
         let header = file::read_header(&mut Cursor::new(&part), &kp.public_key, &kp.secret_key)?;
         Ok(header.file_type == stingle_crypto::constants::FILE_TYPE_VIDEO)
+    }
+
+    /// Decrypt a photo to raw RGBA pixels (for clipboard copy). Goes through
+    /// [`media_response`] so formats the `image` crate can't read natively
+    /// (HEIC/HEIF/TIFF) are first transcoded to JPEG via ffmpeg, exactly like
+    /// the full-screen preview. Errors for videos / undecodable media.
+    pub async fn decrypt_to_rgba(
+        &self,
+        set: FileSet,
+        album_id: Option<&str>,
+        filename: &str,
+    ) -> Result<(u32, u32, Vec<u8>)> {
+        let resp = self.media_response(set, album_id, filename, false, None).await?;
+        if resp.content_type.starts_with("video/") {
+            return Err(CoreError::Other("cannot copy a video as an image".into()));
+        }
+        let img = image::load_from_memory(&resp.body)
+            .map_err(|err| CoreError::Other(format!("decode image: {err}")))?
+            .to_rgba8();
+        let (w, h) = img.dimensions();
+        Ok((w, h, img.into_raw()))
+    }
+
+    /// Cheap is-video check straight from an already-loaded row's `headers`
+    /// string (no extra DB query). For listing many files at once. Returns
+    /// false on any decode error rather than failing the whole listing.
+    pub fn row_is_video(&self, set: FileSet, album_id: Option<&str>, headers: &str) -> bool {
+        (|| -> Result<bool> {
+            let part = headers_part(headers, false)?;
+            let kp = self.keypair_for(set, album_id)?;
+            let header =
+                file::read_header(&mut Cursor::new(&part), &kp.public_key, &kp.secret_key)?;
+            Ok(header.file_type == stingle_crypto::constants::FILE_TYPE_VIDEO)
+        })()
+        .unwrap_or(false)
     }
 
     /// Produce a decrypted media response for the UI/protocol handler.

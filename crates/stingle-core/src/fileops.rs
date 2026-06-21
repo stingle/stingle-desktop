@@ -120,14 +120,16 @@ impl Account {
         Ok(n)
     }
 
-    /// Move files into an album (re-sealing their headers to the album key).
-    /// `from_album` is set only when moving between albums.
+    /// Move or copy files into an album (re-sealing their headers to the album
+    /// key). `from_album` is set only when moving between albums. When
+    /// `is_moving` is false the source copy is kept (copy instead of move).
     pub async fn move_to_album(
         &self,
         from_set: FileSet,
         from_album: Option<&str>,
         filenames: &[String],
         to_album: &str,
+        is_moving: bool,
     ) -> Result<()> {
         let to = self
             .db
@@ -157,7 +159,7 @@ impl Account {
                 FileSet::Album.id(),
                 from_album.unwrap_or(""),
                 to_album,
-                true,
+                is_moving,
                 &server_files,
                 self.server_crypto(),
             )
@@ -176,16 +178,20 @@ impl Account {
                 date_created: row.date_created,
                 date_modified: row.date_modified,
             })?;
-            match from_set {
-                FileSet::Album => self.db.delete_album_file(from_album.unwrap_or(""), &row.filename)?,
-                _ => self.db.delete_file(from_set, &row.filename)?,
+            // Copy keeps the source; move removes it.
+            if is_moving {
+                match from_set {
+                    FileSet::Album => self.db.delete_album_file(from_album.unwrap_or(""), &row.filename)?,
+                    _ => self.db.delete_file(from_set, &row.filename)?,
+                }
             }
         }
         Ok(())
     }
 
-    /// Move album files back to the gallery (re-sealing headers to the user key).
-    pub async fn move_to_gallery(&self, from_album: &str, filenames: &[String]) -> Result<()> {
+    /// Move or copy album files back to the gallery (re-sealing headers to the
+    /// user key). When `is_moving` is false the album copy is kept.
+    pub async fn move_to_gallery(&self, from_album: &str, filenames: &[String], is_moving: bool) -> Result<()> {
         let user_pk = self.keypair.public_key.clone();
         let mut server_files: Vec<(String, Option<String>)> = Vec::new();
         let mut rows: Vec<(DbFile, String)> = Vec::new();
@@ -206,7 +212,7 @@ impl Account {
                 FileSet::Gallery.id(),
                 from_album,
                 "",
-                true,
+                is_moving,
                 &server_files,
                 self.server_crypto(),
             )
@@ -227,7 +233,10 @@ impl Account {
                     date_modified: row.date_modified,
                 },
             )?;
-            self.db.delete_album_file(from_album, &row.filename)?;
+            // Copy keeps the album entry; move removes it.
+            if is_moving {
+                self.db.delete_album_file(from_album, &row.filename)?;
+            }
         }
         Ok(())
     }
