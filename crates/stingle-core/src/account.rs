@@ -15,7 +15,14 @@ use crate::paths::{account_key, AccountPaths};
 
 /// Non-secret account info persisted to `account.json`. The key bundle stored
 /// here is password-encrypted (Argon2id MODERATE), so it is safe at rest.
-#[derive(Serialize, Deserialize, Clone)]
+///
+/// The session `token` is a bearer credential: anyone holding it can act as the
+/// user against the API (list/move/delete/share — they still can't decrypt
+/// content without the password, but they can destroy or exfiltrate ciphertext).
+/// So at rest it is NOT written in the clear: [`AccountInfo::save`] seals it to
+/// the account's own public key (`token_enc`) and blanks the plaintext field,
+/// and [`AccountInfo::unseal_token`] recovers it after the keypair is unlocked.
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct AccountInfo {
     pub email: String,
     pub user_id: String,
@@ -23,17 +30,57 @@ pub struct AccountInfo {
     pub server_url: String,
     pub server_pk_b64: String,
     pub key_bundle_b64: String,
+    /// In-memory plaintext token. On disk this is empty for accounts saved by a
+    /// current build (see `token_enc`); a legacy file may still carry it here.
+    #[serde(default)]
     pub token: String,
+    /// `crypto_box_seal`(token) to the account public key, base64 — the at-rest
+    /// form of the token. Absent in legacy files. Set by [`AccountInfo::save`];
+    /// not a secret on its own (opening it needs the password-unlocked key).
+    #[serde(default)]
+    pub token_enc: Option<String>,
     pub is_key_backed_up: bool,
 }
 
 impl AccountInfo {
     fn save(&self, paths: &AccountPaths) -> Result<()> {
-        std::fs::write(paths.account_file(), serde_json::to_vec_pretty(self)?)?;
+        let mut on_disk = self.clone();
+        // Seal the token to our own public key (derivable from the bundle, no
+        // password needed) so the stored file never contains a usable token.
+        if !self.token.is_empty() {
+            if let Ok(bundle) = KeyBundle::parse_base64(&self.key_bundle_b64) {
+                if let Ok(sealed) =
+                    stingle_crypto::sodium::box_seal(self.token.as_bytes(), &bundle.public_key)
+                {
+                    on_disk.token_enc = Some(B64.encode(sealed));
+                    on_disk.token = String::new();
+                }
+            }
+        }
+        std::fs::write(paths.account_file(), serde_json::to_vec_pretty(&on_disk)?)?;
         Ok(())
     }
     fn load(path: &Path) -> Result<Self> {
         Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    }
+
+    /// Recover the plaintext token from `token_enc` using the unlocked keypair.
+    /// No-op if the token is already present (legacy plaintext file or already
+    /// unsealed). Must be called after the keypair is unlocked.
+    fn unseal_token(&mut self, keypair: &KeyPair) -> Result<()> {
+        if self.token.is_empty() {
+            if let Some(enc) = &self.token_enc {
+                let raw = B64.decode(enc.trim())?;
+                let opened = stingle_crypto::sodium::box_seal_open(
+                    &raw,
+                    &keypair.public_key,
+                    &keypair.secret_key,
+                )?;
+                self.token = String::from_utf8(opened.to_vec())
+                    .map_err(|_| CoreError::Other("token is not valid UTF-8".into()))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -49,12 +96,31 @@ pub struct Account {
     /// Bounds total concurrent downloads (prefetch + on-demand) so we never
     /// exhaust the connection pool / trip server connection limits.
     pub(crate) download_sem: tokio::sync::Semaphore,
+    /// Sub-limit held *only* by the bulk prefetch passes, so they can never
+    /// occupy every `download_sem` permit. This reserves lanes for on-demand
+    /// requests (thumbnails/originals the user is actually looking at), which go
+    /// straight through `download_sem` and so jump ahead of the bulk backlog.
+    pub(crate) bulk_sem: tokio::sync::Semaphore,
+    /// In-memory LRU of decrypted thumbnails so scrolling back is instant.
+    pub(crate) thumb_cache: crate::thumb_cache::ThumbCache,
     /// Throttle for cache-limit enforcement (ms epoch of last check).
     pub(crate) last_cache_check_ms: std::sync::atomic::AtomicI64,
+    /// Cooperative cancellation flag for the bulk "download all originals" pass.
+    /// Set when the user turns "keep originals locally" off so an in-flight
+    /// download stops promptly instead of running to completion.
+    pub(crate) stop_originals: std::sync::atomic::AtomicBool,
 }
 
-/// Max concurrent downloads across the whole account.
-pub(crate) const MAX_CONCURRENT_DOWNLOADS: usize = 24;
+/// Max concurrent downloads across the whole account. Thumbnails are small, so
+/// a high fan-out finishes the prefetch backlog quickly; the reqwest pool is
+/// sized to match (`pool_max_idle_per_host`).
+pub(crate) const MAX_CONCURRENT_DOWNLOADS: usize = 56;
+/// Max of those a bulk prefetch may hold at once; the rest (8 lanes) stay free
+/// for the on-demand requests the user is actively waiting on. Kept high enough
+/// that bulk prefetch stays fast when nothing is competing.
+pub(crate) const MAX_BULK_DOWNLOADS: usize = 48;
+/// Byte budget for the in-memory decrypted-thumbnail LRU (~128 MB).
+const THUMB_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
 impl Account {
     /// Register a new account on the server and return the logged-in session.
@@ -64,7 +130,7 @@ impl Account {
         server_url: &str,
         email: &str,
         password: &str,
-        base_dir: &Path,
+        accounts_dir: &Path,
         is_backup: bool,
     ) -> Result<Account> {
         let client = Client::new(Some(server_url))?;
@@ -76,7 +142,7 @@ impl Account {
         client
             .register(email, &login_hash, &salt_hex, is_backup, &bundle.to_base64())
             .await?;
-        Self::login(server_url, email, password, base_dir).await
+        Self::login(server_url, email, password, accounts_dir).await
     }
 
     /// Log in (online) and build the session, persisting account info locally.
@@ -84,7 +150,7 @@ impl Account {
         server_url: &str,
         email: &str,
         password: &str,
-        base_dir: &Path,
+        accounts_dir: &Path,
     ) -> Result<Account> {
         let client = Client::new(Some(server_url))?;
         let salt_hex = client.pre_login(email).await?;
@@ -96,7 +162,7 @@ impl Account {
         let server_pk = B64.decode(login.server_public_key.trim())?;
 
         let key = account_key(server_url, email);
-        let paths = AccountPaths::new(base_dir, &key);
+        let paths = AccountPaths::new(accounts_dir, &key);
         paths.ensure()?;
         let db = Db::open(paths.db_file())?;
 
@@ -108,6 +174,7 @@ impl Account {
             server_pk_b64: login.server_public_key,
             key_bundle_b64: login.key_bundle,
             token: login.token,
+            token_enc: None,
             is_key_backed_up: login.is_key_backed_up,
         };
         info.save(&paths)?;
@@ -120,7 +187,10 @@ impl Account {
             server_pk,
             keypair,
             download_sem: tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS),
+            bulk_sem: tokio::sync::Semaphore::new(MAX_BULK_DOWNLOADS),
+            thumb_cache: crate::thumb_cache::ThumbCache::new(THUMB_CACHE_BYTES),
             last_cache_check_ms: std::sync::atomic::AtomicI64::new(0),
+            stop_originals: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -132,7 +202,7 @@ impl Account {
         email: &str,
         mnemonic: &str,
         new_password: &str,
-        base_dir: &Path,
+        accounts_dir: &Path,
     ) -> Result<Account> {
         let client = Client::new(Some(server_url))?;
         let sk = stingle_crypto::mnemonic::mnemonic_to_entropy(mnemonic)?;
@@ -169,16 +239,18 @@ impl Account {
         )?;
         client.recover_account(email, &params_b64).await?;
 
-        Self::login(server_url, email, new_password, base_dir).await
+        Self::login(server_url, email, new_password, accounts_dir).await
     }
 
     /// Resume a previously logged-in account from disk, unlocking the stored key
     /// bundle with the password (offline — no server round-trip). Use this on
     /// app start when a valid session token already exists.
-    pub fn resume(base_dir: &Path, account_key_hex: &str, password: &str) -> Result<Account> {
-        let paths = AccountPaths::new(base_dir, account_key_hex);
-        let info = AccountInfo::load(&paths.account_file())?;
+    pub fn resume(accounts_dir: &Path, account_key_hex: &str, password: &str) -> Result<Account> {
+        let paths = AccountPaths::new(accounts_dir, account_key_hex);
+        let mut info = AccountInfo::load(&paths.account_file())?;
         let keypair = KeyBundle::parse_base64(&info.key_bundle_b64)?.unlock(password)?;
+        // Recover the at-rest-sealed session token now that the keypair is open.
+        info.unseal_token(&keypair)?;
         let server_pk = B64.decode(info.server_pk_b64.trim())?;
         let client = Client::new(Some(&info.server_url))?;
         let db = Db::open(paths.db_file())?;
@@ -190,7 +262,10 @@ impl Account {
             server_pk,
             keypair,
             download_sem: tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS),
+            bulk_sem: tokio::sync::Semaphore::new(MAX_BULK_DOWNLOADS),
+            thumb_cache: crate::thumb_cache::ThumbCache::new(THUMB_CACHE_BYTES),
             last_cache_check_ms: std::sync::atomic::AtomicI64::new(0),
+            stop_originals: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -217,15 +292,18 @@ impl Account {
             server_pk,
             keypair,
             download_sem: tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS),
+            bulk_sem: tokio::sync::Semaphore::new(MAX_BULK_DOWNLOADS),
+            thumb_cache: crate::thumb_cache::ThumbCache::new(THUMB_CACHE_BYTES),
             last_cache_check_ms: std::sync::atomic::AtomicI64::new(0),
+            stop_originals: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
-    /// List locally-known accounts (their account-key directories).
-    pub fn list_local(base_dir: &Path) -> Vec<(String, AccountInfo)> {
+    /// List locally-known accounts (their account-key directories) found directly
+    /// under `accounts_dir`.
+    pub fn list_local(accounts_dir: &Path) -> Vec<(String, AccountInfo)> {
         let mut out = Vec::new();
-        let accounts_dir = base_dir.join("accounts");
-        if let Ok(entries) = std::fs::read_dir(&accounts_dir) {
+        if let Ok(entries) = std::fs::read_dir(accounts_dir) {
             for e in entries.flatten() {
                 let info_path = e.path().join("account.json");
                 if let Ok(info) = AccountInfo::load(&info_path) {
@@ -256,6 +334,13 @@ impl Account {
         Ok(stingle_crypto::mnemonic::entropy_to_mnemonic(
             &self.keypair.secret_key,
         )?)
+    }
+
+    /// Ask any in-flight "download all originals" pass to stop as soon as it can.
+    /// Called when the user turns "keep originals locally" off.
+    pub fn request_stop_originals(&self) {
+        self.stop_originals
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Log out: best-effort server logout, then wipe local account data.

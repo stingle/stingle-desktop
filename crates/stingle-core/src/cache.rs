@@ -9,13 +9,18 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use stingle_db::{FileSet, Sort};
 
 use crate::account::Account;
 use crate::error::Result;
 use crate::util::now_ms;
+
+/// Grace period before an unreferenced blob is eligible for orphan pruning, so a
+/// blob a concurrent import just wrote (but hasn't recorded in the DB yet) is
+/// never deleted out from under it.
+const ORPHAN_GRACE: Duration = Duration::from_secs(600);
 
 fn dir_size(dir: &Path) -> u64 {
     std::fs::read_dir(dir)
@@ -74,6 +79,53 @@ impl Account {
             self.remove_local_files(&name);
         }
         Ok(())
+    }
+
+    /// Delete cached encrypted blobs (originals + thumbnails) that no DB row
+    /// references any more. Album / album-file deletes (and leaving an album)
+    /// drop rows but not their on-disk blobs; this reclaims them.
+    ///
+    /// A blob filename can be shared by several rows (e.g. a gallery file also
+    /// copied into an album reuse the same `.sp`), so a file is removed ONLY
+    /// when nothing references it. Returns the number of files deleted.
+    pub fn prune_orphan_blobs(&self) -> Result<usize> {
+        let mut referenced: HashSet<String> = HashSet::new();
+        for set in [FileSet::Gallery, FileSet::Trash] {
+            for f in self.db.list_files(set, Sort::Desc, None, 0)? {
+                referenced.insert(f.filename);
+            }
+        }
+        for f in self.db.list_all_album_files()? {
+            referenced.insert(f.filename);
+        }
+
+        let mut removed = 0;
+        for dir in [self.paths.originals_dir(), self.paths.thumbs_dir()] {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let Ok(meta) = e.metadata() else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
+                // Skip a blob young enough that a concurrent import may have just
+                // written it but not yet recorded the DB row (avoids a race that
+                // would delete a freshly-imported file).
+                let too_new = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.elapsed().ok())
+                    .map(|age| age < ORPHAN_GRACE)
+                    .unwrap_or(true);
+                if too_new {
+                    continue;
+                }
+                let name = e.file_name().to_string_lossy().to_string();
+                if !referenced.contains(&name) && std::fs::remove_file(e.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
     }
 
     /// Evict oldest cached files until under the configured limit. `force`

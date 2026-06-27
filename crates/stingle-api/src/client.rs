@@ -45,6 +45,19 @@ impl Client {
     /// `vN/` segment is appended automatically.
     pub fn new(server_url: Option<&str>) -> Result<Self> {
         let mut base = server_url.unwrap_or(DEFAULT_SERVER_URL).to_string();
+        // Refuse to derive the login auth hash etc. over a cleartext channel.
+        // Only `https://` is allowed, except plain-`http` to a loopback host for
+        // local development/self-hosting.
+        let lower = base.trim().to_ascii_lowercase();
+        let is_https = lower.starts_with("https://");
+        let is_local_http = lower.starts_with("http://localhost")
+            || lower.starts_with("http://127.0.0.1")
+            || lower.starts_with("http://[::1]");
+        if !is_https && !is_local_http {
+            return Err(ApiError::BadResponse(
+                "server URL must use https:// (http is only allowed for localhost)".into(),
+            ));
+        }
         if !base.ends_with('/') {
             base.push('/');
         }

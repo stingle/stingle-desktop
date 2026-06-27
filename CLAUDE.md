@@ -1,4 +1,4 @@
-# Stingle Photos Desktop — Project Guide
+# Stingle Desktop — Project Guide
 
 Cross-platform desktop client for Stingle Photos (E2E-encrypted photo backup),
 fully compatible with `api.stingle.org` and the Android `.sp` format.

@@ -20,6 +20,27 @@ pub struct Space {
     pub quota: i64,
 }
 
+/// Does this look like a real `.sp` blob rather than a server JSON error
+/// envelope (which `sync/download` returns with HTTP 200 on a bad token / rate
+/// limit)? Guards the on-disk cache against being poisoned with error bodies.
+fn is_sp_blob(bytes: &[u8]) -> bool {
+    bytes.len() >= stingle_crypto::file::FILE_HEADER_BEGINNING_LEN
+        && bytes.starts_with(stingle_crypto::constants::FILE_BEGINNING)
+}
+
+/// Cheap on-disk validity check: read just the 2-byte "SP" prefix. Lets us
+/// detect (and re-download) an empty or poisoned cached blob without reading a
+/// whole multi-GB original.
+fn sp_magic_ok(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = [0u8; 2];
+    f.read_exact(&mut buf).is_ok() && &buf == stingle_crypto::constants::FILE_BEGINNING
+}
+
 impl Account {
     // ----------------------------- cursors -----------------------------
 
@@ -103,6 +124,7 @@ impl Account {
             })?;
             cur.contacts = cur.contacts.max(rc.date_modified.unwrap_or(0));
         }
+        let had_deletes = !updates.deletes.is_empty();
         for de in &updates.deletes {
             self.process_delete(de)?;
             cur.deletes = cur.deletes.max(de.date);
@@ -110,10 +132,22 @@ impl Account {
 
         self.update_space(updates.space_used, updates.space_quota)?;
         self.save_cursors(&cur)?;
+        // Server deletes (album / album-file removals) drop DB rows but not the
+        // on-disk blobs; reclaim any that are now unreferenced.
+        if had_deletes {
+            let _ = self.prune_orphan_blobs();
+        }
         Ok(())
     }
 
     fn process_file(&self, set: FileSet, rf: &RemoteFile) -> Result<()> {
+        // The server is untrusted: refuse a filename that isn't a plain single
+        // component, so a crafted name can never be used to build a cache path
+        // that escapes the account directory. Skip (don't fail the whole sync).
+        if !crate::paths::is_safe_component(&rf.filename) {
+            tracing::warn!("skipping file with unsafe name from server: {:?}", rf.filename);
+            return Ok(());
+        }
         let existing = self.db.get_file(set, &rf.filename)?;
         let is_local =
             existing.as_ref().map(|e| e.is_local).unwrap_or(false) || self.paths.original(&rf.filename).exists();
@@ -136,6 +170,10 @@ impl Account {
     }
 
     fn process_album_file(&self, rf: &RemoteFile) -> Result<()> {
+        if !crate::paths::is_safe_component(&rf.filename) {
+            tracing::warn!("skipping album file with unsafe name from server: {:?}", rf.filename);
+            return Ok(());
+        }
         let is_local = self
             .db
             .get_album_file(&rf.album_id, &rf.filename)?
@@ -236,6 +274,12 @@ impl Account {
     }
 
     pub(crate) fn remove_local_files(&self, filename: &str) {
+        // Guard against a server-supplied delete event with a traversal name
+        // (`..\..\victim`) turning into deletion of an arbitrary file.
+        if !crate::paths::is_safe_component(filename) {
+            tracing::warn!("refusing to delete local files for unsafe name: {filename:?}");
+            return;
+        }
         let _ = std::fs::remove_file(self.paths.original(filename));
         let _ = std::fs::remove_file(self.paths.thumb(filename));
     }
@@ -294,14 +338,23 @@ impl Account {
         filename: &str,
         is_thumb: bool,
     ) -> Result<PathBuf> {
+        // Defense in depth: unsafe names are already rejected at sync ingest, but
+        // never build a cache path from one even if one slips through.
+        if !crate::paths::is_safe_component(filename) {
+            return Err(CoreError::Other("unsafe storage filename".into()));
+        }
         let path = if is_thumb {
             self.paths.thumb(filename)
         } else {
             self.paths.original(filename)
         };
-        if path.exists() && std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false) {
+        // A non-empty file is only trusted if it actually starts with the `.sp`
+        // magic. This both validates the cache and self-heals blobs poisoned by
+        // an older build that cached a server JSON error body (HTTP 200) here.
+        if path.exists() && sp_magic_ok(&path) {
             return Ok(path);
         }
+        let _ = std::fs::remove_file(&path); // drop any empty/poisoned blob
         let bytes = self.download_limited(filename, set.id(), is_thumb).await?;
         std::fs::write(&path, &bytes)?;
         let _ = self.enforce_cache_limit(false);
@@ -325,13 +378,24 @@ impl Account {
             .acquire()
             .await
             .map_err(|_| CoreError::Other("download semaphore closed".into()))?;
-        match self.client.download(self.token(), filename, set_id, is_thumb).await {
-            Ok(b) => Ok(b),
-            Err(_) => Ok(self
-                .client
-                .download(self.token(), filename, set_id, is_thumb)
-                .await?),
+        // Two attempts, to ride out a transient network error or a one-off server
+        // error body. CRITICAL: `sync/download` returns its JSON error envelope
+        // with HTTP 200 (bad token, rate limit, …), so a successful HTTP response
+        // is NOT proof of an `.sp` blob — validate the magic and never return /
+        // cache a body that would poison the on-disk cache.
+        let mut last: Option<CoreError> = None;
+        for _ in 0..2 {
+            match self.client.download(self.token(), filename, set_id, is_thumb).await {
+                Ok(b) if is_sp_blob(&b) => return Ok(b),
+                Ok(_) => {
+                    last = Some(CoreError::Other(
+                        "download did not return an SP file (server error body)".into(),
+                    ))
+                }
+                Err(e) => last = Some(e.into()),
+            }
         }
+        Err(last.unwrap_or_else(|| CoreError::Other("download failed".into())))
     }
 
     /// Download (if needed) and decrypt a file or thumbnail to plaintext bytes.
@@ -424,4 +488,26 @@ pub(crate) fn decode_b64_flexible(s: &str) -> Result<Vec<u8>> {
     }
     let std = GeneralPurpose::new(&alphabet::STANDARD, cfg);
     Ok(std.decode(s)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_non_sp_download_bodies() {
+        // A real `.sp` blob: "SP" magic + version + 32-byte id + 4-byte size.
+        let mut good = Vec::new();
+        good.extend_from_slice(stingle_crypto::constants::FILE_BEGINNING);
+        good.push(stingle_crypto::constants::CURRENT_FILE_VERSION);
+        good.extend_from_slice(&[0u8; 32]);
+        good.extend_from_slice(&[0u8; 4]);
+        assert!(is_sp_blob(&good));
+
+        // The server's HTTP-200 JSON error envelope must be rejected.
+        assert!(!is_sp_blob(br#"{"status":"error","parts":{}}"#));
+        // Empty / truncated bodies too.
+        assert!(!is_sp_blob(b""));
+        assert!(!is_sp_blob(b"SP"));
+    }
 }

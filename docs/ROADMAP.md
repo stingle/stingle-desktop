@@ -1,4 +1,4 @@
-# Stingle Photos Desktop — Implementation Roadmap
+# Stingle Desktop — Implementation Roadmap
 
 Goal: a cross-platform (Windows/macOS/Linux) desktop client that replicates the
 **full** functionality of the Stingle Photos Android app, is byte-compatible

@@ -4,7 +4,7 @@
 //! unreachable until the account is unlocked. These settings (last account,
 //! auto-unlock, storage path, minimize-to-tray, continuous sync) must be read
 //! *before* login, so they live in a single JSON file at a **fixed** location:
-//! `dirs::config_dir()/StinglePhotos/config.json`.
+//! `dirs::config_dir()/Stingle/config.json`.
 //!
 //! It cannot live inside the storage folder, because the storage path is itself
 //! one of these settings.
@@ -26,6 +26,18 @@ pub struct AutoUnlockBlob {
     pub cipher_b64: String,
 }
 
+/// A folder the app watches for new media to auto-import. Lives in the global
+/// config so the watcher can be configured before (and idle until) login.
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct WatchFolder {
+    /// Absolute path of the folder to watch.
+    pub path: String,
+    /// Permanently delete each original after — and only after — its encrypted
+    /// import is verified successful.
+    pub delete_originals: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(default)]
 pub struct AppConfig {
@@ -39,8 +51,16 @@ pub struct AppConfig {
     pub auto_unlock_blob: Option<AutoUnlockBlob>,
     /// Hide to tray instead of quitting when the window is closed.
     pub minimize_to_tray: bool,
+    /// Auto-download updates and apply them on the next relaunch. `None` is the
+    /// default (enabled); `Some(false)` disables auto-update, in which case the
+    /// UI shows a sidebar banner to install manually. A missing/old config file
+    /// therefore defaults to enabled.
+    pub auto_update: Option<bool>,
     /// Continuously sync & download all originals in the background.
     pub sync_everything: bool,
+    /// Folders watched for new media to auto-import (each with its own
+    /// delete-after-import setting).
+    pub watch_folders: Vec<WatchFolder>,
     // NOTE: start-with-PC is read from the autostart plugin (its own source of
     // truth), so it is intentionally not duplicated here.
 }
@@ -50,7 +70,25 @@ pub struct AppConfig {
 pub fn config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
+        .join("Stingle")
+}
+
+/// Pre-rename config directory (`…/StinglePhotos`), kept only for migration.
+fn legacy_config_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
         .join("StinglePhotos")
+}
+
+/// One-time migration of the config directory from the old `StinglePhotos` name
+/// to the new `Stingle` one. No-op unless the legacy dir exists and the new one
+/// does not, so it is safe to call on every startup.
+pub fn migrate_legacy_config_dir() {
+    let new = config_dir();
+    let old = legacy_config_dir();
+    if old.exists() && !new.exists() {
+        let _ = std::fs::rename(&old, &new);
+    }
 }
 
 fn config_file() -> PathBuf {
@@ -74,11 +112,14 @@ impl AppConfig {
         std::fs::write(config_file(), bytes).map_err(|e| e.to_string())
     }
 
-    /// The effective base dir: `storage_path` override, else the platform default.
-    pub fn effective_base_dir(&self) -> PathBuf {
+    /// The directory that holds the per-account folders. When the user has chosen
+    /// a custom location (`storage_path`), the account folders live *directly*
+    /// inside it. Otherwise they sit in an `accounts/` subfolder of the app-data
+    /// dir, alongside `config.json`.
+    pub fn effective_accounts_dir(&self) -> PathBuf {
         match &self.storage_path {
             Some(p) if !p.trim().is_empty() => PathBuf::from(p),
-            _ => stingle_core::paths::default_base_dir(),
+            _ => stingle_core::paths::default_base_dir().join("accounts"),
         }
     }
 }

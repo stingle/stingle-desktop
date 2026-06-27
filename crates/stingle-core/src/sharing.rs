@@ -121,6 +121,8 @@ impl Account {
             .await?;
         self.db.delete_all_files_in_album(album_id)?;
         self.db.delete_album(album_id)?;
+        // Reclaim the left album's now-unreferenced encrypted blobs.
+        let _ = self.prune_orphan_blobs();
         Ok(())
     }
 

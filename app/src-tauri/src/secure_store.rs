@@ -1,17 +1,28 @@
 //! Storage for the auto-unlock symmetric key.
 //!
 //! The 32-byte key encrypts the account password (kept as ciphertext in
-//! `config.json`). The key itself is kept in the OS secure store, released only
-//! after a biometric / user-consent prompt:
+//! `config.json`). The key itself is kept in the OS secure store:
 //!
-//! - **Windows:** Windows Hello (`UserConsentVerifier`) gates retrieval; the key
-//!   bytes live in the per-user `PasswordVault` (DPAPI-protected at rest).
+//! - **Windows:** the key bytes live in the per-user `PasswordVault`
+//!   (DPAPI-protected at rest). Before retrieving, we additionally show a
+//!   Windows Hello (`UserConsentVerifier`) prompt.
 //! - **macOS:** the key lives in the login Keychain (encrypted at rest).
 //! - **Other:** no biometric store; only the plaintext fallback applies.
 //!
+//! SECURITY (threat model): the Hello prompt is a UX speed-bump, NOT a
+//! cryptographic gate. The `PasswordVault` entry is bound to the OS *user
+//! account*, so any code already running as the same user can read it directly
+//! (and thus recover the stored password) WITHOUT passing the prompt. Likewise
+//! the Keychain item is readable by the unlocked login session. Enabling
+//! auto-unlock therefore lowers account security to "anything running as this
+//! OS user can obtain the account password." This is an explicit, user-opt-in
+//! trade-off; it is not protection against a malicious local process.
+//!
 //! **Plaintext fallback:** when no biometric store is available and the user
 //! explicitly opts in (after a danger warning), the key is written to disk in
-//! the clear. This is the one CLAUDE.md exception — a user-initiated weakening.
+//! the clear (no extra protection beyond the per-user profile's filesystem
+//! permissions). This is the one CLAUDE.md exception — a user-initiated
+//! weakening.
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -67,7 +78,10 @@ fn restrict_permissions(path: &std::path::Path) {
 
 #[cfg(not(unix))]
 fn restrict_permissions(_path: &std::path::Path) {
-    // Windows: the file sits under the per-user roaming profile, ACL-protected.
+    // Windows: the file sits under the per-user profile dir, which the default
+    // ACL restricts to this user + Administrators/SYSTEM. We do NOT tighten the
+    // ACL further here, so treat this as "readable by any process running as
+    // this user" — the same trust level as the plaintext fallback overall.
 }
 
 // ----------------------------- unified API -----------------------------
@@ -108,7 +122,7 @@ mod imp {
     };
     use windows::Security::Credentials::{PasswordCredential, PasswordVault};
 
-    const RESOURCE: &str = "StinglePhotosAutoUnlock";
+    const RESOURCE: &str = "StingleAutoUnlock";
 
     pub fn biometric_available() -> bool {
         match UserConsentVerifier::CheckAvailabilityAsync() {
@@ -140,7 +154,7 @@ mod imp {
     }
 
     pub fn retrieve(account_key: &str) -> Result<[u8; 32], String> {
-        prompt("Unlock Stingle Photos")?;
+        prompt("Unlock Stingle Desktop")?;
         let vault = PasswordVault::new().map_err(|e| e.to_string())?;
         let cred = vault
             .Retrieve(&HSTRING::from(RESOURCE), &HSTRING::from(account_key))
@@ -170,7 +184,7 @@ mod imp {
         delete_generic_password, get_generic_password, set_generic_password,
     };
 
-    const SERVICE: &str = "StinglePhotosAutoUnlock";
+    const SERVICE: &str = "StingleAutoUnlock";
 
     // The login Keychain is always present; treat it as the secure store. (The
     // key is encrypted at rest and unlocked with the macOS login session.)

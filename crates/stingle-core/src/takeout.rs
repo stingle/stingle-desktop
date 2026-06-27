@@ -104,15 +104,42 @@ fn sanitize(name: &str) -> String {
         .map(|c| if "/\\:*?\"<>|".contains(c) { '_' } else { c })
         .collect();
     let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
+    // `.`/`..` are valid filenames but, used as a path component, would point at
+    // the current/parent directory — never let them through as a name.
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
         "untitled".to_string()
     } else {
         trimmed.to_string()
     }
 }
 
-/// Avoid clobbering files with duplicate original names.
+/// Reduce an untrusted, header-derived filename to a safe bare filename for use
+/// as the final component of an output path.
+///
+/// The original filename inside a `.sp` header is sealed with an *anonymous*
+/// `crypto_box_seal`, so anyone who knows the recipient public key (the server,
+/// a MITM, or a malicious album sharer) can fabricate a header with any
+/// filename — including one containing `../`, a leading `/`, or `C:\…`. Writing
+/// decrypted bytes to `dir.join(that)` would escape `dir` and could drop a file
+/// into e.g. the Startup folder. We therefore keep only the final path
+/// component and neutralize separators / illegal characters.
+pub fn safe_filename(name: &str) -> String {
+    // Take the last component, splitting on BOTH separators (a Windows header
+    // opened on Linux keeps `\` as a literal char, and vice-versa).
+    let last = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned = sanitize(last);
+    if cleaned == "." || cleaned == ".." {
+        "untitled".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Avoid clobbering files with duplicate original names. The name is first run
+/// through [`safe_filename`], so an untrusted/header-derived `name` can never
+/// escape `dir`.
 pub(crate) fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    let name = &safe_filename(name);
     let candidate = dir.join(name);
     if !candidate.exists() {
         return candidate;
@@ -131,4 +158,30 @@ pub(crate) fn unique_path(dir: &Path, name: &str) -> PathBuf {
         }
     }
     candidate
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_filename;
+    use std::path::Path;
+
+    #[test]
+    fn reduces_to_a_safe_basename() {
+        assert_eq!(safe_filename("normal.jpg"), "normal.jpg");
+        assert_eq!(safe_filename("../../etc/passwd"), "passwd");
+        assert_eq!(safe_filename("..\\..\\evil.exe"), "evil.exe");
+        assert_eq!(safe_filename("/abs/x.jpg"), "x.jpg");
+        assert_eq!(safe_filename("C:\\Users\\a\\Startup\\x.exe"), "x.exe");
+        assert_eq!(safe_filename(".."), "untitled");
+        assert_eq!(safe_filename(""), "untitled");
+    }
+
+    #[test]
+    fn result_never_escapes_dir() {
+        let base = Path::new("/base/out");
+        for evil in ["../../e", "..\\..\\e", "/etc/p", "C:\\x\\y"] {
+            let joined = base.join(safe_filename(evil));
+            assert!(joined.starts_with(base), "{evil} escaped to {joined:?}");
+        }
+    }
 }

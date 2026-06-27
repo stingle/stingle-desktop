@@ -1,14 +1,50 @@
-import React, { useEffect, useState, useCallback, useRef } from "react";
+import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import {
   api, mediaUrl, pickFiles, pickFolder,
-  Session, FileItem, Album, LocalAccount,
-  SET_GALLERY, SET_TRASH, SET_ALBUM,
+  Session, FileItem, Album, LocalAccount, WatchFolder,
+  SET_GALLERY, SET_TRASH, SET_ALBUM, BLANK_COVER,
 } from "./api";
+import logoUrl from "./assets/stingle-logo.png";
 
 type View = "gallery" | "albums" | "trash" | "settings";
+
+/* ----------------------------- Icons ----------------------------- */
+// Crisp inline stroke icons (currentColor) replacing the generic emoji.
+const ICON_PROPS = {
+  width: 18, height: 18, viewBox: "0 0 24 24", fill: "none",
+  stroke: "currentColor", strokeWidth: 1.7,
+  strokeLinecap: "round" as const, strokeLinejoin: "round" as const,
+};
+const GalleryIcon = () => (
+  <svg {...ICON_PROPS}>
+    <rect x="3" y="3" width="18" height="18" rx="2.5" />
+    <circle cx="8.5" cy="8.5" r="1.6" />
+    <path d="M21 15l-5-5L5 21" />
+  </svg>
+);
+const AlbumsIcon = () => (
+  <svg {...ICON_PROPS}>
+    <path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4l2 2.2h8.5A1.5 1.5 0 0 1 20.5 9.7" />
+    <rect x="3" y="8.2" width="18" height="11" rx="1.8" />
+  </svg>
+);
+const TrashIcon = () => (
+  <svg {...ICON_PROPS}>
+    <path d="M4 7h16" />
+    <path d="M9 7V5.2A1.2 1.2 0 0 1 10.2 4h3.6A1.2 1.2 0 0 1 15 5.2V7" />
+    <path d="M6 7l1 12.2A1.8 1.8 0 0 0 8.8 21h6.4a1.8 1.8 0 0 0 1.8-1.8L18 7" />
+    <path d="M10 11v6M14 11v6" />
+  </svg>
+);
+const SettingsIcon = () => (
+  <svg {...ICON_PROPS}>
+    <circle cx="12" cy="12" r="3.1" />
+    <path d="M19.4 13a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1V19a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-2.7-1.1l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.6 1.6 0 0 0 4.6 13a2 2 0 1 1 0-4 1.6 1.6 0 0 0 1.1-2.7l-.1-.1A2 2 0 1 1 8.4 3.4l.1.1A1.6 1.6 0 0 0 11 4.6 2 2 0 1 1 15 4.6a1.6 1.6 0 0 0 2.7 1.1l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1A1.6 1.6 0 0 0 19.4 11a2 2 0 1 1 0 4z" />
+  </svg>
+);
 
 function fmtMB(mb: number): string {
   if (mb >= 1024) return (mb / 1024).toFixed(1) + " GB";
@@ -81,6 +117,26 @@ function inTextField(e: KeyboardEvent): boolean {
   const t = e.target as HTMLElement | null;
   return !!t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
 }
+
+/** One thumbnail. Memoized so a selection change (or a sync-triggered reload)
+ *  only re-renders the tiles that actually changed — critical with thousands of
+ *  tiles, where re-rendering the whole grid on every marquee frame would jank. */
+const TileView = React.memo(function TileView({
+  f, set, albumId, selected, selectionEmpty, renderExtra,
+}: {
+  f: FileItem; set: number; albumId: string | null;
+  selected: boolean; selectionEmpty: boolean;
+  renderExtra?: (f: FileItem) => React.ReactNode;
+}) {
+  return (
+    <div data-fn={f.filename} className={"tile" + (selected ? " sel" : "")}>
+      <img loading="lazy" draggable={false} src={mediaUrl(set, f.filename, true, albumId)} />
+      {f.is_video && <div className="vid-badge" aria-label="Video"><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M8 5v14l11-7z" /></svg></div>}
+      <div className="check">{selected ? "✓" : ""}</div>
+      {selectionEmpty && renderExtra?.(f)}
+    </div>
+  );
+});
 
 /** A selectable photo grid: click opens; checkbox/Ctrl-click toggles; Shift-click
  *  selects a range; drag a thumbnail to drag the file(s) out; drag from empty
@@ -283,20 +339,20 @@ function PhotoGrid({ items, set, albumId, grouped, sel, setSel, onOpen, renderEx
     }
   };
 
+  const selectionEmpty = sel.size === 0;
   const Tile = (f: FileItem) => (
-    <div key={f.filename} data-fn={f.filename}
-      className={"tile" + (sel.has(f.filename) ? " sel" : "")}>
-      <img loading="lazy" draggable={false} src={mediaUrl(set, f.filename, true, albumId)} />
-      {f.is_video && <div className="vid-badge" aria-label="Video"><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M8 5v14l11-7z" /></svg></div>}
-      <div className="check">{sel.has(f.filename) ? "✓" : ""}</div>
-      {sel.size === 0 && renderExtra?.(f)}
-    </div>
+    <TileView key={f.filename} f={f} set={set} albumId={albumId}
+      selected={sel.has(f.filename)} selectionEmpty={selectionEmpty} renderExtra={renderExtra} />
   );
+
+  // Re-grouping the whole list is cheap but pointless on every render (e.g. each
+  // marquee frame), so cache it until the items array itself changes.
+  const groups = useMemo(() => (grouped ? groupByDate(items) : null), [grouped, items]);
 
   return (
     <div ref={wrapRef} className="grid-wrap" onMouseDown={startDrag}>
-      {grouped
-        ? groupByDate(items).map((g) => (
+      {groups
+        ? groups.map((g) => (
             <div key={g.label}>
               <div className="date-header">{g.label}</div>
               <div className="grid">{g.entries.map(({ f }) => Tile(f))}</div>
@@ -360,7 +416,9 @@ function ZoomableImage({ thumbUrl, fullUrl, onDragOut }: { thumbUrl: string; ful
       <div
         ref={stageRef}
         className="zoom-stage"
-        onClick={(e) => e.stopPropagation()}
+        // Clicks on the actual image stay open; clicks on the empty margin
+        // around it bubble up to the viewer's onClose.
+        onClick={(e) => { if (e.target !== e.currentTarget) e.stopPropagation(); }}
         onMouseDown={onMouseDown}
         onMouseMove={onMouseMove}
         onMouseUp={endDrag}
@@ -391,10 +449,22 @@ export default function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<string | null>(null);
+  // Set when the server rejected our token. Forces the unlock screen to do a
+  // full online login (a plain offline resume would reuse the dead token).
+  const [sessionExpired, setSessionExpired] = useState(false);
 
   const showToast = useCallback((m: string) => {
     setToast(m);
     setTimeout(() => setToast(null), 2600);
+  }, []);
+
+  // The backend emits this when any sync hits a server "logout" (token expired).
+  useEffect(() => {
+    const un = listen("session-expired", () => {
+      setSession(null);
+      setSessionExpired(true);
+    });
+    return () => { un.then((f) => f()); };
   }, []);
 
   const refreshSession = useCallback(async () => {
@@ -405,32 +475,41 @@ export default function App() {
   useEffect(() => {
     if (didInit) return;
     didInit = true;
+    // Safety net: never strand the user on the boot spinner if a startup command
+    // is slow or hangs (e.g. a backend mid-restart, DB lock, or an unanswered
+    // biometric prompt). After this, we drop to the login/unlock screen, from
+    // which they can proceed manually.
+    const safety = setTimeout(() => setLoading(false), 10000);
     (async () => {
       try {
         const s = await api.session();
-        if (s.logged_in) { setSession(s); setLoading(false); return; }
+        if (s.logged_in) { setSession(s); return; }
         // Not logged in: if auto-unlock is armed, try it (may prompt biometric).
         if (await api.isAutoUnlockEnabled().catch(() => false)) {
           try {
             const u = await api.tryAutoUnlock();
-            if (u.logged_in) { setSession(u); setLoading(false); return; }
+            if (u.logged_in) { setSession(u); return; }
           } catch { /* fall through to the login screen */ }
         }
       } catch { /* ignore */ }
-      setLoading(false);
+      finally { clearTimeout(safety); setLoading(false); }
     })();
   }, []);
 
   if (loading) return <div className="auth"><div className="spinner" /></div>;
-  if (!session) return <AuthView onAuthed={setSession} />;
+  if (!session) return (
+    <AuthView
+      onAuthed={(s) => { setSessionExpired(false); setSession(s); }}
+      sessionExpired={sessionExpired}
+    />
+  );
   return <Main session={session} setSession={setSession} refreshSession={refreshSession} showToast={showToast} toast={toast} />;
 }
 
 /* ----------------------------- Auth ----------------------------- */
 
-function AuthView({ onAuthed }: { onAuthed: (s: Session) => void }) {
+function AuthView({ onAuthed, sessionExpired }: { onAuthed: (s: Session) => void; sessionExpired?: boolean }) {
   const [mode, setMode] = useState<"login" | "register" | "recover">("login");
-  const [accounts, setAccounts] = useState<LocalAccount[]>([]);
   const [lastAcc, setLastAcc] = useState<LocalAccount | null>(null);
   const [useOther, setUseOther] = useState(false);
   const [ready, setReady] = useState(false);
@@ -442,7 +521,6 @@ function AuthView({ onAuthed }: { onAuthed: (s: Session) => void }) {
   const [error, setError] = useState("");
 
   useEffect(() => {
-    api.localAccounts().then(setAccounts).catch(() => {});
     api.lastAccount().then((a) => { setLastAcc(a); setReady(true); }).catch(() => setReady(true));
   }, []);
 
@@ -465,18 +543,18 @@ function AuthView({ onAuthed }: { onAuthed: (s: Session) => void }) {
     setBusy(true); setError("");
     try {
       let s: Session;
-      try { s = await api.resume(lastAcc.account_key, password); }
-      catch { s = await api.login(lastAcc.server_url, lastAcc.email, password); }
+      if (sessionExpired) {
+        // The stored token was rejected by the server; an offline resume would
+        // just reuse it, so go straight to a full online login for a fresh token.
+        s = await api.login(lastAcc.server_url, lastAcc.email, password);
+      } else {
+        try { s = await api.resume(lastAcc.account_key, password); }
+        catch { s = await api.login(lastAcc.server_url, lastAcc.email, password); }
+      }
       onAuthed(s);
     } catch (e: any) {
       setError(String(e));
     } finally { setBusy(false); }
-  };
-
-  const logoutLast = async () => {
-    if (!lastAcc) return;
-    await api.forgetAccount(lastAcc.account_key).catch(() => {});
-    setLastAcc(null); setPassword(""); setUseOther(true);
   };
 
   const title = mode === "login" ? "Sign In" : mode === "register" ? "Create Account" : "Recover Account";
@@ -488,8 +566,11 @@ function AuthView({ onAuthed }: { onAuthed: (s: Session) => void }) {
     return (
       <div className="auth">
         <div className="auth-card">
-          <h1>Stingle Photos</h1>
+          <h1>Stingle Desktop</h1>
           <div className="sub">Welcome back</div>
+          {sessionExpired && (
+            <div className="error">Your session expired. Please enter your password to sign in again.</div>
+          )}
           <div className="field">
             <label>Account</label>
             <div className="muted" style={{ fontSize: 15 }}>{lastAcc.email}</div>
@@ -503,9 +584,8 @@ function AuthView({ onAuthed }: { onAuthed: (s: Session) => void }) {
           <button className="primary" style={{ width: "100%", marginTop: 10 }} disabled={busy} onClick={unlock}>
             {busy ? <span className="spinner" /> : "Unlock"}
           </button>
-          <div className="link-row">
-            <a onClick={logoutLast}>Log out</a>
-            <a onClick={() => { setUseOther(true); setEmail(""); setPassword(""); setError(""); }}>Use another account</a>
+          <div className="link-row" style={{ justifyContent: "center" }}>
+            <a onClick={() => { setUseOther(true); setEmail(""); setPassword(""); setError(""); }}>Sign in to a different account</a>
           </div>
         </div>
       </div>
@@ -515,25 +595,8 @@ function AuthView({ onAuthed }: { onAuthed: (s: Session) => void }) {
   return (
     <div className="auth">
       <div className="auth-card">
-        <h1>Stingle Photos</h1>
-        <div className="sub">End-to-end encrypted photo backup</div>
-
-        {accounts.length > 0 && mode === "login" && (
-          <div className="field">
-            <label>Account</label>
-            <select
-              style={{ width: "100%", padding: 9, background: "var(--bg)", color: "var(--fg)", border: "1px solid var(--border)", borderRadius: 8 }}
-              onChange={(ev) => {
-                const a = accounts.find((x) => x.email === ev.target.value);
-                if (a) { setEmail(a.email); setServer(a.server_url); }
-              }}
-              value={email}
-            >
-              <option value="">New / other account…</option>
-              {accounts.map((a) => <option key={a.account_key} value={a.email}>{a.email}</option>)}
-            </select>
-          </div>
-        )}
+        <h1>Stingle Desktop</h1>
+        <div className="sub">End-to-end encrypted backup</div>
 
         <div className="field">
           <label>Email</label>
@@ -596,21 +659,46 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
   const [reloadKey, setReloadKey] = useState(0);
   const [thumbs, setThumbs] = useState<{ done: number; total: number } | null>(null);
   const [originals, setOriginals] = useState<{ done: number; total: number } | null>(null);
+  // Set when auto-update is off and the backend reports an available update.
+  const [updateVer, setUpdateVer] = useState<string | null>(null);
+  const [updating, setUpdating] = useState(false);
   const reload = () => setReloadKey((k) => k + 1);
 
+  const installUpdate = useCallback(async () => {
+    setUpdating(true);
+    try { await api.installUpdate(); } // installs + restarts; never returns
+    catch (err) { setUpdating(false); showToast("Update failed: " + err); }
+  }, [showToast]);
+
+  // Auto-update off: the backend emits `update-available` at startup if a newer
+  // version exists, so the sidebar can offer a one-click install.
   useEffect(() => {
+    const un = listen<string>("update-available", (e) => setUpdateVer(e.payload));
+    return () => { un.then((f) => f()); };
+  }, []);
+
+  useEffect(() => {
+    // Progress events are emitted from many concurrent download tasks, so they
+    // can arrive out of order (e.g. 48 then 32). Clamp `done` to never go
+    // backwards within a batch so the counter rises smoothly instead of jumping.
+    const merge = (prev: { done: number; total: number } | null, done: number, total: number) => {
+      const sameBatch = prev && prev.total === total;
+      return { done: sameBatch ? Math.max(prev!.done, done) : done, total };
+    };
     const u1 = listen<[number, number]>("thumbs-progress", (e) =>
-      setThumbs({ done: e.payload[0], total: e.payload[1] })
+      setThumbs((prev) => merge(prev, e.payload[0], e.payload[1]))
     );
     const u2 = listen<number>("thumbs-done", () => {
       setThumbs(null);
-      reload();
+      reload(); // new thumbnails arrived → re-mount the <img>s so they show
     });
     const u3 = listen<[number, number]>("originals-progress", (e) =>
-      setOriginals(e.payload[1] > 0 ? { done: e.payload[0], total: e.payload[1] } : null)
+      setOriginals((prev) => (e.payload[1] > 0 ? merge(prev, e.payload[0], e.payload[1]) : null))
     );
     const u4 = listen<number>("originals-done", () => {
       setOriginals(null);
+      // The background "sync everything" loop runs a full_sync (which can pull in
+      // new photos) before each originals pass, so refresh the grid here too.
       reload();
     });
     return () => { u1.then((f) => f()); u2.then((f) => f()); u3.then((f) => f()); u4.then((f) => f()); };
@@ -688,14 +776,22 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
   return (
     <div className="app">
       <div className="sidebar">
-        <div className="brand"><span className="dot" /> Stingle</div>
+        <div className="brand">
+          <img className="brand-logo" src={logoUrl} alt="" />
+          <div className="brand-title">Stingle Desktop</div>
+        </div>
         <div className="nav">
-          <button className={view === "gallery" ? "active" : ""} onClick={() => setView("gallery")}>🖼️ Gallery</button>
-          <button className={view === "albums" ? "active" : ""} onClick={() => setView("albums")}>📁 Albums</button>
-          <button className={view === "trash" ? "active" : ""} onClick={() => setView("trash")}>🗑️ Trash</button>
-          <button className={view === "settings" ? "active" : ""} onClick={() => setView("settings")}>⚙️ Settings</button>
+          <button className={view === "gallery" ? "active" : ""} onClick={() => setView("gallery")}><GalleryIcon /> Gallery</button>
+          <button className={view === "albums" ? "active" : ""} onClick={() => setView("albums")}><AlbumsIcon /> Albums</button>
+          <button className={view === "trash" ? "active" : ""} onClick={() => setView("trash")}><TrashIcon /> Trash</button>
+          <button className={view === "settings" ? "active" : ""} onClick={() => setView("settings")}><SettingsIcon /> Settings</button>
         </div>
         <div className="spacer" />
+        {updateVer && (
+          <button className="update-banner" disabled={updating} onClick={installUpdate}>
+            {updating ? "Updating…" : `⤓ Update to ${updateVer} — restart now`}
+          </button>
+        )}
         <div className="acct">{session.email}</div>
         <div className="storage-bar"><div style={{ width: pct + "%" }} /></div>
         <div className="acct">{fmtMB(session.space_used)} / {fmtMB(session.space_quota)}</div>
@@ -726,15 +822,64 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
 
 /* ----------------------------- Gallery ----------------------------- */
 
+// Progressive load: render the first page almost immediately, then fetch the
+// rest in the background and append it in chunks. The full array is kept once
+// loaded, so selection / marquee / viewer index math is unaffected — only the
+// first-paint latency and the cost of one giant IPC call are removed.
+const FIRST_PAGE = 1000;
+const REST_PAGE = 4000;
+function usePagedFiles(
+  fetchPage: (offset: number, limit: number) => Promise<FileItem[]>,
+  reloadSignal: number,
+): { items: FileItem[]; reload: () => void } {
+  const [items, setItems] = useState<FileItem[]>([]);
+  // Latest committed list, read at reload time to tell a cold load (empty grid →
+  // show progressively) from a warm reload (grid already populated → swap once at
+  // the end, so a sync-triggered reload doesn't visibly shrink then regrow).
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  // Bumped on each (re)load so a superseded in-flight load stops updating state.
+  const tokenRef = useRef(0);
+  const reload = useCallback(() => {
+    const token = ++tokenRef.current;
+    const cold = itemsRef.current.length === 0;
+    (async () => {
+      const first = await fetchPage(0, FIRST_PAGE);
+      if (token !== tokenRef.current) return;
+      if (cold) setItems(first);
+      // Dedupe by filename: a concurrent sync insert can shift OFFSET and make a
+      // row reappear across a page boundary. Advance `offset` by the raw page
+      // length so pagination stays aligned with the backend regardless.
+      const seen = new Set(first.map((f) => f.filename));
+      const acc = first.slice();
+      let offset = first.length;
+      let done = first.length < FIRST_PAGE; // first page was the whole list
+      while (!done) {
+        const page = await fetchPage(offset, REST_PAGE);
+        if (token !== tokenRef.current) return;
+        for (const f of page) {
+          if (!seen.has(f.filename)) { seen.add(f.filename); acc.push(f); }
+        }
+        offset += page.length;
+        done = page.length < REST_PAGE;
+        if (cold) setItems(acc.slice()); // grow the grid as chunks arrive
+      }
+      if (!cold) setItems(acc); // warm: single atomic swap, no flicker
+    })().catch(() => { /* leave the previous list in place on failure */ });
+  }, [fetchPage]);
+  useEffect(() => { reload(); }, [reload, reloadSignal]);
+  return { items, reload };
+}
+
 function GalleryView({ syncing, onSync, showToast, onChanged, reloadSignal }: {
   syncing: boolean; onSync: () => void; showToast: (m: string) => void; onChanged: () => void; reloadSignal: number;
 }) {
-  const [items, setItems] = useState<FileItem[]>([]);
   const [sel, setSel] = useState<Set<string>>(new Set());
   const [viewerIdx, setViewerIdx] = useState<number | null>(null);
 
-  const load = useCallback(() => { api.listGallery(0, 100000).then(setItems); }, []);
-  useEffect(() => { load(); }, [load, reloadSignal]);
+  const fetchPage = useCallback(
+    (offset: number, limit: number) => api.listGallery(offset, limit), []);
+  const { items, reload: load } = usePagedFiles(fetchPage, reloadSignal);
 
   const doImport = async () => {
     const files = await pickFiles();
@@ -799,8 +944,15 @@ function GalleryView({ syncing, onSync, showToast, onChanged, reloadSignal }: {
 function AlbumsView({ showToast, reloadSignal }: { showToast: (m: string) => void; reloadSignal: number }) {
   const [albums, setAlbums] = useState<Album[]>([]);
   const [open, setOpen] = useState<Album | null>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const scrollPos = useRef(0);
   const load = useCallback(() => { api.listAlbums().then(setAlbums); }, []);
   useEffect(() => { load(); }, [load, reloadSignal]);
+
+  // Restore the list's scroll position after returning from an opened album.
+  useLayoutEffect(() => {
+    if (!open && contentRef.current) contentRef.current.scrollTop = scrollPos.current;
+  }, [open]);
 
   const create = async () => {
     const name = prompt("Album name:");
@@ -818,13 +970,16 @@ function AlbumsView({ showToast, reloadSignal }: { showToast: (m: string) => voi
         <h2>Albums</h2>
         <div className="actionbar"><button className="primary" onClick={create}>＋ New Album</button></div>
       </div>
-      <div className="content">
+      <div className="content" ref={contentRef}>
         {albums.length === 0 ? <div className="empty">No albums yet.</div> : (
           <div className="albums">
             {albums.map((a) => (
-              <div key={a.album_id} className="album-card" onClick={() => setOpen(a)}>
+              <div key={a.album_id} className="album-card"
+                onClick={() => { scrollPos.current = contentRef.current?.scrollTop ?? 0; setOpen(a); }}>
                 <div className="cover">
-                  {a.cover ? <img src={mediaUrl(SET_ALBUM, a.cover, true, a.album_id)} /> : "📁"}
+                  {a.cover === BLANK_COVER
+                    ? <div className="blank-cover">🖼️</div>
+                    : a.cover ? <img src={mediaUrl(SET_ALBUM, a.cover, true, a.album_id)} /> : "📁"}
                 </div>
                 <div className="meta">
                   <div className="name">{a.name} {a.is_shared ? "👥" : ""}</div>
@@ -865,6 +1020,10 @@ function AlbumDetail({ album, onBack, showToast }: { album: Album; onBack: () =>
     if (!confirm(`Delete album "${album.name}"?`)) return;
     await api.deleteAlbum(album.album_id); onBack();
   };
+  const blankCover = async () => {
+    if (!confirm("Hide this album's contents behind a blank cover?")) return;
+    await api.setAlbumBlankCover(album.album_id); showToast("Blank album cover set");
+  };
   const share = async () => {
     const email = prompt("Share with (email):");
     if (!email) return;
@@ -902,6 +1061,7 @@ function AlbumDetail({ album, onBack, showToast }: { album: Album; onBack: () =>
               {album.is_owner && <button onClick={share}>👥 Share</button>}
               {album.is_owner && album.is_shared && <button onClick={unshare}>Unshare</button>}
               {album.is_owner && <button onClick={rename}>Rename</button>}
+              {album.is_owner && <button onClick={blankCover}>Blank cover</button>}
               {album.is_owner && <button onClick={del}>Delete</button>}
               {!album.is_owner && <button onClick={leave}>Leave</button>}
             </>
@@ -974,6 +1134,7 @@ function SettingsView({ session, setSession, showToast }: {
   // App options
   const [autostart, setAutostart] = useState(false);
   const [minTray, setMinTray] = useState(false);
+  const [autoUpdate, setAutoUpdate] = useState(true);
   const [syncEvery, setSyncEvery] = useState(false);
   const [autoUnlock, setAutoUnlock] = useState(false);
   const [biometric, setBiometric] = useState(false);
@@ -981,6 +1142,15 @@ function SettingsView({ session, setSession, showToast }: {
   const [auPassword, setAuPassword] = useState("");
   const [storagePath, setStoragePath] = useState("");
   const [moving, setMoving] = useState<{ done: number; total: number } | null>(null);
+  const [confirmSignOut, setConfirmSignOut] = useState(false);
+
+  // Watch folders
+  const [watchFolders, setWatchFolders] = useState<WatchFolder[]>([]);
+  const [watchStatus, setWatchStatus] = useState<string | null>(null);
+
+  // About / updates
+  const [version, setVersion] = useState("");
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
 
   const refreshCache = () => { api.cacheSize().then((b) => setCacheSizeMB(b / 1048576)); };
   useEffect(() => {
@@ -988,10 +1158,13 @@ function SettingsView({ session, setSession, showToast }: {
     refreshCache();
     api.getAutostart().then(setAutostart).catch(() => {});
     api.getMinimizeToTray().then(setMinTray).catch(() => {});
+    api.getAutoUpdate().then(setAutoUpdate).catch(() => {});
+    api.getAppVersion().then(setVersion).catch(() => {});
     api.getSyncEverything().then(setSyncEvery).catch(() => {});
     api.isAutoUnlockEnabled().then(setAutoUnlock).catch(() => {});
     api.secureStoreStatus().then((s) => setBiometric(s.biometric)).catch(() => {});
     api.getStoragePath().then(setStoragePath).catch(() => {});
+    api.getWatchFolders().then(setWatchFolders).catch(() => {});
   }, []);
 
   // Progress bar while the storage folder is being moved.
@@ -1002,6 +1175,32 @@ function SettingsView({ session, setSession, showToast }: {
     return () => { u.then((f) => f()); };
   }, []);
 
+  // Live status from the watch-folder importer.
+  useEffect(() => {
+    const u1 = listen<string>("watch-import-progress", (e) =>
+      setWatchStatus(`Imported ${e.payload}`)
+    );
+    const u2 = listen<string>("watch-import-error", (e) => setWatchStatus(e.payload));
+    return () => { u1.then((f) => f()); u2.then((f) => f()); };
+  }, []);
+
+  // Persist the watch list and reflect it locally.
+  const saveWatchFolders = async (next: WatchFolder[]) => {
+    setWatchFolders(next);
+    try { await api.setWatchFolders(next); }
+    catch (e) { showToast("Failed to save watch folders: " + e); }
+  };
+  const addWatchFolder = async () => {
+    const dir = await pickFolder();
+    if (!dir) return;
+    if (watchFolders.some((w) => w.path === dir)) { showToast("Already watching that folder"); return; }
+    await saveWatchFolders([...watchFolders, { path: dir, delete_originals: false }]);
+  };
+  const removeWatchFolder = (path: string) =>
+    saveWatchFolders(watchFolders.filter((w) => w.path !== path));
+  const toggleDeleteOriginals = (path: string, v: boolean) =>
+    saveWatchFolders(watchFolders.map((w) => (w.path === path ? { ...w, delete_originals: v } : w)));
+
   const toggleAutostart = async (v: boolean) => {
     try { await api.setAutostart(v); setAutostart(v); }
     catch (e) { showToast("Failed: " + e); }
@@ -1009,6 +1208,24 @@ function SettingsView({ session, setSession, showToast }: {
   const toggleMinTray = async (v: boolean) => {
     try { await api.setMinimizeToTray(v); setMinTray(v); }
     catch (e) { showToast("Failed: " + e); }
+  };
+  const toggleAutoUpdate = async (v: boolean) => {
+    try { await api.setAutoUpdate(v); setAutoUpdate(v); }
+    catch (e) { showToast("Failed: " + e); }
+  };
+  const checkForUpdate = async () => {
+    setCheckingUpdate(true);
+    try {
+      const ver = await api.checkForUpdate();
+      if (ver) {
+        if (confirm(`Version ${ver} is available. Install it now and restart?`)) {
+          await api.installUpdate(); // installs + restarts; never returns
+        }
+      } else {
+        showToast("You're on the latest version");
+      }
+    } catch (e) { showToast("Update check failed: " + e); }
+    finally { setCheckingUpdate(false); }
   };
   const toggleSyncEvery = async (v: boolean) => {
     try { await api.setSyncEverything(v); setSyncEvery(v); showToast(v ? "Syncing everything locally" : "Continuous sync off"); }
@@ -1045,7 +1262,7 @@ function SettingsView({ session, setSession, showToast }: {
   const changeStorage = async () => {
     const dir = await pickFolder();
     if (!dir || dir === storagePath) return;
-    if (!window.confirm(`Move all local data to:\n${dir}\n\nThe app will lock during the move.`)) return;
+    if (!window.confirm(`Move your photo library to:\n${dir}\n\nApp settings stay in their current location. The app will pause during the move.`)) return;
     setMoving({ done: 0, total: 0 });
     try {
       await api.changeStoragePath(dir);
@@ -1124,6 +1341,16 @@ function SettingsView({ session, setSession, showToast }: {
             <span>Minimize to the tray instead of quitting when I close the window</span>
           </label>
           <label className="opt-row">
+            <input type="checkbox" checked={autoUpdate} onChange={(e) => toggleAutoUpdate(e.target.checked)} />
+            <span>
+              Automatically download updates
+              <span className="muted" style={{ display: "block", fontSize: 12 }}>
+                New versions are downloaded in the background and applied the next time you open the app.
+                When off, you'll be offered the update in the sidebar instead.
+              </span>
+            </span>
+          </label>
+          <label className="opt-row">
             <input type="checkbox" checked={autoUnlock} onChange={(e) => onAutoUnlockToggle(e.target.checked)} />
             <span>
               Unlock automatically on startup
@@ -1159,7 +1386,44 @@ function SettingsView({ session, setSession, showToast }: {
         </div>
 
         <div className="settings-section">
+          <h3>Watch folders</h3>
+          <p className="muted" style={{ fontSize: 13 }}>
+            New photos and videos placed in these folders are imported automatically.
+          </p>
+          {watchFolders.length === 0 && (
+            <p className="muted" style={{ fontSize: 13 }}>No folders watched yet.</p>
+          )}
+          {watchFolders.map((w) => (
+            <div key={w.path} className="settings-section" style={{ padding: "10px 12px", marginBottom: 8 }}>
+              <div className="row" style={{ alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                <span style={{ wordBreak: "break-all" }}>{w.path}</span>
+                <button onClick={() => removeWatchFolder(w.path)}>Remove</button>
+              </div>
+              <label className="opt-row" style={{ marginTop: 6 }}>
+                <input
+                  type="checkbox"
+                  checked={w.delete_originals}
+                  onChange={(e) => toggleDeleteOriginals(w.path, e.target.checked)}
+                />
+                <span>
+                  Delete originals after successful import
+                  <span className="muted" style={{ display: "block", fontSize: 12 }}>
+                    Each original is <b>permanently deleted</b>, but only after its encrypted copy is
+                    written, decrypts back to the exact same file, and is confirmed in your library.
+                  </span>
+                </span>
+              </label>
+            </div>
+          ))}
+          <button onClick={addWatchFolder}>Add folder…</button>
+          {watchStatus && (
+            <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>{watchStatus}</div>
+          )}
+        </div>
+
+        <div className="settings-section">
           <h3>Storage location</h3>
+          <p className="muted" style={{ fontSize: 13 }}>Where your encrypted photo library is kept. App settings stay in the app data folder.</p>
           <p className="muted" style={{ fontSize: 13, wordBreak: "break-all" }}>{storagePath}</p>
           <button onClick={changeStorage} disabled={!!moving}>Change…</button>
           {moving && (
@@ -1181,13 +1445,36 @@ function SettingsView({ session, setSession, showToast }: {
         </div>
 
         <div className="settings-section">
+          <h3>About</h3>
+          <div className="row" style={{ alignItems: "center", justifyContent: "space-between", gap: 8, maxWidth: 360 }}>
+            <span className="muted">Stingle Desktop{version && ` — version ${version}`}</span>
+            <button onClick={checkForUpdate} disabled={checkingUpdate}>
+              {checkingUpdate ? "Checking…" : "Check for updates"}
+            </button>
+          </div>
+        </div>
+
+        <div className="settings-section">
           <h3>Session</h3>
           <div className="actionbar">
             <button onClick={async () => { await api.lock(); setSession(null); }}>Lock</button>
-            <button onClick={async () => { await api.logout(false); setSession(null); }}>Sign out</button>
+            <button onClick={() => setConfirmSignOut(true)}>Sign out</button>
           </div>
         </div>
       </div>
+
+      {confirmSignOut && (
+        <ConfirmDialog
+          title="Sign out"
+          message={<>Do you want to delete all locally stored data (downloaded photos, thumbnails and database) for <b>{session.email}</b>? You can keep it for a faster next sign-in.</>}
+          onClose={() => setConfirmSignOut(false)}
+          actions={[
+            { label: "Cancel", onClick: () => setConfirmSignOut(false) },
+            { label: "Keep data", onClick: async () => { setConfirmSignOut(false); await api.logout(false); setSession(null); } },
+            { label: "Delete all data", variant: "danger", onClick: async () => { setConfirmSignOut(false); await api.logout(true); setSession(null); } },
+          ]}
+        />
+      )}
     </>
   );
 }
@@ -1226,7 +1513,9 @@ function MoveDialog({ fromSet, fromAlbum, count, onPick, onClose }: {
   const Card = (a: Album) => (
     <div key={a.album_id} className="move-card" onClick={() => onPick({ type: "album", id: a.album_id }, isMoving)}>
       <div className="move-cover">
-        {a.cover ? <img src={mediaUrl(SET_ALBUM, a.cover, true, a.album_id)} /> : <span>📁</span>}
+        {a.cover === BLANK_COVER
+          ? <span>🖼️</span>
+          : a.cover ? <img src={mediaUrl(SET_ALBUM, a.cover, true, a.album_id)} /> : <span>📁</span>}
       </div>
       <div className="move-name" title={a.name}>{a.name}</div>
       <div className="move-count">{a.count} item{a.count === 1 ? "" : "s"}</div>
@@ -1267,6 +1556,41 @@ function MoveDialog({ fromSet, fromAlbum, count, onPick, onClose }: {
         </div>
         {priv.length > 0 && <><div className="move-section">My albums</div><div className="move-grid">{priv.map(Card)}</div></>}
         {shared.length > 0 && <><div className="move-section">Shared albums</div><div className="move-grid">{shared.map(Card)}</div></>}
+      </div>
+    </div>
+  );
+}
+
+type ConfirmAction = { label: string; onClick: () => void; variant?: "primary" | "danger" };
+
+// A small reusable confirmation modal supporting up to a few labeled actions.
+// Esc or a backdrop click cancels (runs `onClose`).
+function ConfirmDialog({ title, message, actions, onClose }: {
+  title: string; message?: React.ReactNode; actions: ConfirmAction[]; onClose: () => void;
+}) {
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [onClose]);
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h3>{title}</h3>
+        {message && <p className="muted" style={{ fontSize: 14, lineHeight: 1.5, marginTop: 0 }}>{message}</p>}
+        <div className="actionbar" style={{ justifyContent: "flex-end", marginTop: 18 }}>
+          {actions.map((a, i) => (
+            <button
+              key={i}
+              className={a.variant === "primary" ? "primary" : ""}
+              style={a.variant === "danger" ? { background: "#b3261e", color: "#fff", borderColor: "#b3261e" } : undefined}
+              onClick={a.onClick}
+            >
+              {a.label}
+            </button>
+          ))}
+        </div>
       </div>
     </div>
   );

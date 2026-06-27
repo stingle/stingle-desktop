@@ -236,6 +236,33 @@ impl Account {
             Ok(self.keypair.public_key.clone())
         }
     }
+
+    /// Prove a just-imported gallery original is a faithful, decryptable backup
+    /// of its source: decrypt the stored `.sp` **in memory** (never to disk) and
+    /// confirm the plaintext exactly matches the source's length and SHA-256.
+    ///
+    /// This is the gate the watch-folder importer must clear before it is allowed
+    /// to delete a user's original file. Returns `Ok(true)` only on an exact
+    /// match; `Ok(false)` on any mismatch; `Err` if the blob can't be read or
+    /// decrypted at all.
+    pub fn verify_local_original(
+        &self,
+        filename: &str,
+        expected_sha256: &[u8],
+        expected_len: u64,
+    ) -> Result<bool> {
+        let sp = std::fs::read(self.paths.original(filename))?;
+        let plain = file::decrypt_bytes(
+            &sp,
+            &self.keypair.public_key,
+            &self.keypair.secret_key,
+        )?;
+        if plain.len() as u64 != expected_len {
+            return Ok(false);
+        }
+        let actual = sodium::sha256(&plain)?;
+        Ok(actual.as_slice() == expected_sha256)
+    }
 }
 
 fn collect_media(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
@@ -248,5 +275,61 @@ fn collect_media(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
                 out.push(p);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::account::{Account, AccountInfo};
+    use stingle_crypto::keys::KeyPair;
+
+    /// Import a tiny gallery file and confirm `verify_local_original` only
+    /// returns true for the exact source bytes — the gate the watch-folder
+    /// importer must clear before deleting an original.
+    #[tokio::test]
+    async fn verify_local_original_roundtrips() {
+        let tag = hex::encode(sodium::random_bytes(8).unwrap());
+        let base = std::env::temp_dir().join(format!("stingle-verify-test-{tag}"));
+
+        let keypair = KeyPair::generate().unwrap();
+        let info = AccountInfo {
+            email: "test@example.com".into(),
+            user_id: "1".into(),
+            home_folder: "home".into(),
+            server_url: "https://api.stingle.org".into(),
+            server_pk_b64: String::new(),
+            key_bundle_b64: String::new(),
+            token: "t".into(),
+            token_enc: None,
+            is_key_backed_up: false,
+        };
+        let acc = Account::reopen_at(&base, info, keypair, Vec::new()).unwrap();
+
+        // A non-image .jpg is fine: the thumbnailer falls back to a placeholder.
+        let src = base.join("photo.jpg");
+        let payload = b"hello stingle integrity check payload";
+        std::fs::write(&src, payload).unwrap();
+
+        let filename = acc
+            .import_file(&src, FileSet::Gallery, None)
+            .await
+            .unwrap()
+            .expect("fresh import returns a filename");
+
+        let sha = sodium::sha256(payload).unwrap();
+        // Exact match passes.
+        assert!(acc
+            .verify_local_original(&filename, &sha, payload.len() as u64)
+            .unwrap());
+        // Wrong length fails closed.
+        assert!(!acc.verify_local_original(&filename, &sha, 1).unwrap());
+        // Wrong hash fails closed.
+        let wrong = sodium::sha256(b"tampered").unwrap();
+        assert!(!acc
+            .verify_local_original(&filename, &wrong, payload.len() as u64)
+            .unwrap());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -62,6 +62,12 @@ impl Account {
             .for_each_concurrent(concurrency.max(1), |(set, filename)| {
                 let done = &done;
                 async move {
+                    // Hold a bulk permit so this prefetch never occupies every
+                    // download lane — on-demand thumbnail requests stay snappy.
+                    let _bulk = match self.bulk_sem.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
                     // Best-effort: a single failed thumbnail shouldn't abort the batch.
                     let _ = self.fetch_thumb_blob(set, &filename).await;
                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -119,11 +125,24 @@ impl Account {
             return Ok(0);
         }
 
+        // Fresh start: clear any stale cancellation from a previous toggle.
+        self.stop_originals.store(false, Ordering::Relaxed);
+
         let done = AtomicUsize::new(0);
         stream::iter(items)
             .for_each_concurrent(concurrency.max(1), |(set, _album, filename)| {
                 let done = &done;
                 async move {
+                    // Stop promptly if the user turned "keep originals locally" off
+                    // mid-run. Already-queued items just fall through as no-ops.
+                    if self.stop_originals.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    // Reserve download lanes for on-demand requests (see bulk_sem).
+                    let _bulk = match self.bulk_sem.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
                     // Best-effort: a single failed original shouldn't abort the batch.
                     let _ = self.ensure_encrypted(set, &filename, false).await;
                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;

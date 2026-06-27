@@ -10,6 +10,11 @@ use crate::account::Account;
 use crate::error::Result;
 use crate::util::now_ms;
 
+/// Sentinel `cover` value that hides an album's contents behind a generic
+/// placeholder instead of any real photo. Byte-compatible with the Android
+/// client's `SetAlbumCoverAsyncTask.ALBUM_COVER_BLANK_TEXT`.
+pub const ALBUM_COVER_BLANK: &str = "__b__";
+
 /// 32-byte random album id, base64url-encoded (matches `CryptoHelpers.getRandomString(32)`).
 fn new_album_id() -> Result<String> {
     Ok(B64URL.encode(sodium::random_bytes(32)?))
@@ -79,6 +84,8 @@ impl Account {
             .await?;
         self.db.delete_all_files_in_album(album_id)?;
         self.db.delete_album(album_id)?;
+        // Reclaim the album's now-unreferenced encrypted blobs.
+        let _ = self.prune_orphan_blobs();
         Ok(())
     }
 
@@ -93,6 +100,13 @@ impl Account {
             self.db.upsert_album(&a)?;
         }
         Ok(())
+    }
+
+    /// Set a blank album cover: hides the album's contents behind a generic
+    /// placeholder by storing the `__b__` sentinel ([`ALBUM_COVER_BLANK`]).
+    /// Mirrors the Android "Set a blank album cover" action.
+    pub async fn set_album_blank_cover(&self, album_id: &str) -> Result<()> {
+        self.set_album_cover(album_id, ALBUM_COVER_BLANK).await
     }
 
     /// Decrypt an album's display name from its metadata.

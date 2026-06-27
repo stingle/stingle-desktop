@@ -22,6 +22,15 @@ pub enum CoreError {
     Other(String),
 }
 
+impl CoreError {
+    /// True when the server rejected our token and asked us to log out (the
+    /// session expired). Callers should drop the session and re-authenticate
+    /// rather than keep hammering the API with a dead token.
+    pub fn is_logged_out(&self) -> bool {
+        matches!(self, CoreError::Api(stingle_api::ApiError::LoggedOut))
+    }
+}
+
 impl From<base64::DecodeError> for CoreError {
     fn from(e: base64::DecodeError) -> Self {
         CoreError::Base64(e.to_string())

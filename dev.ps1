@@ -1,5 +1,5 @@
 <#
-  Build & (re)launch the Stingle Photos desktop app in dev mode.
+  Build & (re)launch the Stingle Desktop app in dev mode.
 
   Usage:
     Double-click  dev.cmd

@@ -406,7 +406,7 @@ pub fn decrypt_range<R: Read + Seek>(
     start: u64,
     end_inclusive: u64,
 ) -> Result<Vec<u8>> {
-    if chunk_size == 0 {
+    if chunk_size < 1 || chunk_size as usize > MAX_BUFFER_LENGTH {
         return Err(CryptoError::MalformedFile("invalid chunk size"));
     }
     let chunk = chunk_size as u64;

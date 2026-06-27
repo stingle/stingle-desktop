@@ -5,10 +5,10 @@
 //! ffmpeg ever reads from a path is the user's own local file during import.
 
 use std::io::{Cursor, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Once;
+use std::sync::OnceLock;
 
 use image::imageops::FilterType;
 use image::ImageReader;
@@ -28,18 +28,7 @@ pub fn image_thumbnail(image_bytes: &[u8]) -> Result<Vec<u8>> {
     encode_jpeg(&thumb)
 }
 
-static FFMPEG_INIT: Once = Once::new();
-static mut FFMPEG_OK: bool = false;
-
-/// Ensure an ffmpeg binary is available (downloads a managed copy on first use).
-fn ensure_ffmpeg() -> bool {
-    FFMPEG_INIT.call_once(|| {
-        let ok = install_ffmpeg().is_ok();
-        // SAFETY: written exactly once inside call_once.
-        unsafe { FFMPEG_OK = ok };
-    });
-    unsafe { FFMPEG_OK }
-}
+static FFMPEG: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// Install ffmpeg if needed (ffmpeg-sidecar's managed "essentials" build, which
 /// does decode HEIC/HEIF — see [`transcode_to_jpeg`] for the seekable-input
@@ -48,17 +37,61 @@ fn install_ffmpeg() -> Result<()> {
     ffmpeg_sidecar::download::auto_download().map_err(|e| CoreError::Other(e.to_string()))
 }
 
+/// Resolve a usable ffmpeg binary exactly once.
+///
+/// SECURITY (supply chain): ffmpeg is fed DECRYPTED image bytes on stdin, so a
+/// tampered binary is a plaintext-disclosure / code-execution risk. By default
+/// we fall back to ffmpeg-sidecar's *managed* build, which is downloaded over
+/// HTTPS on first use but is NOT signature-pinned. To close that hole:
+///   - `STINGLE_FFMPEG` — absolute path to a trusted ffmpeg (e.g. one bundled
+///     into the signed installer). When set, no download happens.
+///   - `STINGLE_FFMPEG_SHA256` — hex SHA-256 the resolved binary MUST match,
+///     else ffmpeg is refused. This is the only setting that fully verifies
+///     integrity; packaged builds should set both.
+fn resolve_ffmpeg() -> Option<PathBuf> {
+    let path = match std::env::var_os("STINGLE_FFMPEG") {
+        Some(p) => PathBuf::from(p),
+        None => {
+            if install_ffmpeg().is_err() {
+                return None;
+            }
+            ffmpeg_sidecar::paths::ffmpeg_path()
+        }
+    };
+    if !path.exists() {
+        return None;
+    }
+    if let Ok(expected) = std::env::var("STINGLE_FFMPEG_SHA256") {
+        if !sha256_matches(&path, expected.trim()) {
+            tracing::error!("ffmpeg SHA-256 verification failed for {path:?}; refusing to use it");
+            return None;
+        }
+    }
+    Some(path)
+}
+
+/// Whether `path`'s SHA-256 equals `expected_hex` (case-insensitive).
+fn sha256_matches(path: &Path, expected_hex: &str) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    match stingle_crypto::sodium::sha256(&bytes) {
+        Ok(d) => hex::encode(d).eq_ignore_ascii_case(expected_hex),
+        Err(_) => false,
+    }
+}
+
 /// Pre-install the media toolchain (ffmpeg) on a background thread at startup so
 /// the first HEIC preview/copy or video frame-grab doesn't stall on the download.
 pub fn prepare_media_tools() {
-    let _ = ensure_ffmpeg();
+    let _ = ffmpeg_path();
 }
 
-fn ffmpeg_path() -> Result<std::path::PathBuf> {
-    if !ensure_ffmpeg() {
-        return Err(CoreError::Other("ffmpeg unavailable".into()));
-    }
-    Ok(ffmpeg_sidecar::paths::ffmpeg_path())
+fn ffmpeg_path() -> Result<PathBuf> {
+    FFMPEG
+        .get_or_init(resolve_ffmpeg)
+        .clone()
+        .ok_or_else(|| CoreError::Other("ffmpeg unavailable".into()))
 }
 
 /// Run ffmpeg with the given args, optionally feeding `input` via stdin, and
@@ -126,6 +159,12 @@ pub fn transcode_temp_dir() -> std::path::PathBuf {
 pub fn transcode_to_jpeg(bytes: &[u8], ext: &str) -> Result<Vec<u8>> {
     let dir = transcode_temp_dir();
     std::fs::create_dir_all(&dir).map_err(|e| CoreError::Other(format!("temp dir: {e}")))?;
+    // The input briefly holds DECRYPTED bytes — restrict the dir to this user.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     let safe_ext = if ext.is_empty() { "bin" } else { ext };
     let seq = XCODE_SEQ.fetch_add(1, Ordering::Relaxed);
     let in_path = dir.join(format!("x_{}_{}.{}", std::process::id(), seq, safe_ext));

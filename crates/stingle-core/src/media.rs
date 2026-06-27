@@ -123,6 +123,20 @@ impl Account {
         is_thumb: bool,
         range: Option<(u64, Option<u64>)>,
     ) -> Result<MediaResponse> {
+        // Fast path: a decrypted thumbnail we've already served this session.
+        // Skips the DB lookup, header decrypt, disk read, and blob decrypt.
+        // (Thumbnails are whole-file requests; ranges only apply to video.)
+        if is_thumb && range.is_none() {
+            if let Some(body) = self.thumb_cache.get(filename) {
+                return Ok(MediaResponse {
+                    content_type: "image/jpeg".to_string(),
+                    total_size: body.len() as u64,
+                    body,
+                    range: None,
+                });
+            }
+        }
+
         let headers = self.headers_for(set, album_id, filename)?;
         let part = headers_part(&headers, is_thumb)?;
         let kp = self.keypair_for(set, album_id)?;
@@ -158,6 +172,10 @@ impl Account {
                         ct = "image/jpeg".to_string();
                     }
                 }
+                // Keep decrypted thumbnails in memory for instant re-display.
+                if is_thumb {
+                    self.thumb_cache.put(filename.to_string(), body.clone());
+                }
                 Ok(MediaResponse {
                     content_type: ct,
                     total_size: body.len() as u64,
@@ -170,8 +188,20 @@ impl Account {
                 let mut f = std::fs::File::open(&path)?;
                 let outer_len = file::outer_header_len(&mut f)?;
                 let last = total.saturating_sub(1);
+                // Reject an unsatisfiable range up front. `total`/`last` derive
+                // from the (attacker-controllable) header's data_size, so without
+                // this guard a start past EOF — or an inverted `end < start` —
+                // would later underflow `end - start + 1` (panic in debug, a
+                // bogus huge Content-Length in release). Use saturating_add so a
+                // near-`u64::MAX` start can't overflow either.
+                if total == 0 || start > last {
+                    return Err(CoreError::Other("range not satisfiable".into()));
+                }
                 let req_end = end_opt.unwrap_or(last).min(last);
-                let end = req_end.min(start + MAX_RANGE_BYTES - 1);
+                let end = req_end.min(start.saturating_add(MAX_RANGE_BYTES - 1));
+                if end < start {
+                    return Err(CoreError::Other("range not satisfiable".into()));
+                }
                 let mut f2 = std::fs::File::open(&path)?;
                 let body = file::decrypt_range(
                     &mut f2,

@@ -39,7 +39,19 @@ impl Db {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // In WAL mode, NORMAL is crash-safe (no corruption on power loss, only the
+        // last few transactions can be lost) but skips the per-commit fsync. This
+        // is the single biggest sync-speed win: the cloud→local delta inserts each
+        // file in its own auto-commit, so FULL would fsync tens of thousands of
+        // times on a large account, taking minutes. NORMAL makes those near memory
+        // speed.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        // 16 MB page cache (negative = KiB) so large gallery scans/sorts stay warm.
+        conn.pragma_update(None, "cache_size", -16_000)?;
+        // Don't fail instantly when sync writes and UI reads contend on the lock.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(schema::DDL)?;
         conn.pragma_update(None, "user_version", schema::SCHEMA_VERSION)?;
         Ok(Self {

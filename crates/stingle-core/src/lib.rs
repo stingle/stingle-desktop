@@ -20,13 +20,14 @@ pub mod prefetch;
 pub mod sharing;
 pub mod sync;
 pub mod takeout;
+pub mod thumb_cache;
 pub mod thumbnail;
 mod util;
 
 pub use account::{Account, AccountInfo};
 pub use error::{CoreError, Result};
 pub use sync::Space;
-pub use takeout::TakeoutStats;
+pub use takeout::{safe_filename, TakeoutStats};
 
 // Re-export the set/sort types so callers don't need a direct `stingle-db` dep.
 pub use stingle_db::{DbAlbum, DbContact, DbFile, FileSet, Sort};

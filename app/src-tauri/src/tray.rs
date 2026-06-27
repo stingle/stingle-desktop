@@ -4,7 +4,9 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager};
 
-fn show_main(app: &AppHandle) {
+/// Bring the main window to the foreground (un-hide, un-minimize, focus).
+/// Shared by the tray and the single-instance handler.
+pub fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
@@ -13,13 +15,13 @@ fn show_main(app: &AppHandle) {
 }
 
 pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "open", "Open Stingle Photos", true, None::<&str>)?;
+    let open = MenuItem::with_id(app, "open", "Open Stingle Desktop", true, None::<&str>)?;
     let sync = MenuItem::with_id(app, "sync", "Sync Now", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &sync, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id("main-tray")
-        .tooltip("Stingle Photos")
+        .tooltip("Stingle Desktop")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -27,7 +29,11 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             "sync" => {
                 let _ = app.emit("tray-sync", ());
             }
-            "quit" => app.exit(0),
+            "quit" => {
+                // Apply any update staged by auto-update before exiting.
+                crate::updater::install_staged_on_exit(app);
+                app.exit(0);
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {

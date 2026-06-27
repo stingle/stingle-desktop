@@ -36,9 +36,19 @@ export type LocalAccount = {
   server_url: string;
 };
 
+export type WatchFolder = {
+  path: string;
+  /** Permanently delete each original after — and only after — a verified import. */
+  delete_originals: boolean;
+};
+
 export const SET_GALLERY = 0;
 export const SET_TRASH = 1;
 export const SET_ALBUM = 2;
+
+/** Sentinel `cover` value meaning "blank cover" — hides the album's contents
+ *  behind a generic placeholder. Must match Android / stingle-core. */
+export const BLANK_COVER = "__b__";
 
 export const api = {
   localAccounts: () => invoke<LocalAccount[]>("list_local_accounts"),
@@ -71,6 +81,8 @@ export const api = {
   deleteAlbum: (albumId: string) => invoke("delete_album", { albumId }),
   setAlbumCover: (albumId: string, filename: string) =>
     invoke("set_album_cover", { albumId, filename }),
+  setAlbumBlankCover: (albumId: string) =>
+    invoke("set_album_blank_cover", { albumId }),
   takeout: (outDir: string, includeTrash: boolean) =>
     invoke<{ written: number; errors: number }>("takeout", { outDir, includeTrash }),
   recoveryPhrase: () => invoke<string>("recovery_phrase"),
@@ -116,8 +128,18 @@ export const api = {
   setMinimizeToTray: (enabled: boolean) => invoke("set_minimize_to_tray", { enabled }),
   getSyncEverything: () => invoke<boolean>("get_sync_everything"),
   setSyncEverything: (enabled: boolean) => invoke("set_sync_everything", { enabled }),
+  getWatchFolders: () => invoke<WatchFolder[]>("get_watch_folders"),
+  setWatchFolders: (folders: WatchFolder[]) => invoke("set_watch_folders", { folders }),
   getStoragePath: () => invoke<string>("get_storage_path"),
   changeStoragePath: (newPath: string) => invoke("change_storage_path", { newPath }),
+  // App updates
+  getAutoUpdate: () => invoke<boolean>("get_auto_update"),
+  setAutoUpdate: (enabled: boolean) => invoke("set_auto_update", { enabled }),
+  getAppVersion: () => invoke<string>("get_app_version"),
+  /** Manual check; resolves to the new version string, or null if up to date. */
+  checkForUpdate: () => invoke<string | null>("check_for_update"),
+  /** Download + install the available update, then restart. Does not return. */
+  installUpdate: () => invoke("install_update_now"),
   // Clipboard
   copyFilesToClipboard: (set: number, albumId: string | null, filenames: string[]) =>
     invoke<number>("copy_files_to_clipboard", { set, albumId, filenames }),

@@ -62,18 +62,32 @@ a { color: var(--accent2); cursor: pointer; }
   background: var(--bg2); border-right: 1px solid var(--border);
   display: flex; flex-direction: column; padding: 14px 10px;
 }
-.brand { font-weight: 700; font-size: 16px; padding: 6px 10px 16px; display:flex; align-items:center; gap:8px;}
-.brand .dot { width:10px;height:10px;border-radius:50%;background:var(--accent); }
+.brand { display:flex; align-items:center; gap:10px; padding: 4px 8px 18px; }
+.brand-logo { width: 30px; height: 30px; border-radius: 7px; flex: none; }
+.brand-title { font-weight: 800; font-size: 18px; letter-spacing: .2px; color: var(--fg); white-space: nowrap; }
 .nav button {
-  display: block; width: 100%; text-align: left; background: transparent;
-  border: none; padding: 9px 10px; border-radius: 8px; color: var(--fg); margin-bottom: 2px;
+  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+  background: transparent; border: none; padding: 9px 10px; border-radius: 8px;
+  color: var(--fg); margin-bottom: 2px; font-size: 14px;
 }
-.nav button.active { background: var(--bg3); }
+.nav button svg { color: var(--muted); flex: none; transition: color .12s; }
+.nav button.active { background: var(--bg3); font-weight: 600; }
+.nav button.active svg { color: var(--accent); }
 .nav button:hover { background: var(--bg3); }
+.nav button:hover svg { color: var(--fg); }
 .sidebar .spacer { flex: 1; }
 .acct { font-size: 12px; color: var(--muted); padding: 8px 10px; }
 .storage-bar { height: 6px; background: var(--bg3); border-radius: 4px; overflow: hidden; margin: 6px 10px; }
 .storage-bar > div { height: 100%; background: var(--accent2); }
+
+/* Update-available call-to-action (shown when auto-update is off). */
+.update-banner {
+  display: block; width: calc(100% - 12px); margin: 0 6px 8px; text-align: left;
+  background: var(--accent); color: #fff; border: none; border-radius: 8px;
+  padding: 9px 10px; font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.update-banner:hover { filter: brightness(1.08); }
+.update-banner:disabled { opacity: .7; cursor: default; }
 
 .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .topbar {
@@ -90,6 +104,12 @@ a { color: var(--accent2); cursor: pointer; }
 .tile {
   position: relative; aspect-ratio: 1; background: var(--bg3);
   border-radius: 8px; overflow: hidden; cursor: pointer; border: 2px solid transparent;
+  /* Let the browser skip layout/paint/raster for off-screen tiles. This is what
+     makes a 10k+ photo grid scroll smoothly without a JS virtualization library:
+     only tiles near the viewport are actually rendered. `auto` remembers each
+     tile's real size after first paint so the scrollbar stays stable. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 148px;
 }
 .tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .tile .cover-btn {
@@ -125,6 +145,7 @@ a { color: var(--accent2); cursor: pointer; }
 .album-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; cursor: pointer; }
 .album-card .cover { aspect-ratio: 4/3; background: var(--bg3); display:flex;align-items:center;justify-content:center;color:var(--muted); }
 .album-card .cover img { width:100%;height:100%;object-fit:cover; }
+.album-card .cover .blank-cover { width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:42px;background:linear-gradient(135deg,#2a2e38,#20232b); }
 .album-card .meta { padding: 10px 12px; }
 .album-card .meta .name { font-weight: 600; }
 .album-card .meta .count { color: var(--muted); font-size: 12px; }

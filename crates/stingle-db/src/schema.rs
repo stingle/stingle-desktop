@@ -16,6 +16,11 @@ CREATE TABLE IF NOT EXISTS files (
     headers       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_files_localremote ON files(is_local, is_remote);
+-- Composite so paginated `ORDER BY date_created, _id` (both directions) is served
+-- entirely from the index — no temp-B-tree sort. The `_id` tiebreaker is what
+-- makes LIMIT/OFFSET pagination stable. Supersedes the old date-only index.
+DROP INDEX IF EXISTS idx_files_date;
+CREATE INDEX IF NOT EXISTS idx_files_date_id ON files(date_created DESC, _id DESC);
 
 CREATE TABLE IF NOT EXISTS trash (
     _id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,6 +34,8 @@ CREATE TABLE IF NOT EXISTS trash (
     headers       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trash_localremote ON trash(is_local, is_remote);
+DROP INDEX IF EXISTS idx_trash_date;
+CREATE INDEX IF NOT EXISTS idx_trash_date_id ON trash(date_created DESC, _id DESC);
 
 CREATE TABLE IF NOT EXISTS albums (
     _id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,6 +68,7 @@ CREATE TABLE IF NOT EXISTS album_files (
     date_modified INTEGER NOT NULL DEFAULT 0,
     UNIQUE(album_id, filename)
 );
+CREATE INDEX IF NOT EXISTS idx_album_files_album ON album_files(album_id, date_created DESC);
 
 CREATE TABLE IF NOT EXISTS contacts (
     _id           INTEGER PRIMARY KEY AUTOINCREMENT,

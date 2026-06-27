@@ -1,4 +1,4 @@
-//! Stingle Photos Desktop — Tauri backend.
+//! Stingle Desktop — Tauri backend.
 //!
 //! Holds the logged-in [`Account`] (from `stingle-core`) and exposes it to the
 //! React UI via commands. Decrypted thumbnails/originals are streamed to the
@@ -20,15 +20,21 @@ mod clipboard_files;
 mod config;
 mod secure_store;
 mod tray;
+mod updater;
+mod watch;
 
-use config::AppConfig;
+use config::{AppConfig, WatchFolder};
 
 /// Interval between background "sync everything" cycles.
 const SYNC_EVERYTHING_INTERVAL_SECS: u64 = 300;
 
+/// Interval between watch-folder scans.
+const WATCH_INTERVAL_SECS: u64 = 15;
+
 pub struct AppState {
-    /// Effective storage base dir; mutable because the storage path is a setting.
-    base_dir: Mutex<PathBuf>,
+    /// Directory holding the per-account folders; mutable because the storage
+    /// location is a setting. Account dirs live directly under it.
+    accounts_dir: Mutex<PathBuf>,
     /// Global, pre-login app config (persisted to a fixed config location).
     config: Mutex<AppConfig>,
     /// Lock-free read of `minimize_to_tray` for the window close handler.
@@ -39,19 +45,34 @@ pub struct AppState {
     account: Mutex<Option<Arc<Account>>>,
     /// Handle to the background continuous-sync loop, if running.
     sync_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    /// Handle to the background watch-folder import loop, if running.
+    watch_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    /// An update downloaded at startup (auto-update on) but not yet installed;
+    /// applied when the app quits. A plain `std::sync::Mutex` so the quit handler
+    /// (sync context) can lock it without a runtime.
+    staged_update: std::sync::Mutex<Option<updater::StagedUpdate>>,
 }
 
 impl AppState {
     fn new() -> Self {
+        // Migrate the old `StinglePhotos` app-data/config dirs to the new
+        // product-neutral `Stingle` name before anything reads them. Both are
+        // no-ops once migrated. (On Windows/macOS these resolve to the same
+        // folder, so either call performs the single rename; the other then
+        // sees the new dir already present and does nothing.)
+        config::migrate_legacy_config_dir();
+        stingle_core::paths::migrate_legacy_base_dir();
         let config = AppConfig::load();
-        let base_dir = config.effective_base_dir();
+        let accounts_dir = config.effective_accounts_dir();
         let minimize = config.minimize_to_tray;
         Self {
-            base_dir: Mutex::new(base_dir),
+            accounts_dir: Mutex::new(accounts_dir),
             config: Mutex::new(config),
             minimize_to_tray: AtomicBool::new(minimize),
             account: Mutex::new(None),
             sync_task: Mutex::new(None),
+            watch_task: Mutex::new(None),
+            staged_update: std::sync::Mutex::new(None),
         }
     }
 
@@ -60,9 +81,9 @@ impl AppState {
         self.account.lock().await.clone()
     }
 
-    /// The effective storage base dir (brief lock).
-    async fn base(&self) -> PathBuf {
-        self.base_dir.lock().await.clone()
+    /// The directory holding per-account folders (brief lock).
+    async fn accounts_dir(&self) -> PathBuf {
+        self.accounts_dir.lock().await.clone()
     }
 }
 
@@ -172,7 +193,7 @@ fn session_dto(acc: &Account) -> SessionDto {
 
 #[tauri::command]
 async fn list_local_accounts(state: State<'_, AppState>) -> CmdResult<Vec<LocalAccountDto>> {
-    let base = state.base().await;
+    let base = state.accounts_dir().await;
     Ok(Account::list_local(&base)
         .into_iter()
         .map(|(account_key, info)| LocalAccountDto {
@@ -191,7 +212,7 @@ async fn last_account(state: State<'_, AppState>) -> CmdResult<Option<LocalAccou
         Some(k) => k,
         None => return Ok(None),
     };
-    let base = state.base().await;
+    let base = state.accounts_dir().await;
     Ok(Account::list_local(&base)
         .into_iter()
         .find(|(k, _)| *k == key)
@@ -231,7 +252,7 @@ async fn register(
     password: String,
     is_backup: bool,
 ) -> CmdResult<SessionDto> {
-    let base = state.base().await;
+    let base = state.accounts_dir().await;
     let acc = Account::register(&server_url, &email, &password, &base, is_backup)
         .await
         .map_err(e)?;
@@ -249,7 +270,7 @@ async fn login(
     email: String,
     password: String,
 ) -> CmdResult<SessionDto> {
-    let base = state.base().await;
+    let base = state.accounts_dir().await;
     let acc = Account::login(&server_url, &email, &password, &base)
         .await
         .map_err(e)?;
@@ -266,7 +287,7 @@ async fn resume(
     account_key: String,
     password: String,
 ) -> CmdResult<SessionDto> {
-    let base = state.base().await;
+    let base = state.accounts_dir().await;
     let acc = Account::resume(&base, &account_key, &password).map_err(e)?;
     let dto = session_dto(&acc);
     *state.account.lock().await = Some(Arc::new(acc));
@@ -300,15 +321,53 @@ async fn lock(state: State<'_, AppState>) -> CmdResult<()> {
 #[tauri::command]
 async fn logout(state: State<'_, AppState>, wipe: bool) -> CmdResult<()> {
     if let Some(acc) = state.account.lock().await.take() {
+        let account_key = stingle_core::paths::account_key(&acc.info.server_url, &acc.info.email);
         acc.logout(wipe).await.map_err(e)?;
+        // A full wipe also forgets the account: clear its secure-store key and any
+        // pre-login config (last account / auto-unlock) so it doesn't reappear on
+        // the unlock screen. Same logic as `forget_account`.
+        if wipe {
+            secure_store::delete(&account_key);
+            let mut cfg = state.config.lock().await;
+            if cfg.last_account.as_deref() == Some(account_key.as_str()) {
+                cfg.last_account = None;
+            }
+            if cfg
+                .auto_unlock_blob
+                .as_ref()
+                .map(|b| b.account_key.as_str())
+                == Some(account_key.as_str())
+            {
+                cfg.auto_unlock = false;
+                cfg.auto_unlock_blob = None;
+            }
+            cfg.save()?;
+        }
     }
     Ok(())
+}
+
+/// The server rejected our token (session expired). Tear down the live session
+/// so the UI returns to the sign-in screen instead of looping on a dead token,
+/// and tell the frontend to force a full re-login (a plain offline resume would
+/// just reuse the dead token).
+async fn handle_session_expired(app: &tauri::AppHandle, state: &AppState) {
+    stop_sync_loop(state).await;
+    if let Some(acc) = state.account.lock().await.take() {
+        acc.request_stop_originals(); // halt any in-flight bulk download
+    }
+    let _ = app.emit("session-expired", ());
 }
 
 #[tauri::command]
 async fn sync(app: tauri::AppHandle, state: State<'_, AppState>) -> CmdResult<SyncResultDto> {
     let acc = state.current().await.ok_or("Not logged in")?;
-    acc.full_sync().await.map_err(e)?;
+    if let Err(err) = acc.full_sync().await {
+        if err.is_logged_out() {
+            handle_session_expired(&app, &state).await;
+        }
+        return Err(e(err));
+    }
     let result = SyncResultDto {
         gallery: acc.db.count_files(FileSet::Gallery).map_err(e)?,
         trash: acc.db.count_files(FileSet::Trash).map_err(e)?,
@@ -541,6 +600,17 @@ async fn set_album_cover(
 }
 
 #[tauri::command]
+async fn set_album_blank_cover(state: State<'_, AppState>, album_id: String) -> CmdResult<()> {
+    let guard = state.account.lock().await;
+    guard
+        .as_ref()
+        .ok_or("Not logged in")?
+        .set_album_blank_cover(&album_id)
+        .await
+        .map_err(e)
+}
+
+#[tauri::command]
 async fn takeout(
     state: State<'_, AppState>,
     out_dir: String,
@@ -586,7 +656,7 @@ async fn recover(
     mnemonic: String,
     new_password: String,
 ) -> CmdResult<SessionDto> {
-    let base = state.base().await;
+    let base = state.accounts_dir().await;
     let acc = Account::recover(&server_url, &email, &mnemonic, &new_password, &base)
         .await
         .map_err(e)?;
@@ -727,7 +797,7 @@ async fn copy_files_to_clipboard(
     let dir = clipboard_temp_dir();
     // Drop the previous copy's decrypted files before writing new ones.
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).map_err(e)?;
+    create_private_dir(&dir).map_err(e)?;
 
     let mut paths = Vec::new();
     for name in &filenames {
@@ -735,7 +805,9 @@ async fn copy_files_to_clipboard(
         let orig = acc
             .original_name(s, album_id.as_deref(), name)
             .unwrap_or_else(|_| name.clone());
-        let out = unique_temp(&dir, &orig);
+        // `orig` is header-derived (attacker-controllable) — reduce it to a safe
+        // bare filename so it can't escape the temp dir.
+        let out = unique_temp(&dir, &stingle_core::safe_filename(&orig));
         std::fs::write(&out, &plain).map_err(e)?;
         paths.push(out);
     }
@@ -797,6 +869,19 @@ fn clipboard_temp_dir() -> PathBuf {
     std::env::temp_dir().join("stingle-clip")
 }
 
+/// Create `dir` (and parents) restricted to the current user (0700 on Unix).
+/// Used for the short-lived folders that hold DECRYPTED drag/clipboard files so
+/// other users on the machine can't read them while they exist.
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
+}
+
 /// A non-colliding path in `dir` for `name`.
 fn unique_temp(dir: &std::path::Path, name: &str) -> PathBuf {
     let p = dir.join(name);
@@ -831,7 +916,7 @@ async fn export_for_drag(
     let acc = state.current().await.ok_or("Not logged in")?;
     let s = set_from_i32(set);
     let dir = drag_temp_dir();
-    std::fs::create_dir_all(&dir).map_err(e)?;
+    create_private_dir(&dir).map_err(e)?;
 
     let mut files = Vec::new();
     for name in &filenames {
@@ -839,7 +924,7 @@ async fn export_for_drag(
         let orig = acc
             .original_name(s, album_id.as_deref(), name)
             .unwrap_or_else(|_| name.clone());
-        let out = unique_temp(&dir, &orig);
+        let out = unique_temp(&dir, &stingle_core::safe_filename(&orig));
         std::fs::write(&out, &plain).map_err(e)?;
         files.push(out.to_string_lossy().to_string());
     }
@@ -881,6 +966,52 @@ async fn set_minimize_to_tray(state: State<'_, AppState>, enabled: bool) -> CmdR
 }
 
 #[tauri::command]
+async fn get_auto_update(state: State<'_, AppState>) -> CmdResult<bool> {
+    Ok(state.config.lock().await.auto_update.unwrap_or(true))
+}
+
+#[tauri::command]
+async fn set_auto_update(state: State<'_, AppState>, enabled: bool) -> CmdResult<()> {
+    let mut cfg = state.config.lock().await;
+    cfg.auto_update = Some(enabled);
+    cfg.save()
+}
+
+#[tauri::command]
+fn get_app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+/// Manual "check for updates now": returns the new version string if one is
+/// available, else `None`.
+#[tauri::command]
+async fn check_for_update(app: tauri::AppHandle) -> CmdResult<Option<String>> {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app.updater().map_err(e)?;
+    Ok(updater.check().await.map_err(e)?.map(|u| u.version))
+}
+
+/// User-driven install (sidebar banner / manual "update now"): download, install,
+/// and restart immediately.
+#[tauri::command]
+async fn install_update_now(app: tauri::AppHandle) -> CmdResult<()> {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app.updater().map_err(e)?;
+    let update = updater
+        .check()
+        .await
+        .map_err(e)?
+        .ok_or_else(|| "No update available".to_string())?;
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(e)?;
+    app.restart();
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+#[tauri::command]
 fn get_autostart(app: tauri::AppHandle) -> CmdResult<bool> {
     use tauri_plugin_autostart::ManagerExt;
     app.autolaunch().is_enabled().map_err(e)
@@ -899,7 +1030,7 @@ fn set_autostart(app: tauri::AppHandle, enabled: bool) -> CmdResult<()> {
 
 #[tauri::command]
 async fn get_storage_path(state: State<'_, AppState>) -> CmdResult<String> {
-    Ok(state.base().await.to_string_lossy().to_string())
+    Ok(state.accounts_dir().await.to_string_lossy().to_string())
 }
 
 // ----------------------------- auto-unlock -----------------------------
@@ -936,7 +1067,7 @@ async fn enable_auto_unlock(
     let account_key = stingle_core::paths::account_key(&acc.info.server_url, &acc.info.email);
 
     // Verify the password actually unlocks this account (offline, via resume).
-    let base = state.base().await;
+    let base = state.accounts_dir().await;
     Account::resume(&base, &account_key, &password)
         .map_err(|_| "Incorrect password".to_string())?;
 
@@ -1002,7 +1133,7 @@ async fn try_auto_unlock(state: State<'_, AppState>) -> CmdResult<SessionDto> {
     let pw = stingle_crypto::sodium::secretbox_open_easy(&key, &nonce, &cipher).map_err(e)?;
     let password = String::from_utf8(pw.to_vec()).map_err(e)?;
 
-    let base = state.base().await;
+    let base = state.accounts_dir().await;
     let acc = Account::resume(&base, &blob.account_key, &password).map_err(e)?;
     let dto = session_dto(&acc);
     *state.account.lock().await = Some(Arc::new(acc));
@@ -1022,7 +1153,22 @@ async fn start_sync_loop(app: tauri::AppHandle, state: &AppState) {
     let handle = tauri::async_runtime::spawn(async move {
         loop {
             if let Some(acc) = app2.state::<AppState>().current().await {
-                let _ = acc.full_sync().await;
+                if let Err(err) = acc.full_sync().await {
+                    if err.is_logged_out() {
+                        // Token died: tear down the session and stop the loop so we
+                        // don't keep hammering the server with a dead token. Done
+                        // inline (not via handle_session_expired) so we never abort
+                        // our own task before emitting the event — clearing the
+                        // handle just detaches it; `return` ends the loop cleanly.
+                        let state = app2.state::<AppState>();
+                        if let Some(a) = state.account.lock().await.take() {
+                            a.request_stop_originals();
+                        }
+                        *state.sync_task.lock().await = None;
+                        let _ = app2.emit("session-expired", ());
+                        return;
+                    }
+                }
                 let app_cb = app2.clone();
                 let cb = move |done: usize, total: usize| {
                     let _ = app_cb.emit("originals-progress", (done, total));
@@ -1063,20 +1209,95 @@ async fn set_sync_everything(
         start_sync_loop(app, &state).await;
     } else {
         stop_sync_loop(&state).await;
+        // Aborting the loop task doesn't touch an originals download that was
+        // spawned detached (e.g. from the initial sync), so signal it to stop too.
+        if let Some(acc) = state.current().await {
+            acc.request_stop_originals();
+        }
+    }
+    Ok(())
+}
+
+// ----------------------------- watch folders -----------------------------
+
+/// Start the background watch-folder import loop (no-op if already running).
+/// The loop idles while logged out or while no folders are configured.
+async fn start_watch_loop(app: tauri::AppHandle, state: &AppState) {
+    let mut guard = state.watch_task.lock().await;
+    if guard.is_some() {
+        return;
+    }
+    let app2 = app.clone();
+    let handle = tauri::async_runtime::spawn(async move {
+        // Per-file `(size, mtime)` fingerprints, carried across passes so a file
+        // must be stable for two consecutive scans before it is imported.
+        let mut stable = std::collections::HashMap::new();
+        loop {
+            let state = app2.state::<AppState>();
+            let folders = state.config.lock().await.watch_folders.clone();
+            if !folders.is_empty() {
+                if let Some(acc) = state.current().await {
+                    watch::scan_folders(&app2, &acc, &folders, &mut stable).await;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(WATCH_INTERVAL_SECS)).await;
+        }
+    });
+    *guard = Some(handle);
+}
+
+/// Stop the background watch-folder loop if running.
+async fn stop_watch_loop(state: &AppState) {
+    if let Some(h) = state.watch_task.lock().await.take() {
+        h.abort();
+    }
+}
+
+#[tauri::command]
+async fn get_watch_folders(state: State<'_, AppState>) -> CmdResult<Vec<WatchFolder>> {
+    Ok(state.config.lock().await.watch_folders.clone())
+}
+
+#[tauri::command]
+async fn set_watch_folders(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    folders: Vec<WatchFolder>,
+) -> CmdResult<()> {
+    {
+        let mut cfg = state.config.lock().await;
+        cfg.watch_folders = folders;
+        cfg.save()?;
+    }
+    // Restart so a freshly-stable map re-scans (and picks up newly-added folders
+    // immediately).
+    stop_watch_loop(&state).await;
+    if !state.config.lock().await.watch_folders.is_empty() {
+        start_watch_loop(app, &state).await;
     }
     Ok(())
 }
 
 // ----------------------------- storage path move -----------------------------
 
+/// Max directory depth for the storage-move walkers — a stack-overflow guard.
+/// Symlinks are skipped (not followed), so a loop can't recurse regardless.
+const MAX_MOVE_DEPTH: u32 = 64;
+
 /// Total size in bytes of all files under `dir` (0 if it doesn't exist).
-fn dir_size(dir: &std::path::Path) -> u64 {
+fn dir_size(dir: &std::path::Path, depth: u32) -> u64 {
+    if depth >= MAX_MOVE_DEPTH {
+        return 0;
+    }
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             match entry.file_type() {
-                Ok(ft) if ft.is_dir() => total += dir_size(&path),
+                // Skip symlinks so a loop can't spin and an external target isn't
+                // counted; only descend into real directories.
+                Ok(ft) if ft.is_symlink() => {}
+                Ok(ft) if ft.is_dir() => total += dir_size(&path, depth + 1),
                 Ok(_) => total += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
                 Err(_) => {}
             }
@@ -1086,22 +1307,28 @@ fn dir_size(dir: &std::path::Path) -> u64 {
 }
 
 /// Recursively copy `src` into `dst`, emitting `storage-move-progress` as bytes
-/// are copied.
+/// are copied. Symlinks are skipped (never followed).
 fn copy_recursive(
     app: &tauri::AppHandle,
     src: &std::path::Path,
     dst: &std::path::Path,
     done: &mut u64,
     total: u64,
+    depth: u32,
 ) -> Result<(), String> {
+    if depth >= MAX_MOVE_DEPTH {
+        return Ok(());
+    }
     std::fs::create_dir_all(dst).map_err(|x| x.to_string())?;
     for entry in std::fs::read_dir(src).map_err(|x| x.to_string())? {
         let entry = entry.map_err(|x| x.to_string())?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
         let ft = entry.file_type().map_err(|x| x.to_string())?;
-        if ft.is_dir() {
-            copy_recursive(app, &from, &to, done, total)?;
+        if ft.is_symlink() {
+            continue;
+        } else if ft.is_dir() {
+            copy_recursive(app, &from, &to, done, total, depth + 1)?;
         } else {
             let n = std::fs::copy(&from, &to).map_err(|x| x.to_string())?;
             *done += n;
@@ -1121,10 +1348,10 @@ fn move_dir_with_progress(
     if !old.exists() {
         return Ok(());
     }
-    let total = dir_size(old);
+    let total = dir_size(old, 0);
     let _ = app.emit("storage-move-progress", (0u64, total));
     let mut done = 0u64;
-    copy_recursive(app, old, new, &mut done, total)?;
+    copy_recursive(app, old, new, &mut done, total, 0)?;
     // Only remove the source after a successful full copy.
     let _ = std::fs::remove_dir_all(old);
     let _ = app.emit("storage-move-progress", (total, total));
@@ -1137,12 +1364,14 @@ async fn change_storage_path(
     state: State<'_, AppState>,
     new_path: String,
 ) -> CmdResult<()> {
-    let new_base = PathBuf::from(new_path.trim());
-    if new_base.as_os_str().is_empty() {
+    // The selected folder becomes the accounts dir itself: account folders are
+    // placed directly inside it (no extra `accounts/` segment).
+    let new_accounts_dir = PathBuf::from(new_path.trim());
+    if new_accounts_dir.as_os_str().is_empty() {
         return Err("Empty path".into());
     }
-    let old_base = state.base().await;
-    if new_base == old_base {
+    let old_accounts_dir = state.accounts_dir().await;
+    if new_accounts_dir == old_accounts_dir {
         return Ok(());
     }
 
@@ -1161,34 +1390,44 @@ async fn change_storage_path(
     });
     *state.account.lock().await = None;
     stop_sync_loop(&state).await;
+    stop_watch_loop(&state).await;
 
-    // Move the data off the async runtime (copying is blocking).
+    // Move only the photo library (the account folders) — never the app-data
+    // config/keys, which live in `config_dir()` and stay put. Copying is
+    // blocking, so run it off the async runtime.
     let app2 = app.clone();
-    let old2 = old_base.clone();
-    let new2 = new_base.clone();
-    tauri::async_runtime::spawn_blocking(move || move_dir_with_progress(&app2, &old2, &new2))
+    let from = old_accounts_dir.clone();
+    let to = new_accounts_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || move_dir_with_progress(&app2, &from, &to))
         .await
         .map_err(e)??;
 
-    // Persist the new path and switch the live base dir.
+    // Persist the new location and switch the live accounts dir.
     {
         let mut cfg = state.config.lock().await;
-        cfg.storage_path = Some(new_base.to_string_lossy().to_string());
+        cfg.storage_path = Some(new_accounts_dir.to_string_lossy().to_string());
         cfg.save()?;
     }
-    *state.base_dir.lock().await = new_base.clone();
+    *state.accounts_dir.lock().await = new_accounts_dir.clone();
 
     // Re-open the session at the new location so the user stays logged in.
     if let Some((info, keypair, server_pk)) = session_parts {
-        match Account::reopen_at(&new_base, info, keypair, server_pk) {
+        match Account::reopen_at(&new_accounts_dir, info, keypair, server_pk) {
             Ok(acc) => *state.account.lock().await = Some(Arc::new(acc)),
             Err(err) => tracing::warn!("reopen after storage move failed: {err}"),
         }
     }
 
-    // Resume the background loop if continuous sync is on.
-    if state.config.lock().await.sync_everything {
-        start_sync_loop(app, &state).await;
+    // Resume the background loops at the new location.
+    let (sync_on, has_watch) = {
+        let cfg = state.config.lock().await;
+        (cfg.sync_everything, !cfg.watch_folders.is_empty())
+    };
+    if sync_on {
+        start_sync_loop(app.clone(), &state).await;
+    }
+    if has_watch {
+        start_watch_loop(app, &state).await;
     }
     Ok(())
 }
@@ -1316,6 +1555,14 @@ pub fn run() {
     tracing_subscriber::fmt().init();
 
     tauri::Builder::default()
+        // Single-instance must be the FIRST plugin registered. When a second
+        // launch is attempted, this fires in the already-running instance instead
+        // of starting a new process — we just surface the existing window.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tray::show_main(app);
+        }))
+        // Persist & restore the main window's size and position across restarts.
+        .plugin(tauri_plugin_window_state::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -1324,6 +1571,7 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::new())
         .register_asynchronous_uri_scheme_protocol("stingle", |ctx, request, responder| {
             let app = ctx.app_handle().clone();
@@ -1344,6 +1592,9 @@ pub fn run() {
                 if state.minimize_to_tray.load(Ordering::Relaxed) {
                     api.prevent_close();
                     let _ = window.hide();
+                } else {
+                    // Real quit: apply any staged update before the app exits.
+                    updater::install_staged_on_exit(window.app_handle());
                 }
             }
         })
@@ -1357,14 +1608,24 @@ pub fn run() {
             // Pre-fetch ffmpeg (full build, with HEIC support) in the background
             // so the first HEIC preview/copy doesn't stall on the download.
             std::thread::spawn(|| stingle_core::thumbnail::prepare_media_tools());
+            // Check for app updates in the background (honors the auto_update
+            // setting): silently stage when on, or emit `update-available` when
+            // off so the UI can show the install banner.
+            tauri::async_runtime::spawn(updater::check_on_startup(app.handle().clone()));
             // Start the continuous-sync loop if the setting is on; it idles until
             // an account is unlocked.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = handle.state::<AppState>();
-                let on = state.config.lock().await.sync_everything;
-                if on {
+                let (sync_on, has_watch) = {
+                    let cfg = state.config.lock().await;
+                    (cfg.sync_everything, !cfg.watch_folders.is_empty())
+                };
+                if sync_on {
                     start_sync_loop(handle.clone(), &state).await;
+                }
+                if has_watch {
+                    start_watch_loop(handle.clone(), &state).await;
                 }
             });
             Ok(())
@@ -1391,6 +1652,7 @@ pub fn run() {
             rename_album,
             delete_album,
             set_album_cover,
+            set_album_blank_cover,
             takeout,
             download_thumbs,
             recovery_phrase,
@@ -1411,6 +1673,11 @@ pub fn run() {
             forget_account,
             get_minimize_to_tray,
             set_minimize_to_tray,
+            get_auto_update,
+            set_auto_update,
+            get_app_version,
+            check_for_update,
+            install_update_now,
             get_autostart,
             set_autostart,
             get_storage_path,
@@ -1422,6 +1689,8 @@ pub fn run() {
             try_auto_unlock,
             get_sync_everything,
             set_sync_everything,
+            get_watch_folders,
+            set_watch_folders,
             copy_to_clipboard,
             copy_files_to_clipboard,
             clipboard_files,

@@ -163,10 +163,12 @@ impl Db {
     ) -> Result<Vec<DbFile>> {
         self.with_conn(|c| {
             let lim = limit.unwrap_or(-1);
+            // `_id` is a stable tiebreaker so paginated reads (LIMIT/OFFSET) never
+            // duplicate or skip rows that share a `date_created`.
             let sql = format!(
-                "SELECT {FILE_COLS} FROM {} ORDER BY date_created {} LIMIT ?1 OFFSET ?2",
+                "SELECT {FILE_COLS} FROM {} ORDER BY date_created {s}, _id {s} LIMIT ?1 OFFSET ?2",
                 table(set),
-                sort.sql()
+                s = sort.sql()
             );
             collect(c, &sql, params![lim, offset], map_file)
         })
