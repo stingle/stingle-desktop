@@ -84,4 +84,4 @@ No paid OS code-signing certs are used, so on first install:
 
 ## License
 
-AGPL-3.0-or-later (matching the upstream Stingle Photos apps).
+GPL-3.0-or-later (matching the upstream Stingle Photos apps). See [LICENSE](LICENSE).
