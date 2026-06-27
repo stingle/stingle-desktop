@@ -78,7 +78,10 @@ No paid OS code-signing certs are used, so on first install:
 
 - **Windows:** SmartScreen shows an "unknown publisher" warning (uses the NSIS
   installer). The in-app updater still works — it's minisign-verified.
-- **macOS:** Gatekeeper blocks double-click; right-click → **Open** once.
+- **macOS:** bundles are **ad-hoc signed** (`signingIdentity: "-"`) — free, no
+  Apple Developer account. This is required for the app to launch *at all* on
+  Apple Silicon (unsigned binaries are killed on exec there). It does **not**
+  satisfy Gatekeeper, so on first launch users still right-click → **Open** once.
 - **Linux:** the updater applies to the **AppImage** target only; `.deb`/`.rpm`
   are managed by the system package manager.
 
