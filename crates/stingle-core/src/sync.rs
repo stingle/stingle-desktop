@@ -88,7 +88,7 @@ impl Account {
     /// Pull server changes then push local changes.
     pub async fn full_sync(&self) -> Result<()> {
         self.sync_cloud_to_local().await?;
-        self.upload_to_cloud().await?;
+        self.upload_to_cloud(None).await?;
         Ok(())
     }
 
@@ -286,16 +286,36 @@ impl Account {
 
     // ------------------------- local → cloud -------------------------
 
-    pub async fn upload_to_cloud(&self) -> Result<()> {
+    /// Upload every pending local-only / re-upload file. `progress(done, total)`
+    /// is called once up front with the full count and again after each file, so
+    /// the UI can show upload progress (file-count granularity).
+    pub async fn upload_to_cloud(
+        &self,
+        progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
+    ) -> Result<()> {
+        // Build the full work list first so `total` is known before we start.
+        let mut work: Vec<(FileSet, DbFile)> = Vec::new();
         for set in [FileSet::Gallery, FileSet::Trash] {
-            let mut todo = self.db.list_only_local(set, Sort::Desc)?;
-            todo.extend(self.db.list_reupload(set)?);
-            for f in todo {
-                self.upload_one(set, &f).await?;
+            for f in self.db.list_only_local(set, Sort::Desc)? {
+                work.push((set, f));
+            }
+            for f in self.db.list_reupload(set)? {
+                work.push((set, f));
             }
         }
         for f in self.db.list_album_files_only_local()? {
-            self.upload_one(FileSet::Album, &f).await?;
+            work.push((FileSet::Album, f));
+        }
+
+        let total = work.len();
+        if let Some(cb) = progress {
+            cb(0, total);
+        }
+        for (i, (set, f)) in work.iter().enumerate() {
+            self.upload_one(*set, f).await?;
+            if let Some(cb) = progress {
+                cb(i + 1, total);
+            }
         }
         Ok(())
     }

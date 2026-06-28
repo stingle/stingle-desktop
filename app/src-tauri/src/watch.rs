@@ -75,16 +75,19 @@ fn collect_media(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
 /// One polling pass over every watched folder. `stable` persists across passes
 /// so we can require a file to be unchanged for two consecutive passes before
 /// touching it (it may still be mid-copy).
+/// Returns the number of files newly imported this pass, so the caller can kick
+/// off an upload when there's something fresh to push to the cloud.
 pub(crate) async fn scan_folders(
     app: &AppHandle,
     acc: &Account,
     folders: &[WatchFolder],
     stable: &mut HashMap<PathBuf, Stamp>,
-) {
+) -> usize {
     // Drop fingerprints for files that have gone away, so the map can't grow
     // without bound.
     stable.retain(|p, _| p.exists());
 
+    let mut imported = 0;
     for folder in folders {
         let root = PathBuf::from(&folder.path);
         if !root.is_dir() {
@@ -93,20 +96,24 @@ pub(crate) async fn scan_folders(
         let mut files = Vec::new();
         collect_media(&root, &mut files, 0);
         for path in files {
-            process_one(app, acc, &path, folder.delete_originals, stable).await;
+            if process_one(app, acc, &path, folder.delete_originals, stable).await {
+                imported += 1;
+            }
         }
     }
+    imported
 }
 
+/// Returns `true` when a new file was imported into the gallery this call.
 async fn process_one(
     app: &AppHandle,
     acc: &Account,
     path: &Path,
     delete_originals: bool,
     stable: &mut HashMap<PathBuf, Stamp>,
-) {
+) -> bool {
     let Some((size, mtime)) = stamp(path) else {
-        return;
+        return false;
     };
 
     // Stability gate: only proceed once the file looks identical to the previous
@@ -116,7 +123,7 @@ async fn process_one(
         Some(&prev) if prev == (size, mtime) => {}
         _ => {
             stable.insert(path.to_path_buf(), (size, mtime));
-            return;
+            return false;
         }
     }
 
@@ -124,11 +131,11 @@ async fn process_one(
     // compares the decrypted blob against.
     let data = match std::fs::read(path) {
         Ok(d) => d,
-        Err(_) => return, // locked / vanished; retry a later pass
+        Err(_) => return false, // locked / vanished; retry a later pass
     };
     let source_sha = match stingle_crypto::sodium::sha256(&data) {
         Ok(h) => h,
-        Err(_) => return,
+        Err(_) => return false,
     };
     let source_len = data.len() as u64;
     drop(data); // free the bytes before import_file reads the file again
@@ -170,15 +177,17 @@ async fn process_one(
                     }
                 }
             }
+            true
         }
         // Path-dedup duplicate: already imported earlier. We have no filename to
         // verify against, so we deliberately never delete on `None`.
-        Ok(None) => {}
+        Ok(None) => false,
         Err(err) => {
             let _ = app.emit(
                 "watch-import-error",
                 format!("Failed to import {}: {err}", label(path)),
             );
+            false
         }
     }
 }

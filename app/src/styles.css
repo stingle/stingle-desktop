@@ -80,6 +80,32 @@ a { color: var(--accent2); cursor: pointer; }
 .storage-bar { height: 6px; background: var(--bg3); border-radius: 4px; overflow: hidden; margin: 6px 10px; }
 .storage-bar > div { height: 100%; background: var(--accent2); }
 
+/* Consolidated sync status panel (sidebar). */
+.sync-panel { padding: 6px 10px 4px; }
+.sync-head {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 12px; color: var(--fg); min-height: 18px;
+}
+.sync-head .spinner { width: 12px; height: 12px; border-width: 2px; }
+.sync-idle { color: var(--muted); }
+.phase-row {
+  display: grid; grid-template-columns: 14px 1fr auto; align-items: center;
+  column-gap: 6px; margin-top: 8px;
+}
+.phase-icon { font-size: 12px; color: var(--accent2); text-align: center; }
+.phase-label { font-size: 12px; color: var(--muted); }
+.phase-count { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.sync-bar {
+  grid-column: 1 / -1; height: 4px; background: var(--bg3);
+  border-radius: 3px; overflow: hidden; margin-top: 4px;
+}
+.sync-bar > div { height: 100%; background: var(--accent2); transition: width .25s ease; }
+
+/* Sidebar section dividers. */
+.side-div { height: 1px; background: var(--border); margin: 10px 10px; }
+/* App version, tucked under the logo and right-aligned. */
+.brand-version { font-size: 11px; color: var(--muted); text-align: right; margin: -14px 8px 12px; }
+
 /* Update-available call-to-action (shown when auto-update is off). */
 .update-banner {
   display: block; width: calc(100% - 12px); margin: 0 6px 8px; text-align: left;
@@ -128,6 +154,12 @@ a { color: var(--accent2); cursor: pointer; }
   pointer-events: none;
 }
 .tile .vid-badge svg { margin-left: 1px; }
+/* "Not uploaded yet" marker — bottom-left, persistent (unlike the hover check). */
+.tile .cloud-badge {
+  position: absolute; bottom: 6px; left: 6px; width: 22px; height: 22px; border-radius: 50%;
+  background: rgba(0,0,0,0.55); color: #fff; display: flex; align-items: center; justify-content: center;
+  pointer-events: none;
+}
 .grid-wrap { position: relative; user-select: none; }
 .marquee { position: fixed; border: 1px solid var(--accent2); background: rgba(59,130,246,0.18); border-radius: 2px; z-index: 60; pointer-events: none; }
 .tile .check {
@@ -157,9 +189,10 @@ a { color: var(--accent2); cursor: pointer; }
 }
 .viewer video { max-width: 92vw; max-height: 88vh; object-fit: contain; background: #000; }
 .viewer .zoom-stage { width: 92vw; height: 88vh; display: flex; align-items: center; justify-content: center; overflow: hidden; }
-.viewer .zoom-inner { position: relative; display: inline-block; will-change: transform; }
-.viewer .zoom-inner img.base { display: block; max-width: 92vw; max-height: 88vh; object-fit: contain; user-select: none; -webkit-user-drag: none; }
-.viewer .zoom-inner img.over { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; user-select: none; -webkit-user-drag: none; transition: opacity .2s ease; }
+.viewer .zoom-inner { position: relative; will-change: transform; }
+.viewer .zoom-inner img.base,
+.viewer .zoom-inner img.over { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; user-select: none; -webkit-user-drag: none; }
+.viewer .zoom-inner img.over { transition: opacity .2s ease; }
 .viewer .zoom-controls {
   position: absolute; bottom: 46px; left: 50%; transform: translateX(-50%);
   display: flex; gap: 8px; align-items: center;

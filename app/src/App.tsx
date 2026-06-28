@@ -132,6 +132,11 @@ const TileView = React.memo(function TileView({
     <div data-fn={f.filename} className={"tile" + (selected ? " sel" : "")}>
       <img loading="lazy" draggable={false} src={mediaUrl(set, f.filename, true, albumId)} />
       {f.is_video && <div className="vid-badge" aria-label="Video"><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M8 5v14l11-7z" /></svg></div>}
+      {f.is_local && !f.is_remote && (
+        <div className="cloud-badge" aria-label="Not uploaded yet" title="Not uploaded yet">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4c-1.48 0-2.85.43-4.01 1.17l1.46 1.46C10.21 6.23 11.08 6 12 6c3.04 0 5.5 2.46 5.5 5.5v.5H19c1.66 0 3 1.34 3 3 0 1.13-.64 2.11-1.56 2.62l1.45 1.45C24.16 18.16 24 16 24 16c0-2.64-2.05-4.78-4.65-4.96zM3 5.27l2.75 2.74C2.56 8.15 0 10.77 0 14c0 3.31 2.69 6 6 6h11.73l2 2L21 20.73 4.27 4 3 5.27zM7.73 10l8 8H6c-2.21 0-4-1.79-4-4s1.79-4 4-4h1.73z" /></svg>
+        </div>
+      )}
       <div className="check">{selected ? "✓" : ""}</div>
       {selectionEmpty && renderExtra?.(f)}
     </div>
@@ -369,6 +374,9 @@ function ZoomableImage({ thumbUrl, fullUrl, onDragOut }: { thumbUrl: string; ful
   const [scale, setScale] = useState(1);
   const [pos, setPos] = useState({ x: 0, y: 0 });
   const [fullLoaded, setFullLoaded] = useState(false);
+  // Natural pixel size of the image (from whichever layer loads first; the thumb
+  // and full share an aspect ratio, so the thumb gives a correct fit immediately).
+  const [natural, setNatural] = useState<{ w: number; h: number } | null>(null);
   const drag = useRef<{ x: number; y: number } | null>(null);
   // Press tracked when NOT zoomed → a small move drags the file out (Explorer-style).
   const press = useRef<{ x: number; y: number } | null>(null);
@@ -376,7 +384,36 @@ function ZoomableImage({ thumbUrl, fullUrl, onDragOut }: { thumbUrl: string; ful
 
   const clamp = (s: number) => Math.min(8, Math.max(1, s));
 
-  useEffect(() => { setScale(1); setPos({ x: 0, y: 0 }); setFullLoaded(false); }, [fullUrl]);
+  useEffect(() => { setScale(1); setPos({ x: 0, y: 0 }); setFullLoaded(false); setNatural(null); }, [fullUrl]);
+
+  const onBaseLoad = (e: React.SyntheticEvent<HTMLImageElement>) => {
+    const img = e.currentTarget;
+    if (!natural && img.naturalWidth > 0) setNatural({ w: img.naturalWidth, h: img.naturalHeight });
+  };
+  const onOverLoad = (e: React.SyntheticEvent<HTMLImageElement>) => {
+    const img = e.currentTarget;
+    if (img.naturalWidth > 0) setNatural({ w: img.naturalWidth, h: img.naturalHeight });
+    setFullLoaded(true);
+  };
+
+  // Lay the image out ONCE at a bounded high resolution, then zoom/pan it with a
+  // GPU transform. Driving zoom by element *size* makes a big photo's element
+  // grow until the webview can't decode it at that size → blank, and panning
+  // re-rasterizes the giant layer → also blank. Here `render` is a fixed box,
+  // capped to native resolution and the webview's safe decode limit, so the
+  // raster is far sharper than the old 512px thumbnail box yet never blanks;
+  // transform: scale handles the visual zoom on top of it.
+  const render = useMemo(() => {
+    if (!natural) return null;
+    const fitR = Math.min((window.innerWidth * 0.92) / natural.w, (window.innerHeight * 0.88) / natural.h);
+    const fitW = natural.w * fitR, fitH = natural.h * fitR; // displayed size at scale 1
+    const dpr = window.devicePixelRatio || 1;
+    const MAX_DEVICE_EDGE = 4096; // safe single-image decode size for the webview
+    // Rasterize up to `R`× the fit size — bounded by 1:1 native pixels, the decode
+    // cap, and the max zoom. Beyond R, transform upscales (soft, but never blank).
+    const R = Math.max(1, Math.min(8, 1 / fitR, MAX_DEVICE_EDGE / (dpr * Math.max(fitW, fitH))));
+    return { w: Math.round(fitW * R), h: Math.round(fitH * R), R };
+  }, [natural]);
 
   useEffect(() => {
     const el = stageRef.current;
@@ -426,10 +463,17 @@ function ZoomableImage({ thumbUrl, fullUrl, onDragOut }: { thumbUrl: string; ful
         onDoubleClick={() => (scale > 1 ? reset() : setScale(2))}
         style={{ cursor: scale > 1 ? (drag.current ? "grabbing" : "grab") : "default" }}
       >
-        <div className="zoom-inner" style={{ transform: `translate(${pos.x}px,${pos.y}px) scale(${scale})` }}>
-          <img className="base" src={thumbUrl} draggable={false} />
+        <div
+          className="zoom-inner"
+          style={
+            render
+              ? { width: render.w, height: render.h, transform: `translate(${pos.x}px,${pos.y}px) scale(${scale / render.R})` }
+              : { transform: `translate(${pos.x}px,${pos.y}px)` }
+          }
+        >
+          <img className="base" src={thumbUrl} draggable={false} onLoad={onBaseLoad} />
           <img className="over" src={fullUrl} draggable={false}
-            style={{ opacity: fullLoaded ? 1 : 0 }} onLoad={() => setFullLoaded(true)} />
+            style={{ opacity: fullLoaded ? 1 : 0 }} onLoad={onOverLoad} />
         </div>
       </div>
       <div className="zoom-controls" onClick={(e) => e.stopPropagation()}>
@@ -648,6 +692,49 @@ function AuthView({ onAuthed, sessionExpired }: { onAuthed: (s: Session) => void
   );
 }
 
+/* ----------------------------- Sync panel ----------------------------- */
+
+type Progress = { done: number; total: number } | null;
+
+// One phase row: an icon, a label, a done/total count, and a progress bar.
+function PhaseRow({ icon, label, value }: { icon: string; label: string; value: { done: number; total: number } }) {
+  const pct = value.total > 0 ? Math.min(100, (value.done / value.total) * 100) : 0;
+  return (
+    <div className="phase-row">
+      <span className="phase-icon">{icon}</span>
+      <span className="phase-label">{label}</span>
+      <span className="phase-count">{value.done} / {value.total}</span>
+      <div className="sync-bar"><div style={{ width: pct + "%" }} /></div>
+    </div>
+  );
+}
+
+// Consolidated sync status: a calm "Up to date" when idle, or an animated header
+// plus one progress row per active phase (upload / thumbnails / cache).
+function SyncPanel({ syncing, upload, thumbs, originals }: {
+  syncing: boolean; upload: Progress; thumbs: Progress; originals: Progress;
+}) {
+  const up = upload && upload.total > 0 ? upload : null;
+  const th = thumbs && thumbs.total > 0 ? thumbs : null;
+  const or = originals && originals.total > 0 ? originals : null;
+  const active = syncing || !!up || !!th || !!or;
+
+  return (
+    <div className="sync-panel">
+      <div className="sync-head">
+        {active ? (
+          <><span className="spinner" /> <span>Syncing…</span></>
+        ) : (
+          <span className="sync-idle">✓ Up to date</span>
+        )}
+      </div>
+      {up && <PhaseRow icon="↑" label="Uploading" value={up} />}
+      {th && <PhaseRow icon="⤓" label="Thumbnails" value={th} />}
+      {or && <PhaseRow icon="⤓" label="Cache" value={or} />}
+    </div>
+  );
+}
+
 /* ----------------------------- Main ----------------------------- */
 
 function Main({ session, setSession, refreshSession, showToast, toast }: {
@@ -657,11 +744,14 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
   const [view, setView] = useState<View>("gallery");
   const [syncing, setSyncing] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
+  const [upload, setUpload] = useState<{ done: number; total: number } | null>(null);
   const [thumbs, setThumbs] = useState<{ done: number; total: number } | null>(null);
   const [originals, setOriginals] = useState<{ done: number; total: number } | null>(null);
   // Set when auto-update is off and the backend reports an available update.
   const [updateVer, setUpdateVer] = useState<string | null>(null);
   const [updating, setUpdating] = useState(false);
+  const [appVer, setAppVer] = useState<string>("");
+  useEffect(() => { api.getAppVersion().then(setAppVer).catch(() => {}); }, []);
   const reload = () => setReloadKey((k) => k + 1);
 
   const installUpdate = useCallback(async () => {
@@ -677,6 +767,25 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
     return () => { un.then((f) => f()); };
   }, []);
 
+  // Folder-watch auto-import runs in a background loop and emits one event per
+  // imported file. Unlike manual import (drag/paste/button) it has no direct
+  // call into the UI, so refresh the grid here — debounced, since a batch can
+  // fire many events in quick succession — and surface any import failures.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const scheduleReload = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => reload(), 600);
+    };
+    const u1 = listen<string>("watch-import-progress", () => scheduleReload());
+    const u2 = listen<string>("watch-import-error", (e) => showToast(e.payload));
+    return () => {
+      if (timer) clearTimeout(timer);
+      u1.then((f) => f());
+      u2.then((f) => f());
+    };
+  }, [showToast]);
+
   useEffect(() => {
     // Progress events are emitted from many concurrent download tasks, so they
     // can arrive out of order (e.g. 48 then 32). Clamp `done` to never go
@@ -685,6 +794,14 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
       const sameBatch = prev && prev.total === total;
       return { done: sameBatch ? Math.max(prev!.done, done) : done, total };
     };
+    const u0 = listen<[number, number]>("upload-progress", (e) =>
+      // total 0 → nothing to upload; keep the row hidden instead of showing 0/0.
+      setUpload((prev) => (e.payload[1] > 0 ? merge(prev, e.payload[0], e.payload[1]) : null))
+    );
+    const u0b = listen("upload-done", () => {
+      setUpload(null);
+      reload(); // uploaded files are now remote → refresh their state badges
+    });
     const u1 = listen<[number, number]>("thumbs-progress", (e) =>
       setThumbs((prev) => merge(prev, e.payload[0], e.payload[1]))
     );
@@ -701,7 +818,10 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
       // new photos) before each originals pass, so refresh the grid here too.
       reload();
     });
-    return () => { u1.then((f) => f()); u2.then((f) => f()); u3.then((f) => f()); u4.then((f) => f()); };
+    return () => {
+      u0.then((f) => f()); u0b.then((f) => f());
+      u1.then((f) => f()); u2.then((f) => f()); u3.then((f) => f()); u4.then((f) => f());
+    };
   }, []);
 
   const doSync = useCallback(async () => {
@@ -780,6 +900,7 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
           <img className="brand-logo" src={logoUrl} alt="" />
           <div className="brand-title">Stingle Desktop</div>
         </div>
+        {appVer && <div className="brand-version">v{appVer}</div>}
         <div className="nav">
           <button className={view === "gallery" ? "active" : ""} onClick={() => setView("gallery")}><GalleryIcon /> Gallery</button>
           <button className={view === "albums" ? "active" : ""} onClick={() => setView("albums")}><AlbumsIcon /> Albums</button>
@@ -792,15 +913,11 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
             {updating ? "Updating…" : `⤓ Update to ${updateVer} — restart now`}
           </button>
         )}
+        <SyncPanel syncing={syncing} upload={upload} thumbs={thumbs} originals={originals} />
+        <div className="side-div" />
         <div className="acct">{session.email}</div>
         <div className="storage-bar"><div style={{ width: pct + "%" }} /></div>
         <div className="acct">{fmtMB(session.space_used)} / {fmtMB(session.space_quota)}</div>
-        {thumbs && thumbs.total > 0 && (
-          <div className="acct">⤓ Thumbnails {thumbs.done}/{thumbs.total}</div>
-        )}
-        {originals && originals.total > 0 && (
-          <div className="acct">⤓ Originals {originals.done}/{originals.total}</div>
-        )}
       </div>
 
       <div className="main">

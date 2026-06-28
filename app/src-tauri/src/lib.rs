@@ -362,11 +362,27 @@ async fn handle_session_expired(app: &tauri::AppHandle, state: &AppState) {
 #[tauri::command]
 async fn sync(app: tauri::AppHandle, state: State<'_, AppState>) -> CmdResult<SyncResultDto> {
     let acc = state.current().await.ok_or("Not logged in")?;
-    if let Err(err) = acc.full_sync().await {
+    // Run the two sync phases directly (instead of full_sync) so we can surface
+    // per-file upload progress to the UI between the metadata pull and prefetch.
+    if let Err(err) = acc.sync_cloud_to_local().await {
         if err.is_logged_out() {
             handle_session_expired(&app, &state).await;
         }
         return Err(e(err));
+    }
+    {
+        let app_cb = app.clone();
+        let upcb = move |done: usize, total: usize| {
+            let _ = app_cb.emit("upload-progress", (done, total));
+        };
+        let r = acc.upload_to_cloud(Some(&upcb)).await;
+        let _ = app.emit("upload-done", ());
+        if let Err(err) = r {
+            if err.is_logged_out() {
+                handle_session_expired(&app, &state).await;
+            }
+            return Err(e(err));
+        }
     }
     let result = SyncResultDto {
         gallery: acc.db.count_files(FileSet::Gallery).map_err(e)?,
@@ -1153,7 +1169,18 @@ async fn start_sync_loop(app: tauri::AppHandle, state: &AppState) {
     let handle = tauri::async_runtime::spawn(async move {
         loop {
             if let Some(acc) = app2.state::<AppState>().current().await {
-                if let Err(err) = acc.full_sync().await {
+                let app_up = app2.clone();
+                let upcb = move |done: usize, total: usize| {
+                    let _ = app_up.emit("upload-progress", (done, total));
+                };
+                let synced = acc.sync_cloud_to_local().await;
+                let uploaded = if synced.is_ok() {
+                    acc.upload_to_cloud(Some(&upcb)).await
+                } else {
+                    Ok(())
+                };
+                let _ = app2.emit("upload-done", ());
+                if let Err(err) = synced.and(uploaded) {
                     if err.is_logged_out() {
                         // Token died: tear down the session and stop the loop so we
                         // don't keep hammering the server with a dead token. Done
@@ -1237,7 +1264,18 @@ async fn start_watch_loop(app: tauri::AppHandle, state: &AppState) {
             let folders = state.config.lock().await.watch_folders.clone();
             if !folders.is_empty() {
                 if let Some(acc) = state.current().await {
-                    watch::scan_folders(&app2, &acc, &folders, &mut stable).await;
+                    let imported = watch::scan_folders(&app2, &acc, &folders, &mut stable).await;
+                    // Newly imported files are local-only; push them to the cloud
+                    // right away (with progress) so watch-folder import "just syncs"
+                    // without waiting for a manual sync.
+                    if imported > 0 {
+                        let app_up = app2.clone();
+                        let upcb = move |done: usize, total: usize| {
+                            let _ = app_up.emit("upload-progress", (done, total));
+                        };
+                        let _ = acc.upload_to_cloud(Some(&upcb)).await;
+                        let _ = app2.emit("upload-done", ());
+                    }
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(WATCH_INTERVAL_SECS)).await;

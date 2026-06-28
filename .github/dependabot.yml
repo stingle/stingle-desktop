@@ -1,0 +1,36 @@
+# Dependabot config. Security updates for transitive deps that can't be bumped
+# standalone (esbuild via vite, glib via the gtk/tauri stack) are ignored here;
+# dismiss their existing alerts in Security → Dependabot alerts to quiet them.
+version: 2
+updates:
+  # Keep the release workflow's actions current (clears the Node 20 warnings).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: npm
+    directory: "/app"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      app-deps:
+        patterns:
+          - "*"
+    ignore:
+      # transitive via vite; dev-server only, not shipped in the app
+      - dependency-name: "esbuild"
+
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      rust-deps:
+        patterns:
+          - "*"
+    ignore:
+      # transitive via the gtk/tauri Linux stack; not upgradable standalone
+      - dependency-name: "glib"

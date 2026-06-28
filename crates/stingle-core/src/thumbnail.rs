@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use image::imageops::FilterType;
-use image::ImageReader;
+use image::{DynamicImage, ImageDecoder, ImageReader};
 
 use crate::error::{CoreError, Result};
 
@@ -21,9 +21,17 @@ pub const THUMB_JPEG_QUALITY: u8 = 80;
 
 /// Decode an image and produce a downscaled JPEG thumbnail.
 pub fn image_thumbnail(image_bytes: &[u8]) -> Result<Vec<u8>> {
-    let img = ImageReader::new(Cursor::new(image_bytes))
+    let mut decoder = ImageReader::new(Cursor::new(image_bytes))
         .with_guessed_format()?
-        .decode()?;
+        .into_decoder()?;
+    // Honor EXIF orientation so the thumbnail matches how the webview renders
+    // the full image. Cameras (Nikon, iPhone, …) store portrait shots in
+    // landshape pixels plus an orientation tag; without this the thumbnail
+    // comes out sideways. encode_jpeg re-encodes raw RGB and writes no EXIF, so
+    // baking the rotation in here can't cause a double-rotation in the webview.
+    let orientation = decoder.orientation()?;
+    let mut img = DynamicImage::from_decoder(decoder)?;
+    img.apply_orientation(orientation);
     let thumb = img.thumbnail(THUMB_MAX_DIM, THUMB_MAX_DIM);
     encode_jpeg(&thumb)
 }
