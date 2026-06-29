@@ -121,16 +121,68 @@ function inTextField(e: KeyboardEvent): boolean {
 /** One thumbnail. Memoized so a selection change (or a sync-triggered reload)
  *  only re-renders the tiles that actually changed — critical with thousands of
  *  tiles, where re-rendering the whole grid on every marquee frame would jank. */
+/** A shared IntersectionObserver for the whole grid: each tile registers its
+ *  element + a setter, and is told when it enters/leaves a band ~2 viewports tall
+ *  around the scroll viewport. One observer for the whole grid is O(visible) work
+ *  per scroll, not O(items) — so a 10k-photo grid stays cheap. The band (rootMargin)
+ *  is generous enough that tiles reload before they scroll back into view, so there
+ *  is no blank flash on normal scrolling. */
+function useTileVisibility(): (el: Element, cb: (visible: boolean) => void) => () => void {
+  const cbs = useRef<Map<Element, (v: boolean) => void>>(new Map()).current;
+  const ioRef = useRef<IntersectionObserver | null>(null);
+
+  const register = useCallback((el: Element, cb: (visible: boolean) => void) => {
+    if (!ioRef.current) {
+      // Resolve the scroll container from a real tile (it's an ancestor and is
+      // attached by the time a ref callback runs); fall back to the viewport.
+      const root = (el.closest(".content") as Element | null) ?? null;
+      ioRef.current = new IntersectionObserver(
+        (entries) => {
+          for (const e of entries) {
+            const setter = cbs.get(e.target);
+            if (setter) setter(e.isIntersecting);
+          }
+        },
+        { root, rootMargin: "200% 0px", threshold: 0 },
+      );
+    }
+    cbs.set(el, cb);
+    ioRef.current.observe(el);
+    return () => {
+      ioRef.current?.unobserve(el);
+      cbs.delete(el);
+    };
+  }, [cbs]);
+
+  useEffect(() => () => { ioRef.current?.disconnect(); cbs.clear(); }, [cbs]);
+
+  return register;
+}
+
 const TileView = React.memo(function TileView({
-  f, set, albumId, selected, selectionEmpty, renderExtra,
+  f, set, albumId, selected, selectionEmpty, renderExtra, register,
 }: {
   f: FileItem; set: number; albumId: string | null;
   selected: boolean; selectionEmpty: boolean;
   renderExtra?: (f: FileItem) => React.ReactNode;
+  // Registers this tile with the grid's shared IntersectionObserver; the callback
+  // flips whether the <img> is mounted as the tile enters/leaves the load band.
+  register: (el: Element, cb: (visible: boolean) => void) => () => void;
 }) {
+  const tileRef = useRef<HTMLDivElement>(null);
+  // Only mount the <img> while the tile is within the observer's band. Removing it
+  // when far off-screen ABORTS any in-flight stingle:// request — the one thing
+  // native loading="lazy" can't do — so a fast scroll never builds a backlog of
+  // stale requests that starve the now-visible thumbnails.
+  const [show, setShow] = useState(false);
+  useEffect(() => {
+    const el = tileRef.current;
+    if (!el) return;
+    return register(el, setShow);
+  }, [register]);
   return (
-    <div data-fn={f.filename} className={"tile" + (selected ? " sel" : "")}>
-      <img loading="lazy" draggable={false} src={mediaUrl(set, f.filename, true, albumId)} />
+    <div ref={tileRef} data-fn={f.filename} className={"tile" + (selected ? " sel" : "")}>
+      {show && <img draggable={false} src={mediaUrl(set, f.filename, true, albumId)} />}
       {f.is_video && <div className="vid-badge" aria-label="Video"><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M8 5v14l11-7z" /></svg></div>}
       {f.is_local && !f.is_remote && (
         <div className="cloud-badge" aria-label="Not uploaded yet" title="Not uploaded yet">
@@ -345,9 +397,11 @@ function PhotoGrid({ items, set, albumId, grouped, sel, setSel, onOpen, renderEx
   };
 
   const selectionEmpty = sel.size === 0;
+  const register = useTileVisibility();
   const Tile = (f: FileItem) => (
     <TileView key={f.filename} f={f} set={set} albumId={albumId}
-      selected={sel.has(f.filename)} selectionEmpty={selectionEmpty} renderExtra={renderExtra} />
+      selected={sel.has(f.filename)} selectionEmpty={selectionEmpty} renderExtra={renderExtra}
+      register={register} />
   );
 
   // Re-grouping the whole list is cheap but pointless on every render (e.g. each
@@ -374,9 +428,15 @@ function ZoomableImage({ thumbUrl, fullUrl, onDragOut }: { thumbUrl: string; ful
   const [scale, setScale] = useState(1);
   const [pos, setPos] = useState({ x: 0, y: 0 });
   const [fullLoaded, setFullLoaded] = useState(false);
-  // Natural pixel size of the image (from whichever layer loads first; the thumb
-  // and full share an aspect ratio, so the thumb gives a correct fit immediately).
+  // Drives the on-screen LAYOUT (fit box). Taken from whichever layer loads first —
+  // normally the instant cached thumbnail — and then kept STABLE. We must not adopt
+  // the full image's reported size here: an original with EXIF orientation reports
+  // swapped naturalWidth/Height vs. the pre-oriented thumbnail, so overwriting this
+  // when the full arrives would visibly resize the picture mid-view.
   const [natural, setNatural] = useState<{ w: number; h: number } | null>(null);
+  // Best available resolution, only for the raster sharpness multiplier (R) — the
+  // full image when it arrives. Updating it does NOT change the on-screen size.
+  const [hiRes, setHiRes] = useState<{ w: number; h: number } | null>(null);
   const drag = useRef<{ x: number; y: number } | null>(null);
   // Press tracked when NOT zoomed → a small move drags the file out (Explorer-style).
   const press = useRef<{ x: number; y: number } | null>(null);
@@ -384,36 +444,50 @@ function ZoomableImage({ thumbUrl, fullUrl, onDragOut }: { thumbUrl: string; ful
 
   const clamp = (s: number) => Math.min(8, Math.max(1, s));
 
-  useEffect(() => { setScale(1); setPos({ x: 0, y: 0 }); setFullLoaded(false); setNatural(null); }, [fullUrl]);
+  useEffect(() => { setScale(1); setPos({ x: 0, y: 0 }); setFullLoaded(false); setNatural(null); setHiRes(null); }, [fullUrl]);
 
   const onBaseLoad = (e: React.SyntheticEvent<HTMLImageElement>) => {
     const img = e.currentTarget;
-    if (!natural && img.naturalWidth > 0) setNatural({ w: img.naturalWidth, h: img.naturalHeight });
+    if (img.naturalWidth > 0) {
+      // The thumbnail is pre-oriented (EXIF baked in at generation), so ITS aspect
+      // is the true display aspect. Always trust it for the layout box — overwrite
+      // even if the full image got here first, since the full can report raw,
+      // EXIF-unaware (e.g. landscape) dimensions that would size the box wrong.
+      setNatural({ w: img.naturalWidth, h: img.naturalHeight });
+      setHiRes((r) => r ?? { w: img.naturalWidth, h: img.naturalHeight });
+    }
   };
   const onOverLoad = (e: React.SyntheticEvent<HTMLImageElement>) => {
     const img = e.currentTarget;
-    if (img.naturalWidth > 0) setNatural({ w: img.naturalWidth, h: img.naturalHeight });
+    if (img.naturalWidth > 0) {
+      setNatural((n) => n ?? { w: img.naturalWidth, h: img.naturalHeight }); // fallback box only until the thumb loads
+      setHiRes({ w: img.naturalWidth, h: img.naturalHeight }); // full resolution → sharp zoom, no size change
+    }
     setFullLoaded(true);
   };
 
-  // Lay the image out ONCE at a bounded high resolution, then zoom/pan it with a
-  // GPU transform. Driving zoom by element *size* makes a big photo's element
-  // grow until the webview can't decode it at that size → blank, and panning
-  // re-rasterizes the giant layer → also blank. Here `render` is a fixed box,
-  // capped to native resolution and the webview's safe decode limit, so the
-  // raster is far sharper than the old 512px thumbnail box yet never blanks;
-  // transform: scale handles the visual zoom on top of it.
-  const render = useMemo(() => {
+  // The on-screen fit box (size at zoom = 1). Driven ONLY by `natural` (the
+  // thumbnail's aspect), so it is fixed the moment the thumbnail loads and never
+  // changes when the full image arrives — that's what stops the picture resizing.
+  const box = useMemo(() => {
     if (!natural) return null;
     const fitR = Math.min((window.innerWidth * 0.92) / natural.w, (window.innerHeight * 0.88) / natural.h);
-    const fitW = natural.w * fitR, fitH = natural.h * fitR; // displayed size at scale 1
+    return { w: Math.round(natural.w * fitR), h: Math.round(natural.h * fitR) };
+  }, [natural]);
+
+  // Raster multiplier for the FULL-image layer only. It's laid out at box × overR
+  // and counter-scaled by 1/overR, so it occupies exactly the box but is decoded at
+  // higher resolution → sharp zoom. Because it only affects that layer's internal
+  // raster (not the box), updating it when the full image loads changes nothing
+  // on-screen. Bounded by the image's native pixels and the webview's decode limit.
+  const overR = useMemo(() => {
+    if (!box || !hiRes) return 1;
     const dpr = window.devicePixelRatio || 1;
     const MAX_DEVICE_EDGE = 4096; // safe single-image decode size for the webview
-    // Rasterize up to `R`× the fit size — bounded by 1:1 native pixels, the decode
-    // cap, and the max zoom. Beyond R, transform upscales (soft, but never blank).
-    const R = Math.max(1, Math.min(8, 1 / fitR, MAX_DEVICE_EDGE / (dpr * Math.max(fitW, fitH))));
-    return { w: Math.round(fitW * R), h: Math.round(fitH * R), R };
-  }, [natural]);
+    const longEdge = Math.max(hiRes.w, hiRes.h);
+    const nativePerFit = longEdge / Math.max(box.w, box.h);
+    return Math.max(1, Math.min(8, nativePerFit, MAX_DEVICE_EDGE / (dpr * Math.max(box.w, box.h))));
+  }, [box, hiRes]);
 
   useEffect(() => {
     const el = stageRef.current;
@@ -466,14 +540,16 @@ function ZoomableImage({ thumbUrl, fullUrl, onDragOut }: { thumbUrl: string; ful
         <div
           className="zoom-inner"
           style={
-            render
-              ? { width: render.w, height: render.h, transform: `translate(${pos.x}px,${pos.y}px) scale(${scale / render.R})` }
+            box
+              ? { width: box.w, height: box.h, transform: `translate(${pos.x}px,${pos.y}px) scale(${scale})` }
               : { transform: `translate(${pos.x}px,${pos.y}px)` }
           }
         >
           <img className="base" src={thumbUrl} draggable={false} onLoad={onBaseLoad} />
-          <img className="over" src={fullUrl} draggable={false}
-            style={{ opacity: fullLoaded ? 1 : 0 }} onLoad={onOverLoad} />
+          <img className="over" src={fullUrl} draggable={false} onLoad={onOverLoad}
+            style={box
+              ? { opacity: fullLoaded ? 1 : 0, width: box.w * overR, height: box.h * overR, transform: `scale(${1 / overR})`, transformOrigin: "top left" }
+              : { opacity: fullLoaded ? 1 : 0 }} />
         </div>
       </div>
       <div className="zoom-controls" onClick={(e) => e.stopPropagation()}>
@@ -481,6 +557,10 @@ function ZoomableImage({ thumbUrl, fullUrl, onDragOut }: { thumbUrl: string; ful
         <button onClick={reset}>{Math.round(scale * 100)}%</button>
         <button onClick={zoomIn}>＋</button>
       </div>
+      {/* While the high-res original is still downloading/decrypting (only the
+          thumbnail is showing), spin in the corner so the soft image reads as
+          "loading", not "final". */}
+      {!fullLoaded && <div className="full-spinner"><div className="spinner" /></div>}
     </>
   );
 }
@@ -563,10 +643,40 @@ function AuthView({ onAuthed, sessionExpired }: { onAuthed: (s: Session) => void
   const [phrase, setPhrase] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // Whether biometric auto-unlock is set up, so we can offer a manual retry.
+  // The startup auto-unlock attempt prompts once; if the user cancels it (or it
+  // otherwise fails) this button is the only way back in short of restarting.
+  const [canBiometric, setCanBiometric] = useState(false);
 
   useEffect(() => {
     api.lastAccount().then((a) => { setLastAcc(a); setReady(true); }).catch(() => setReady(true));
   }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const [enabled, store] = await Promise.all([
+          api.isAutoUnlockEnabled().catch(() => false),
+          api.secureStoreStatus().catch(() => ({ biometric: false })),
+        ]);
+        setCanBiometric(enabled && store.biometric);
+      } catch { /* leave the button hidden */ }
+    })();
+  }, []);
+
+  // Retry biometric unlock from the login screen (re-triggers the OS prompt).
+  // Only meaningful for an offline resume — a server-expired token can't be
+  // revived this way, so the button is hidden when sessionExpired.
+  const biometricUnlock = async () => {
+    setBusy(true); setError("");
+    try {
+      const u = await api.tryAutoUnlock();
+      if (u.logged_in) { onAuthed(u); return; }
+      setError("Biometric unlock was canceled.");
+    } catch (e: any) {
+      setError(String(e));
+    } finally { setBusy(false); }
+  };
 
   const submit = async () => {
     setBusy(true); setError("");
@@ -628,6 +738,11 @@ function AuthView({ onAuthed, sessionExpired }: { onAuthed: (s: Session) => void
           <button className="primary" style={{ width: "100%", marginTop: 10 }} disabled={busy} onClick={unlock}>
             {busy ? <span className="spinner" /> : "Unlock"}
           </button>
+          {canBiometric && !sessionExpired && (
+            <button style={{ width: "100%", marginTop: 8 }} disabled={busy} onClick={biometricUnlock}>
+              Unlock with biometrics
+            </button>
+          )}
           <div className="link-row" style={{ justifyContent: "center" }}>
             <a onClick={() => { setUseOther(true); setEmail(""); setPassword(""); setError(""); }}>Sign in to a different account</a>
           </div>
@@ -787,6 +902,14 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
   }, [showToast]);
 
   useEffect(() => {
+    // A *-done event can fire repeatedly as concurrent batches finish; each reload
+    // rebuilds the whole items array (and re-attaches the grid observer), so coalesce
+    // a burst into a single reload instead of thrashing the grid mid-scroll.
+    let reloadTimer: ReturnType<typeof setTimeout> | undefined;
+    const scheduleReload = () => {
+      if (reloadTimer) clearTimeout(reloadTimer);
+      reloadTimer = setTimeout(() => reload(), 600);
+    };
     // Progress events are emitted from many concurrent download tasks, so they
     // can arrive out of order (e.g. 48 then 32). Clamp `done` to never go
     // backwards within a batch so the counter rises smoothly instead of jumping.
@@ -800,14 +923,14 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
     );
     const u0b = listen("upload-done", () => {
       setUpload(null);
-      reload(); // uploaded files are now remote → refresh their state badges
+      scheduleReload(); // uploaded files are now remote → refresh their state badges
     });
     const u1 = listen<[number, number]>("thumbs-progress", (e) =>
       setThumbs((prev) => merge(prev, e.payload[0], e.payload[1]))
     );
     const u2 = listen<number>("thumbs-done", () => {
       setThumbs(null);
-      reload(); // new thumbnails arrived → re-mount the <img>s so they show
+      scheduleReload(); // new thumbnails arrived → re-mount the <img>s so they show
     });
     const u3 = listen<[number, number]>("originals-progress", (e) =>
       setOriginals((prev) => (e.payload[1] > 0 ? merge(prev, e.payload[0], e.payload[1]) : null))
@@ -816,9 +939,10 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
       setOriginals(null);
       // The background "sync everything" loop runs a full_sync (which can pull in
       // new photos) before each originals pass, so refresh the grid here too.
-      reload();
+      scheduleReload();
     });
     return () => {
+      if (reloadTimer) clearTimeout(reloadTimer);
       u0.then((f) => f()); u0b.then((f) => f());
       u1.then((f) => f()); u2.then((f) => f()); u3.then((f) => f()); u4.then((f) => f());
     };
@@ -1756,7 +1880,6 @@ function Viewer({ items, index, set, albumId, onClose, onChanged, showToast }: {
   onClose: () => void; onChanged: () => void; showToast: (m: string) => void;
 }) {
   const [i, setI] = useState(index);
-  const [isVid, setIsVid] = useState<boolean | null>(null);
   const vidPress = useRef<{ x: number; y: number } | null>(null);
   const f = items[i];
   useEffect(() => {
@@ -1768,13 +1891,6 @@ function Viewer({ items, index, set, albumId, onClose, onChanged, showToast }: {
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
   }, [items.length, onClose]);
-
-  useEffect(() => {
-    let alive = true;
-    setIsVid(null);
-    if (f) api.isVideo(set, f.filename, albumId).then((v) => alive && setIsVid(v)).catch(() => alive && setIsVid(false));
-    return () => { alive = false; };
-  }, [i, f, set, albumId]);
 
   // Ctrl/Cmd+C copies the currently-viewed item.
   useEffect(() => {
@@ -1788,6 +1904,11 @@ function Viewer({ items, index, set, albumId, onClose, onChanged, showToast }: {
   }, [f, set, albumId, showToast]);
 
   if (!f) return null;
+  // `is_video` already comes with the listed row (decoded from its header), so use
+  // it directly — no extra IPC round-trip to gate the viewer. This lets the image
+  // (and its instant cached thumbnail) mount the moment you click, instead of
+  // waiting on a command that can be starved right after a big scroll.
+  const isVid = f.is_video;
   const thumbUrl = mediaUrl(set, f.filename, true, albumId);
   const fullUrl = mediaUrl(set, f.filename, false, albumId);
   const stop = (e: React.MouseEvent) => e.stopPropagation();
@@ -1799,8 +1920,7 @@ function Viewer({ items, index, set, albumId, onClose, onChanged, showToast }: {
           onDone={() => { onChanged(); onClose(); }} showToast={showToast} />
       </div>
       {i > 0 && <button className="nav-btn prev" onClick={(e) => { e.stopPropagation(); setI(i - 1); }}>‹</button>}
-      {isVid === null ? <div className="spinner" />
-        : isVid ? <video src={fullUrl} controls autoPlay onClick={stop}
+      {isVid ? <video src={fullUrl} controls autoPlay onClick={stop}
             onMouseDown={(e) => {
               // Start a drag only from the video frame, not the bottom controls bar.
               const r = (e.currentTarget as HTMLElement).getBoundingClientRect();

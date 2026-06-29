@@ -152,13 +152,38 @@ impl Account {
 
         match range {
             None => {
-                let blob = std::fs::read(&path)?;
-                let mut body = file::decrypt_with_external_header(
-                    &part,
-                    &blob,
-                    &kp.public_key,
-                    &kp.secret_key,
-                )?;
+                // Cache miss: read the encrypted blob and decrypt it. The disk read
+                // is blocking and the libsodium decrypt is CPU-bound, so run both on
+                // the blocking pool (never the async workers — a slow disk or a burst
+                // of misses would otherwise stall every concurrent request).
+                //
+                // Only *full-resolution* decrypts take a permit: they're large and may
+                // transcode, so we bound how many run at once. Thumbnails are tiny AND
+                // are the instant-preview layer the viewer paints under the full image,
+                // so they must never queue behind a heavy full decrypt — gating them
+                // would make the preview wait for the full download. The frontend
+                // observer already caps how many thumbnails are in flight, so they need
+                // no backend bound of their own.
+                let _permit = if is_thumb {
+                    None
+                } else {
+                    Some(
+                        self.decrypt_sem
+                            .acquire()
+                            .await
+                            .map_err(|_| CoreError::Other("decrypt semaphore closed".into()))?,
+                    )
+                };
+                let path = path.clone();
+                let part = part.clone();
+                let pk = kp.public_key.clone();
+                let sk = kp.secret_key.clone();
+                let mut body = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+                    let blob = std::fs::read(&path)?;
+                    Ok(file::decrypt_with_external_header(&part, &blob, &pk, &sk)?)
+                })
+                .await
+                .map_err(|e| CoreError::Other(format!("decrypt task failed: {e}")))??;
                 let mut ct = content_type;
                 // Transcode formats the webview can't display for full preview.
                 if !is_thumb && needs_transcode(&ct) {
@@ -185,8 +210,6 @@ impl Account {
             }
             Some((start, end_opt)) => {
                 let total = header.data_size;
-                let mut f = std::fs::File::open(&path)?;
-                let outer_len = file::outer_header_len(&mut f)?;
                 let last = total.saturating_sub(1);
                 // Reject an unsatisfiable range up front. `total`/`last` derive
                 // from the (attacker-controllable) header's data_size, so without
@@ -202,15 +225,21 @@ impl Account {
                 if end < start {
                     return Err(CoreError::Other("range not satisfiable".into()));
                 }
-                let mut f2 = std::fs::File::open(&path)?;
-                let body = file::decrypt_range(
-                    &mut f2,
-                    outer_len,
-                    &header.symmetric_key,
-                    header.chunk_size,
-                    start,
-                    end,
-                )?;
+                // Open + decrypt the requested slice on the blocking pool so a slow
+                // disk (the cache may live on an HDD) can't stall the async runtime.
+                // Not gated by `decrypt_sem`: video streams are self-paced by
+                // playback, and we don't want a thumbnail burst to starve them.
+                let path = path.clone();
+                let sym = header.symmetric_key.clone();
+                let chunk_size = header.chunk_size;
+                let body = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+                    let mut f = std::fs::File::open(&path)?;
+                    let outer_len = file::outer_header_len(&mut f)?;
+                    let mut f2 = std::fs::File::open(&path)?;
+                    Ok(file::decrypt_range(&mut f2, outer_len, &sym, chunk_size, start, end)?)
+                })
+                .await
+                .map_err(|e| CoreError::Other(format!("range decrypt task failed: {e}")))??;
                 Ok(MediaResponse {
                     content_type,
                     total_size: total,

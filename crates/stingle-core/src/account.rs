@@ -101,6 +101,12 @@ pub struct Account {
     /// requests (thumbnails/originals the user is actually looking at), which go
     /// straight through `download_sem` and so jump ahead of the bulk backlog.
     pub(crate) bulk_sem: tokio::sync::Semaphore,
+    /// Bounds concurrent *full-resolution* media decrypts behind the `stingle://`
+    /// protocol — the large, sometimes-transcoding originals/previews. Sized to the
+    /// machine's parallelism so several can't thrash every core at once. Thumbnails
+    /// deliberately bypass this (they're the instant-preview layer and must never
+    /// queue behind a heavy decrypt); the frontend observer caps their fan-out.
+    pub(crate) decrypt_sem: tokio::sync::Semaphore,
     /// In-memory LRU of decrypted thumbnails so scrolling back is instant.
     pub(crate) thumb_cache: crate::thumb_cache::ThumbCache,
     /// Throttle for cache-limit enforcement (ms epoch of last check).
@@ -121,6 +127,14 @@ pub(crate) const MAX_CONCURRENT_DOWNLOADS: usize = 56;
 pub(crate) const MAX_BULK_DOWNLOADS: usize = 48;
 /// Byte budget for the in-memory decrypted-thumbnail LRU (~128 MB).
 const THUMB_CACHE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Permits for concurrent on-demand decrypts — the machine's parallelism, so a
+/// burst of cache-misses uses every core without oversubscribing them.
+fn decrypt_permits() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
 
 impl Account {
     /// Register a new account on the server and return the logged-in session.
@@ -188,6 +202,7 @@ impl Account {
             keypair,
             download_sem: tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS),
             bulk_sem: tokio::sync::Semaphore::new(MAX_BULK_DOWNLOADS),
+            decrypt_sem: tokio::sync::Semaphore::new(decrypt_permits()),
             thumb_cache: crate::thumb_cache::ThumbCache::new(THUMB_CACHE_BYTES),
             last_cache_check_ms: std::sync::atomic::AtomicI64::new(0),
             stop_originals: std::sync::atomic::AtomicBool::new(false),
@@ -263,6 +278,7 @@ impl Account {
             keypair,
             download_sem: tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS),
             bulk_sem: tokio::sync::Semaphore::new(MAX_BULK_DOWNLOADS),
+            decrypt_sem: tokio::sync::Semaphore::new(decrypt_permits()),
             thumb_cache: crate::thumb_cache::ThumbCache::new(THUMB_CACHE_BYTES),
             last_cache_check_ms: std::sync::atomic::AtomicI64::new(0),
             stop_originals: std::sync::atomic::AtomicBool::new(false),
@@ -293,6 +309,7 @@ impl Account {
             keypair,
             download_sem: tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS),
             bulk_sem: tokio::sync::Semaphore::new(MAX_BULK_DOWNLOADS),
+            decrypt_sem: tokio::sync::Semaphore::new(decrypt_permits()),
             thumb_cache: crate::thumb_cache::ThumbCache::new(THUMB_CACHE_BYTES),
             last_cache_check_ms: std::sync::atomic::AtomicI64::new(0),
             stop_originals: std::sync::atomic::AtomicBool::new(false),
