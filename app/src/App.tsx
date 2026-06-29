@@ -198,7 +198,12 @@ const TileView = React.memo(function TileView({
 /** A selectable photo grid: click opens; checkbox/Ctrl-click toggles; Shift-click
  *  selects a range; drag a thumbnail to drag the file(s) out; drag from empty
  *  space to lasso a marquee selection. Optionally date-grouped. */
-function PhotoGrid({ items, set, albumId, grouped, sel, setSel, onOpen, renderExtra, showToast }: {
+// Memoized: opening/closing the viewer (and other parent state changes) must NOT
+// re-render the whole grid — reconciling tens of thousands of tiles makes the
+// viewer take a beat to appear/close. With stable props (state setters, a
+// useCallback'd showToast/renderExtra) this re-renders only when items/sel/grouped
+// actually change.
+const PhotoGrid = React.memo(function PhotoGrid({ items, set, albumId, grouped, sel, setSel, onOpen, renderExtra, showToast }: {
   items: FileItem[]; set: number; albumId: string | null; grouped: boolean;
   sel: Set<string>; setSel: (s: Set<string>) => void;
   onOpen: (idx: number) => void;
@@ -421,7 +426,7 @@ function PhotoGrid({ items, set, albumId, grouped, sel, setSel, onOpen, renderEx
       {box && <div className="marquee" style={{ left: box.l, top: box.t, width: box.w, height: box.h }} />}
     </div>
   );
-}
+});
 
 /** Full-screen image with instant (unblurred) thumbnail, silent swap to full, and zoom/pan. */
 function ZoomableImage({ thumbUrl, fullUrl, onDragOut }: { thumbUrl: string; fullUrl: string; onDragOut?: () => void }) {
@@ -1282,6 +1287,15 @@ function AlbumDetail({ album, onBack, showToast }: { album: Album; onBack: () =>
     await api.leaveAlbum(album.album_id); onBack();
   };
 
+  // Stable so the memoized PhotoGrid doesn't re-render the whole album on viewer
+  // open/close. Re-created only when ownership / album id / showToast change.
+  const renderCover = useCallback((f: FileItem) => album.is_owner ? (
+    <button className="cover-btn" onClick={(e) => {
+      e.stopPropagation();
+      api.setAlbumCover(album.album_id, f.filename).then(() => showToast("Album cover set"));
+    }}>★ cover</button>
+  ) : null, [album.is_owner, album.album_id, showToast]);
+
   return (
     <>
       <div className="topbar">
@@ -1313,12 +1327,7 @@ function AlbumDetail({ album, onBack, showToast }: { album: Album; onBack: () =>
         {items.length === 0 ? <div className="empty">Empty album.</div> : (
           <PhotoGrid items={items} set={SET_ALBUM} albumId={album.album_id} grouped={false}
             sel={sel} setSel={setSel} onOpen={setViewerIdx} showToast={showToast}
-            renderExtra={(f) => album.is_owner ? (
-              <button className="cover-btn" onClick={(e) => {
-                e.stopPropagation();
-                api.setAlbumCover(album.album_id, f.filename).then(() => showToast("Album cover set"));
-              }}>★ cover</button>
-            ) : null} />
+            renderExtra={renderCover} />
         )}
       </div>
       {viewerIdx !== null && (
