@@ -111,6 +111,13 @@ fn run_ffmpeg(args: &[&str], input: Option<Vec<u8>>) -> Result<Vec<u8>> {
     if input.is_some() {
         cmd.stdin(Stdio::piped());
     }
+    // On Windows, spawning a console subprocess from the GUI app pops a console
+    // window for the child's lifetime. CREATE_NO_WINDOW (0x08000000) suppresses it.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
     let mut child = cmd
         .spawn()
         .map_err(|e| CoreError::Other(format!("ffmpeg spawn: {e}")))?;

@@ -51,6 +51,9 @@ pub struct AppConfig {
     pub auto_unlock_blob: Option<AutoUnlockBlob>,
     /// Hide to tray instead of quitting when the window is closed.
     pub minimize_to_tray: bool,
+    /// When started automatically at login, launch hidden in the tray instead of
+    /// showing the window. Only takes effect when start-with-PC (autostart) is on.
+    pub start_minimized: bool,
     /// Auto-download updates and apply them on the next relaunch. `None` is the
     /// default (enabled); `Some(false)` disables auto-update, in which case the
     /// UI shows a sidebar banner to install manually. A missing/old config file

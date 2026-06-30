@@ -6,20 +6,26 @@
 //! ever installed, so hosting the manifest on GitHub is safe even over an
 //! untrusted network.
 //!
-//! Behavior, driven by the `auto_update` setting (default on):
-//! - **ON:** at launch we download the update in the background and *stage* it,
-//!   installing only when the app actually quits (see [`install_staged_on_exit`])
-//!   so the running session is never disrupted — the new version is live on the
-//!   next launch.
-//! - **OFF:** we only check; if an update exists we emit `update-available` so
-//!   the UI shows a sidebar banner. Installing is then user-driven via
-//!   [`install_update_now`](crate::install_update_now), which installs + restarts
-//!   immediately.
+//! We check once shortly after launch and then every [`CHECK_INTERVAL`] for as
+//! long as the app keeps running (see [`run_update_loop`]).
+//!
+//! Whenever a newer version is found we emit `update-available` so the sidebar
+//! shows the "restart to apply" card; clicking it is user-driven via
+//! [`install_update_now`](crate::install_update_now), which installs + restarts
+//! immediately. In addition, when the `auto_update` setting is on (default) we
+//! download the update in the background and *stage* it, so it is applied
+//! automatically when the app next quits (see [`install_staged_on_exit`]) even
+//! if the user never clicks the card.
+
+use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::AppState;
+
+/// How often to re-check for updates while the app is running.
+const CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// A downloaded-but-not-yet-installed update, applied at quit time.
 pub struct StagedUpdate {
@@ -27,10 +33,20 @@ pub struct StagedUpdate {
     bytes: Vec<u8>,
 }
 
-/// Background update check, run once at startup. Honors the `auto_update`
-/// setting. All failures are logged and swallowed — a failed check must never
-/// disrupt normal startup.
-pub async fn check_on_startup(app: AppHandle) {
+/// Background update loop: check shortly after startup, then every
+/// [`CHECK_INTERVAL`] for as long as the app runs. All failures are logged and
+/// swallowed — a failed check must never disrupt the running session.
+pub async fn run_update_loop(app: AppHandle) {
+    loop {
+        check_once(&app).await;
+        tokio::time::sleep(CHECK_INTERVAL).await;
+    }
+}
+
+/// A single check. Emits `update-available` when a newer version exists so the
+/// sidebar card appears, and additionally stages the download when `auto_update`
+/// is on so it can be applied on quit without user action.
+async fn check_once(app: &AppHandle) {
     let state = app.state::<AppState>();
     let enabled = {
         let cfg = state.config.lock().await;
@@ -52,8 +68,15 @@ pub async fn check_on_startup(app: AppHandle) {
         }
     };
 
-    if enabled {
-        // Download now, install at quit so the running session is untouched.
+    // Surface the sidebar card regardless of the auto-update setting so the user
+    // can restart-and-apply on demand.
+    let _ = app.emit("update-available", update.version.clone());
+
+    // With auto-update on, also download once and stage it so the quit handler
+    // applies it even if the user never clicks the card. Skip if already staged
+    // to avoid re-downloading on every interval.
+    let already_staged = state.staged_update.lock().unwrap().is_some();
+    if enabled && !already_staged {
         match update.download(|_, _| {}, || {}).await {
             Ok(bytes) => {
                 *state.staged_update.lock().unwrap() = Some(StagedUpdate { update, bytes });
@@ -61,9 +84,6 @@ pub async fn check_on_startup(app: AppHandle) {
             }
             Err(err) => tracing::warn!("update download failed: {err}"),
         }
-    } else {
-        // Disabled: just notify the UI to show the install banner.
-        let _ = app.emit("update-available", update.version.clone());
     }
 }
 

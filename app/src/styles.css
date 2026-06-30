@@ -106,14 +106,17 @@ a { color: var(--accent2); cursor: pointer; }
 /* App version, tucked under the logo and right-aligned. */
 .brand-version { font-size: 11px; color: var(--muted); text-align: right; margin: -14px 8px 12px; }
 
-/* Update-available call-to-action (shown when auto-update is off). */
-.update-banner {
-  display: block; width: calc(100% - 12px); margin: 0 6px 8px; text-align: left;
-  background: var(--accent); color: #fff; border: none; border-radius: 8px;
-  padding: 9px 10px; font-size: 13px; font-weight: 600; cursor: pointer;
+/* Update-available card, shown above the sync status when a newer version is
+   found; clicking it restarts the app to apply the update. */
+.update-card {
+  display: flex; flex-direction: column; gap: 2px; width: calc(100% - 12px);
+  margin: 0 6px 8px; text-align: left; background: var(--accent); color: #fff;
+  border: none; border-radius: 8px; padding: 10px 11px; cursor: pointer;
 }
-.update-banner:hover { filter: brightness(1.08); }
-.update-banner:disabled { opacity: .7; cursor: default; }
+.update-card-title { font-size: 13px; font-weight: 600; }
+.update-card-sub { font-size: 11px; line-height: 1.35; opacity: .9; }
+.update-card:hover { filter: brightness(1.08); }
+.update-card:disabled { opacity: .7; cursor: default; }
 
 .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .topbar {
@@ -122,6 +125,19 @@ a { color: var(--accent2); cursor: pointer; }
 }
 .topbar h2 { margin: 0; font-size: 17px; flex: 1; }
 .content { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 16px; }
+
+/* Settings tabs */
+.settings-tabs {
+  display: flex; gap: 4px; flex: 0 0 auto;
+  padding: 0 16px; border-bottom: 1px solid var(--border);
+}
+.settings-tabs button {
+  border: none; background: transparent; color: var(--muted);
+  padding: 11px 14px; font-weight: 600; font-size: 14px; cursor: pointer;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.settings-tabs button:hover { color: var(--fg); }
+.settings-tabs button.active { color: var(--fg); border-bottom-color: var(--accent2); }
 
 /* Grid — square, cropped thumbnails, date-ordered */
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 8px; }

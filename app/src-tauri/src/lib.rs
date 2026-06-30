@@ -982,6 +982,18 @@ async fn set_minimize_to_tray(state: State<'_, AppState>, enabled: bool) -> CmdR
 }
 
 #[tauri::command]
+async fn get_start_minimized(state: State<'_, AppState>) -> CmdResult<bool> {
+    Ok(state.config.lock().await.start_minimized)
+}
+
+#[tauri::command]
+async fn set_start_minimized(state: State<'_, AppState>, enabled: bool) -> CmdResult<()> {
+    let mut cfg = state.config.lock().await;
+    cfg.start_minimized = enabled;
+    cfg.save()
+}
+
+#[tauri::command]
 async fn get_auto_update(state: State<'_, AppState>) -> CmdResult<bool> {
     Ok(state.config.lock().await.auto_update.unwrap_or(true))
 }
@@ -1607,7 +1619,9 @@ pub fn run() {
         .plugin(tauri_plugin_drag::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
+            // Login launches carry this flag so we can tell them apart from a
+            // manual launch and honor the "start in tray" setting.
+            Some(vec!["--minimized"]),
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::new())
@@ -1638,6 +1652,22 @@ pub fn run() {
         })
         .setup(|app| {
             tray::setup_tray(app.handle())?;
+            // The window starts hidden (`"visible": false`). Show it now unless
+            // this is a login launch (carries `--minimized`) and the user asked
+            // to start in the tray — in which case it stays hidden until they
+            // open it from the tray icon.
+            {
+                let state = app.state::<AppState>();
+                let start_minimized =
+                    tauri::async_runtime::block_on(async { state.config.lock().await.start_minimized });
+                let launched_at_login = std::env::args().any(|a| a == "--minimized");
+                if !(launched_at_login && start_minimized) {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                }
+            }
             // Clear any decrypted files left behind by an interrupted drag-out
             // or HEIC transcode.
             let _ = std::fs::remove_dir_all(drag_temp_dir());
@@ -1646,10 +1676,11 @@ pub fn run() {
             // Pre-fetch ffmpeg (full build, with HEIC support) in the background
             // so the first HEIC preview/copy doesn't stall on the download.
             std::thread::spawn(|| stingle_core::thumbnail::prepare_media_tools());
-            // Check for app updates in the background (honors the auto_update
-            // setting): silently stage when on, or emit `update-available` when
-            // off so the UI can show the install banner.
-            tauri::async_runtime::spawn(updater::check_on_startup(app.handle().clone()));
+            // Check for app updates in the background now and every 30 minutes:
+            // emit `update-available` so the UI can show the restart-to-apply
+            // card, and (when auto_update is on) stage the download for install
+            // on quit.
+            tauri::async_runtime::spawn(updater::run_update_loop(app.handle().clone()));
             // Start the continuous-sync loop if the setting is on; it idles until
             // an account is unlocked.
             let handle = app.handle().clone();
@@ -1711,6 +1742,8 @@ pub fn run() {
             forget_account,
             get_minimize_to_tray,
             set_minimize_to_tray,
+            get_start_minimized,
+            set_start_minimized,
             get_auto_update,
             set_auto_update,
             get_app_version,

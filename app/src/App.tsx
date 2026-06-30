@@ -1038,8 +1038,15 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
         </div>
         <div className="spacer" />
         {updateVer && (
-          <button className="update-banner" disabled={updating} onClick={installUpdate}>
-            {updating ? "Updating…" : `⤓ Update to ${updateVer} — restart now`}
+          <button className="update-card" disabled={updating} onClick={installUpdate}>
+            <span className="update-card-title">
+              ⤓ {updating ? "Installing update…" : "Update available"}
+            </span>
+            <span className="update-card-sub">
+              {updating
+                ? "The app will restart automatically"
+                : `Version ${updateVer} is ready — click to restart and apply`}
+            </span>
           </button>
         )}
         <SyncPanel syncing={syncing} upload={upload} thumbs={thumbs} originals={originals} />
@@ -1374,6 +1381,16 @@ function TrashView({ showToast, onChanged, reloadSignal }: { showToast: (m: stri
 
 /* ----------------------------- Settings ----------------------------- */
 
+type SettingsTab = "account" | "general" | "sync" | "storage" | "about";
+
+const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
+  { id: "account", label: "Account" },
+  { id: "general", label: "General" },
+  { id: "sync", label: "Sync" },
+  { id: "storage", label: "Storage" },
+  { id: "about", label: "About" },
+];
+
 function SettingsView({ session, setSession, showToast }: {
   session: Session; setSession: (s: Session | null) => void; showToast: (m: string) => void;
 }) {
@@ -1383,6 +1400,7 @@ function SettingsView({ session, setSession, showToast }: {
 
   // App options
   const [autostart, setAutostart] = useState(false);
+  const [startMin, setStartMin] = useState(false);
   const [minTray, setMinTray] = useState(false);
   const [autoUpdate, setAutoUpdate] = useState(true);
   const [syncEvery, setSyncEvery] = useState(false);
@@ -1393,6 +1411,7 @@ function SettingsView({ session, setSession, showToast }: {
   const [storagePath, setStoragePath] = useState("");
   const [moving, setMoving] = useState<{ done: number; total: number } | null>(null);
   const [confirmSignOut, setConfirmSignOut] = useState(false);
+  const [tab, setTab] = useState<SettingsTab>("account");
 
   // Watch folders
   const [watchFolders, setWatchFolders] = useState<WatchFolder[]>([]);
@@ -1407,6 +1426,7 @@ function SettingsView({ session, setSession, showToast }: {
     api.getCacheLimit().then((b) => setCacheLimit(String(Math.round(b / 1048576))));
     refreshCache();
     api.getAutostart().then(setAutostart).catch(() => {});
+    api.getStartMinimized().then(setStartMin).catch(() => {});
     api.getMinimizeToTray().then(setMinTray).catch(() => {});
     api.getAutoUpdate().then(setAutoUpdate).catch(() => {});
     api.getAppVersion().then(setVersion).catch(() => {});
@@ -1453,6 +1473,10 @@ function SettingsView({ session, setSession, showToast }: {
 
   const toggleAutostart = async (v: boolean) => {
     try { await api.setAutostart(v); setAutostart(v); }
+    catch (e) { showToast("Failed: " + e); }
+  };
+  const toggleStartMin = async (v: boolean) => {
+    try { await api.setStartMinimized(v); setStartMin(v); }
     catch (e) { showToast("Failed: " + e); }
   };
   const toggleMinTray = async (v: boolean) => {
@@ -1543,8 +1567,22 @@ function SettingsView({ session, setSession, showToast }: {
 
   return (
     <>
-      <div className="topbar"><h2>Settings</h2></div>
+      <div className="topbar">
+        <h2>Settings</h2>
+      </div>
+      <nav className="settings-tabs">
+        {SETTINGS_TABS.map((t) => (
+          <button
+            key={t.id}
+            className={tab === t.id ? "active" : ""}
+            onClick={() => setTab(t.id)}
+          >
+            {t.label}
+          </button>
+        ))}
+      </nav>
       <div className="content">
+        {tab === "account" && <>
         <div className="settings-section">
           <h3>Account</h3>
           <div className="muted">{session.email}</div>
@@ -1564,28 +1602,32 @@ function SettingsView({ session, setSession, showToast }: {
         </div>
 
         <div className="settings-section">
-          <h3>Cache</h3>
-          <p className="muted" style={{ fontSize: 13 }}>
-            Encrypted downloads are cached on disk for fast viewing.
-            {cacheSizeMB !== null && ` Currently using ${cacheSizeMB.toFixed(1)} MB.`}
-            {" "}When the limit is exceeded, the oldest cached files (and their thumbnails) are removed.
-          </p>
-          <div className="row" style={{ maxWidth: 360, alignItems: "center" }}>
-            <input type="number" min={0} value={cacheLimit} onChange={(e) => setCacheLimit(e.target.value)} />
-            <span className="muted" style={{ whiteSpace: "nowrap" }}>MB (0 = unlimited)</span>
-          </div>
-          <div className="actionbar" style={{ marginTop: 10 }}>
-            <button onClick={saveCacheLimit}>Save limit</button>
-            <button onClick={clearCacheNow}>Clear cache now</button>
+          <h3>Session</h3>
+          <div className="actionbar">
+            <button onClick={async () => { await api.lock(); setSession(null); }}>Lock</button>
+            <button onClick={() => setConfirmSignOut(true)}>Sign out</button>
           </div>
         </div>
+        </>}
 
+        {tab === "general" && <>
         <div className="settings-section">
           <h3>General</h3>
           <label className="opt-row">
             <input type="checkbox" checked={autostart} onChange={(e) => toggleAutostart(e.target.checked)} />
             <span>Start automatically when I sign in to this computer</span>
           </label>
+          {autostart && (
+            <label className="opt-row" style={{ marginLeft: 26 }}>
+              <input type="checkbox" checked={startMin} onChange={(e) => toggleStartMin(e.target.checked)} />
+              <span>
+                Start in the tray
+                <span className="muted" style={{ display: "block", fontSize: 12 }}>
+                  Launch hidden in the background — the window stays closed until you open it from the tray icon.
+                </span>
+              </span>
+            </label>
+          )}
           <label className="opt-row">
             <input type="checkbox" checked={minTray} onChange={(e) => toggleMinTray(e.target.checked)} />
             <span>Minimize to the tray instead of quitting when I close the window</span>
@@ -1621,7 +1663,9 @@ function SettingsView({ session, setSession, showToast }: {
             </div>
           )}
         </div>
+        </>}
 
+        {tab === "sync" && <>
         <div className="settings-section">
           <h3>Sync</h3>
           <label className="opt-row">
@@ -1670,6 +1714,25 @@ function SettingsView({ session, setSession, showToast }: {
             <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>{watchStatus}</div>
           )}
         </div>
+        </>}
+
+        {tab === "storage" && <>
+        <div className="settings-section">
+          <h3>Cache</h3>
+          <p className="muted" style={{ fontSize: 13 }}>
+            Encrypted downloads are cached on disk for fast viewing.
+            {cacheSizeMB !== null && ` Currently using ${cacheSizeMB.toFixed(1)} MB.`}
+            {" "}When the limit is exceeded, the oldest cached files (and their thumbnails) are removed.
+          </p>
+          <div className="row" style={{ maxWidth: 360, alignItems: "center" }}>
+            <input type="number" min={0} value={cacheLimit} onChange={(e) => setCacheLimit(e.target.value)} />
+            <span className="muted" style={{ whiteSpace: "nowrap" }}>MB (0 = unlimited)</span>
+          </div>
+          <div className="actionbar" style={{ marginTop: 10 }}>
+            <button onClick={saveCacheLimit}>Save limit</button>
+            <button onClick={clearCacheNow}>Clear cache now</button>
+          </div>
+        </div>
 
         <div className="settings-section">
           <h3>Storage location</h3>
@@ -1693,24 +1756,20 @@ function SettingsView({ session, setSession, showToast }: {
           <p className="muted" style={{ fontSize: 13 }}>Download and decrypt your entire library to a folder.</p>
           <button onClick={doTakeout}>Export library…</button>
         </div>
+        </>}
 
+        {tab === "about" && <>
         <div className="settings-section">
           <h3>About</h3>
-          <div className="row" style={{ alignItems: "center", justifyContent: "space-between", gap: 8, maxWidth: 360 }}>
-            <span className="muted">Stingle Desktop{version && ` — version ${version}`}</span>
+          <div className="muted">Stingle Desktop</div>
+          {version && <div className="muted" style={{ fontSize: 13, marginTop: 4 }}>Version {version}</div>}
+          <div className="actionbar" style={{ marginTop: 12 }}>
             <button onClick={checkForUpdate} disabled={checkingUpdate}>
               {checkingUpdate ? "Checking…" : "Check for updates"}
             </button>
           </div>
         </div>
-
-        <div className="settings-section">
-          <h3>Session</h3>
-          <div className="actionbar">
-            <button onClick={async () => { await api.lock(); setSession(null); }}>Lock</button>
-            <button onClick={() => setConfirmSignOut(true)}>Sign out</button>
-          </div>
-        </div>
+        </>}
       </div>
 
       {confirmSignOut && (

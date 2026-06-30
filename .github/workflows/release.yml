@@ -63,6 +63,13 @@ jobs:
           # No passphrase was set, so the PASSWORD secret may be empty.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS Developer ID code signing + notarization (only used on macOS runner).
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}                   # base64 of the Developer ID Application .p12
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }} # password set when exporting the .p12
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}         # "Developer ID Application: Name (TEAMID)"
+          APPLE_ID: ${{ secrets.APPLE_ID }}                                     # your Apple ID email
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}                         # app-specific password for notarization
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}                           # 10-char team ID
         with:
           projectPath: app
           tagName: ${{ github.ref_name }}
