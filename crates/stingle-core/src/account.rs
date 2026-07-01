@@ -115,6 +115,10 @@ pub struct Account {
     /// Set when the user turns "keep originals locally" off so an in-flight
     /// download stops promptly instead of running to completion.
     pub(crate) stop_originals: std::sync::atomic::AtomicBool,
+    /// Cooperative cancellation flag for an in-flight Takeout (decrypt & export).
+    pub(crate) stop_takeout: std::sync::atomic::AtomicBool,
+    /// Cooperative cancellation flag for an in-flight manual import pass.
+    pub(crate) stop_import: std::sync::atomic::AtomicBool,
 }
 
 /// Max concurrent downloads across the whole account. Thumbnails are small, so
@@ -206,6 +210,8 @@ impl Account {
             thumb_cache: crate::thumb_cache::ThumbCache::new(THUMB_CACHE_BYTES),
             last_cache_check_ms: std::sync::atomic::AtomicI64::new(0),
             stop_originals: std::sync::atomic::AtomicBool::new(false),
+            stop_takeout: std::sync::atomic::AtomicBool::new(false),
+            stop_import: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -282,6 +288,8 @@ impl Account {
             thumb_cache: crate::thumb_cache::ThumbCache::new(THUMB_CACHE_BYTES),
             last_cache_check_ms: std::sync::atomic::AtomicI64::new(0),
             stop_originals: std::sync::atomic::AtomicBool::new(false),
+            stop_takeout: std::sync::atomic::AtomicBool::new(false),
+            stop_import: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -313,6 +321,8 @@ impl Account {
             thumb_cache: crate::thumb_cache::ThumbCache::new(THUMB_CACHE_BYTES),
             last_cache_check_ms: std::sync::atomic::AtomicI64::new(0),
             stop_originals: std::sync::atomic::AtomicBool::new(false),
+            stop_takeout: std::sync::atomic::AtomicBool::new(false),
+            stop_import: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -357,6 +367,18 @@ impl Account {
     /// Called when the user turns "keep originals locally" off.
     pub fn request_stop_originals(&self) {
         self.stop_originals
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Ask an in-flight Takeout (decrypt & export) to stop as soon as it can.
+    pub fn request_stop_takeout(&self) {
+        self.stop_takeout
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Ask an in-flight manual import to stop as soon as it can.
+    pub fn request_stop_import(&self) {
+        self.stop_import
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 

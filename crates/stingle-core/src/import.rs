@@ -2,6 +2,7 @@
 
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::time::UNIX_EPOCH;
 
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
@@ -146,6 +147,62 @@ impl Account {
         let mut files = Vec::new();
         collect_media(dir, &mut files);
         self.import_files(&files, set, album_id).await
+    }
+
+    /// Expand a mix of input paths into the flat list of files to import:
+    /// folders are recursed for importable media; explicit files are kept as-is
+    /// (so a user can import a single file regardless of extension). Used to know
+    /// the total up front for progress reporting.
+    pub fn collect_import_paths(
+        &self,
+        inputs: &[std::path::PathBuf],
+    ) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        for p in inputs {
+            if p.is_dir() {
+                collect_media(p, &mut files);
+            } else {
+                files.push(p.clone());
+            }
+        }
+        files
+    }
+
+    /// Import a pre-expanded list of files, reporting `progress(done, total)` as
+    /// it goes and stopping promptly if [`request_stop_import`] is called.
+    /// Returns the number of files actually imported (skipping duplicates).
+    ///
+    /// [`request_stop_import`]: Account::request_stop_import
+    pub async fn import_files_progress(
+        &self,
+        sources: &[std::path::PathBuf],
+        set: FileSet,
+        album_id: Option<&str>,
+        progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
+    ) -> Result<usize> {
+        // Fresh start: clear any stale cancellation from a previous run.
+        self.stop_import.store(false, Ordering::Relaxed);
+
+        let total = sources.len();
+        if let Some(cb) = progress {
+            cb(0, total);
+        }
+
+        let mut imported = 0usize;
+        let mut done = 0usize;
+        for src in sources {
+            if self.stop_import.load(Ordering::Relaxed) {
+                break;
+            }
+            if self.import_file(src, set, album_id).await?.is_some() {
+                imported += 1;
+            }
+            done += 1;
+            if let Some(cb) = progress {
+                cb(done, total);
+            }
+        }
+        Ok(imported)
     }
 
     /// Import already-decoded image bytes (e.g. pasted from the clipboard).

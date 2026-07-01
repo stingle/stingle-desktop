@@ -504,6 +504,7 @@ async fn list_album_files(
 
 #[tauri::command]
 async fn import_paths(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     paths: Vec<String>,
     album_id: Option<String>,
@@ -514,25 +515,28 @@ async fn import_paths(
     } else {
         FileSet::Gallery
     };
-    let mut imported = 0;
-    for p in paths {
-        let pb = PathBuf::from(&p);
-        if pb.is_dir() {
-            imported += acc
-                .import_folder(&pb, set, album_id.as_deref())
-                .await
-                .map_err(e)?
-                .len();
-        } else if let Some(name) = acc
-            .import_file(&pb, set, album_id.as_deref())
-            .await
-            .map_err(e)?
-        {
-            let _ = name;
-            imported += 1;
-        }
-    }
+    // Expand folders up front so the progress bar has a real total, then import
+    // the flat list with live progress (and cooperative cancellation).
+    let inputs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    let files = acc.collect_import_paths(&inputs);
+    let app_cb = app.clone();
+    let cb = move |done: usize, total: usize| {
+        let _ = app_cb.emit("import-progress", (done, total));
+    };
+    let imported = acc
+        .import_files_progress(&files, set, album_id.as_deref(), Some(&cb))
+        .await
+        .map_err(e)?;
+    let _ = app.emit("import-done", ());
     Ok(imported)
+}
+
+#[tauri::command]
+async fn cancel_import(state: State<'_, AppState>) -> CmdResult<()> {
+    if let Some(acc) = state.current().await {
+        acc.request_stop_import();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -628,19 +632,33 @@ async fn set_album_blank_cover(state: State<'_, AppState>, album_id: String) -> 
 
 #[tauri::command]
 async fn takeout(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     out_dir: String,
     include_trash: bool,
 ) -> CmdResult<TakeoutDto> {
     let acc = state.current().await.ok_or("Not logged in")?;
+    let app_cb = app.clone();
+    let cb = move |done: usize, total: usize| {
+        let _ = app_cb.emit("takeout-progress", (done, total));
+    };
     let stats = acc
-        .takeout(&PathBuf::from(out_dir), include_trash)
+        .takeout(&PathBuf::from(out_dir), include_trash, Some(&cb))
         .await
         .map_err(e)?;
+    let _ = app.emit("takeout-done", ());
     Ok(TakeoutDto {
         written: stats.written,
         errors: stats.errors,
     })
+}
+
+#[tauri::command]
+async fn cancel_takeout(state: State<'_, AppState>) -> CmdResult<()> {
+    if let Some(acc) = state.current().await {
+        acc.request_stop_takeout();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1253,6 +1271,10 @@ async fn set_sync_everything(
         if let Some(acc) = state.current().await {
             acc.request_stop_originals();
         }
+        // The aborted loop never reached its own terminal emits, so the sidebar
+        // would keep showing a frozen progress row — clear those rows here.
+        let _ = app.emit("originals-done", 0usize);
+        let _ = app.emit("upload-done", ());
     }
     Ok(())
 }
@@ -1600,6 +1622,27 @@ async fn build_media_response(
 
 // ----------------------------- run -----------------------------
 
+/// Point `stingle-core` at the ffmpeg bundled next to our executable, if one is
+/// present. Release builds ship a current ffmpeg as a Tauri `externalBin`, which
+/// lands beside the main binary (e.g. `Contents/MacOS/ffmpeg` on macOS). Using
+/// it avoids the unpinned ffmpeg-sidecar download whose cached version could be
+/// too old to decode iOS-18 HEICs. Setting `STINGLE_FFMPEG` makes
+/// `stingle_core::thumbnail::resolve_ffmpeg` use it verbatim (no network). A
+/// no-op when the env var is already set or no bundled binary exists (dev).
+fn use_bundled_ffmpeg() {
+    if std::env::var_os("STINGLE_FFMPEG").is_some() {
+        return;
+    }
+    let name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    if let Some(path) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
+        .filter(|p| p.exists())
+    {
+        std::env::set_var("STINGLE_FFMPEG", path);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt().init();
@@ -1673,6 +1716,11 @@ pub fn run() {
             let _ = std::fs::remove_dir_all(drag_temp_dir());
             let _ = std::fs::remove_dir_all(clipboard_temp_dir());
             let _ = std::fs::remove_dir_all(stingle_core::thumbnail::transcode_temp_dir());
+            // Prefer the ffmpeg shipped next to our binary (bundled by the
+            // release CI as a current build with iOS-18 adaptive-HDR HEIC
+            // support). If it's absent — e.g. `tauri dev` — fall through to
+            // ffmpeg-sidecar's runtime download below.
+            use_bundled_ffmpeg();
             // Pre-fetch ffmpeg (full build, with HEIC support) in the background
             // so the first HEIC preview/copy doesn't stall on the download.
             std::thread::spawn(|| stingle_core::thumbnail::prepare_media_tools());
@@ -1713,6 +1761,7 @@ pub fn run() {
             list_albums,
             list_album_files,
             import_paths,
+            cancel_import,
             trash,
             restore,
             delete_permanently,
@@ -1723,6 +1772,7 @@ pub fn run() {
             set_album_cover,
             set_album_blank_cover,
             takeout,
+            cancel_takeout,
             download_thumbs,
             recovery_phrase,
             is_video,

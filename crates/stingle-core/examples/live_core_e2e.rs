@@ -124,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[+] dev2 decrypted ALBUM file ({} bytes)", adec.len());
 
     // --- takeout on dev2 ---
-    let stats = dev2_acc.takeout(&out_dir, false).await?;
+    let stats = dev2_acc.takeout(&out_dir, false, None).await?;
     println!("[+] takeout wrote {} file(s), {} error(s)", stats.written, stats.errors);
     assert!(stats.written >= 2 && stats.errors == 0);
 

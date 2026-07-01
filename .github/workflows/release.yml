@@ -18,13 +18,13 @@ jobs:
       matrix:
         include:
           - platform: macos-latest      # universal: Intel + Apple Silicon
-            args: "--target universal-apple-darwin"
+            args: "--target universal-apple-darwin --config src-tauri/tauri.bundle-ffmpeg.conf.json"
             rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
           - platform: ubuntu-22.04
-            args: ""
+            args: "--config src-tauri/tauri.bundle-ffmpeg.conf.json"
             rust-targets: ""
           - platform: windows-latest
-            args: ""
+            args: "--config src-tauri/tauri.bundle-ffmpeg.conf.json"
             rust-targets: ""
 
     runs-on: ${{ matrix.platform }}
@@ -53,6 +53,64 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm --prefix app ci
+
+      # Bundle a current ffmpeg as a Tauri externalBin (see tauri.bundle-ffmpeg
+      # .conf.json). ffmpeg-sidecar's runtime download is unpinned and can serve
+      # a build too old to decode iOS-18 adaptive-HDR HEICs; shipping a known-
+      # current binary in the signed installer fixes that deterministically. The
+      # externalBin file MUST be named `ffmpeg-<target-triple>` (Tauri strips the
+      # suffix and signs it into the bundle). Tauri does not lipo sidecars, so
+      # the macOS universal build needs a hand-lipo'd fat binary.
+      - name: Bundle ffmpeg (macOS universal)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/src-tauri/binaries
+          curl -fL -o ff_arm.zip "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip"
+          curl -fL -o ff_x86.zip "https://ffmpeg.martin-riedl.de/redirect/latest/macos/amd64/release/ffmpeg.zip"
+          unzip -o ff_arm.zip -d ff_arm
+          unzip -o ff_x86.zip -d ff_x86
+          arm=$(find ff_arm -name ffmpeg -type f | head -1)
+          x86=$(find ff_x86 -name ffmpeg -type f | head -1)
+          # Provide a lipo'd universal binary (the name for a
+          # `--target universal-apple-darwin` build) AND the two per-arch names,
+          # so the build resolves the externalBin regardless of which naming
+          # Tauri expects for a universal bundle. Unreferenced names are ignored.
+          lipo -create "$arm" "$x86" \
+            -output app/src-tauri/binaries/ffmpeg-universal-apple-darwin
+          cp "$arm" app/src-tauri/binaries/ffmpeg-aarch64-apple-darwin
+          cp "$x86" app/src-tauri/binaries/ffmpeg-x86_64-apple-darwin
+          chmod +x app/src-tauri/binaries/ffmpeg-*-apple-darwin
+          app/src-tauri/binaries/ffmpeg-universal-apple-darwin -version | head -1
+
+      - name: Bundle ffmpeg (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/src-tauri/binaries
+          curl -fL -o ff.zip "https://ffmpeg.martin-riedl.de/redirect/latest/linux/amd64/release/ffmpeg.zip"
+          unzip -o ff.zip -d ff
+          bin=$(find ff -name ffmpeg -type f | head -1)
+          cp "$bin" app/src-tauri/binaries/ffmpeg-x86_64-unknown-linux-gnu
+          chmod +x app/src-tauri/binaries/ffmpeg-x86_64-unknown-linux-gnu
+          app/src-tauri/binaries/ffmpeg-x86_64-unknown-linux-gnu -version | head -1
+
+      # Martin-Riedl has no Windows build; use BtbN's pinned n7.1 GPL release
+      # (immutable GitHub asset, includes the HEVC decoder + HEIF demuxer). The
+      # zip nests the exe under `<folder>/bin/`, so locate it with find.
+      - name: Bundle ffmpeg (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/src-tauri/binaries
+          curl -fL -o ff.zip "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-7.1.zip"
+          unzip -o ff.zip -d ff
+          exe=$(find ff -name ffmpeg.exe | head -1)
+          cp "$exe" app/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe
+          app/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe -version | head -1
 
       - name: Build, sign & publish
         uses: tauri-apps/tauri-action@v0

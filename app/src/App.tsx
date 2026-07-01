@@ -816,14 +816,20 @@ function AuthView({ onAuthed, sessionExpired }: { onAuthed: (s: Session) => void
 
 type Progress = { done: number; total: number } | null;
 
-// One phase row: an icon, a label, a done/total count, and a progress bar.
-function PhaseRow({ icon, label, value }: { icon: string; label: string; value: { done: number; total: number } }) {
+// One phase row: an icon, a label, a done/total count, a progress bar, and an
+// optional ✕ button to cancel the operation behind it.
+function PhaseRow({ icon, label, value, onCancel }: {
+  icon: string; label: string; value: { done: number; total: number }; onCancel?: () => void;
+}) {
   const pct = value.total > 0 ? Math.min(100, (value.done / value.total) * 100) : 0;
   return (
     <div className="phase-row">
       <span className="phase-icon">{icon}</span>
       <span className="phase-label">{label}</span>
       <span className="phase-count">{value.done} / {value.total}</span>
+      {onCancel && (
+        <button className="phase-cancel" onClick={onCancel} title={`Cancel ${label.toLowerCase()}`}>✕</button>
+      )}
       <div className="sync-bar"><div style={{ width: pct + "%" }} /></div>
     </div>
   );
@@ -831,26 +837,32 @@ function PhaseRow({ icon, label, value }: { icon: string; label: string; value: 
 
 // Consolidated sync status: a calm "Up to date" when idle, or an animated header
 // plus one progress row per active phase (upload / thumbnails / cache).
-function SyncPanel({ syncing, upload, thumbs, originals }: {
+function SyncPanel({ syncing, upload, thumbs, originals, importing, takeout, onCancelImport, onCancelTakeout }: {
   syncing: boolean; upload: Progress; thumbs: Progress; originals: Progress;
+  importing: Progress; takeout: Progress;
+  onCancelImport: () => void; onCancelTakeout: () => void;
 }) {
   const up = upload && upload.total > 0 ? upload : null;
   const th = thumbs && thumbs.total > 0 ? thumbs : null;
   const or = originals && originals.total > 0 ? originals : null;
-  const active = syncing || !!up || !!th || !!or;
+  const im = importing && importing.total > 0 ? importing : null;
+  const tk = takeout && takeout.total > 0 ? takeout : null;
+  const active = syncing || !!up || !!th || !!or || !!im || !!tk;
 
   return (
     <div className="sync-panel">
       <div className="sync-head">
         {active ? (
-          <><span className="spinner" /> <span>Syncing…</span></>
+          <><span className="spinner" /> <span>Working…</span></>
         ) : (
           <span className="sync-idle">✓ Up to date</span>
         )}
       </div>
+      {im && <PhaseRow icon="＋" label="Importing" value={im} onCancel={onCancelImport} />}
       {up && <PhaseRow icon="↑" label="Uploading" value={up} />}
       {th && <PhaseRow icon="⤓" label="Thumbnails" value={th} />}
       {or && <PhaseRow icon="⤓" label="Cache" value={or} />}
+      {tk && <PhaseRow icon="↧" label="Takeout" value={tk} onCancel={onCancelTakeout} />}
     </div>
   );
 }
@@ -867,6 +879,8 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
   const [upload, setUpload] = useState<{ done: number; total: number } | null>(null);
   const [thumbs, setThumbs] = useState<{ done: number; total: number } | null>(null);
   const [originals, setOriginals] = useState<{ done: number; total: number } | null>(null);
+  const [importing, setImporting] = useState<{ done: number; total: number } | null>(null);
+  const [takeoutProg, setTakeoutProg] = useState<{ done: number; total: number } | null>(null);
   // Set when auto-update is off and the backend reports an available update.
   const [updateVer, setUpdateVer] = useState<string | null>(null);
   const [updating, setUpdating] = useState(false);
@@ -946,10 +960,22 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
       // new photos) before each originals pass, so refresh the grid here too.
       scheduleReload();
     });
+    const u5 = listen<[number, number]>("import-progress", (e) =>
+      setImporting((prev) => (e.payload[1] > 0 ? merge(prev, e.payload[0], e.payload[1]) : null))
+    );
+    const u6 = listen("import-done", () => {
+      setImporting(null);
+      scheduleReload(); // newly imported files should appear in the grid
+    });
+    const u7 = listen<[number, number]>("takeout-progress", (e) =>
+      setTakeoutProg((prev) => (e.payload[1] > 0 ? merge(prev, e.payload[0], e.payload[1]) : null))
+    );
+    const u8 = listen("takeout-done", () => setTakeoutProg(null));
     return () => {
       if (reloadTimer) clearTimeout(reloadTimer);
       u0.then((f) => f()); u0b.then((f) => f());
       u1.then((f) => f()); u2.then((f) => f()); u3.then((f) => f()); u4.then((f) => f());
+      u5.then((f) => f()); u6.then((f) => f()); u7.then((f) => f()); u8.then((f) => f());
     };
   }, []);
 
@@ -963,6 +989,15 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
     } catch (e) { showToast("Sync failed: " + e); }
     finally { setSyncing(false); }
   }, [refreshSession, showToast]);
+
+  const cancelTakeout = useCallback(async () => {
+    await api.cancelTakeout();
+    showToast("Cancelling takeout…");
+  }, [showToast]);
+  const cancelImport = useCallback(async () => {
+    await api.cancelImport();
+    showToast("Cancelling import…");
+  }, [showToast]);
 
   useEffect(() => {
     const un = listen("tray-sync", () => doSync());
@@ -1049,7 +1084,11 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
             </span>
           </button>
         )}
-        <SyncPanel syncing={syncing} upload={upload} thumbs={thumbs} originals={originals} />
+        <SyncPanel
+          syncing={syncing} upload={upload} thumbs={thumbs} originals={originals}
+          importing={importing} takeout={takeoutProg}
+          onCancelImport={cancelImport} onCancelTakeout={cancelTakeout}
+        />
         <div className="side-div" />
         <div className="acct">{session.email}</div>
         <div className="storage-bar"><div style={{ width: pct + "%" }} /></div>
@@ -1084,7 +1123,7 @@ const REST_PAGE = 4000;
 function usePagedFiles(
   fetchPage: (offset: number, limit: number) => Promise<FileItem[]>,
   reloadSignal: number,
-): { items: FileItem[]; reload: () => void } {
+): { items: FileItem[]; reload: () => void; remove: (filenames: string[]) => void } {
   const [items, setItems] = useState<FileItem[]>([]);
   // Latest committed list, read at reload time to tell a cold load (empty grid →
   // show progressively) from a warm reload (grid already populated → swap once at
@@ -1121,7 +1160,15 @@ function usePagedFiles(
     })().catch(() => { /* leave the previous list in place on failure */ });
   }, [fetchPage]);
   useEffect(() => { reload(); }, [reload, reloadSignal]);
-  return { items, reload };
+  // Optimistically drop rows (e.g. just-trashed files) so the grid updates
+  // instantly, without waiting for a warm reload to page through the whole list
+  // — which can be superseded mid-flight by a concurrent sync-triggered reload
+  // and leave the deleted item on screen until a remount does a cold load.
+  const remove = useCallback((filenames: string[]) => {
+    const kill = new Set(filenames);
+    setItems((prev) => prev.filter((f) => !kill.has(f.filename)));
+  }, []);
+  return { items, reload, remove };
 }
 
 function GalleryView({ syncing, onSync, showToast, onChanged, reloadSignal }: {
@@ -1132,7 +1179,7 @@ function GalleryView({ syncing, onSync, showToast, onChanged, reloadSignal }: {
 
   const fetchPage = useCallback(
     (offset: number, limit: number) => api.listGallery(offset, limit), []);
-  const { items, reload: load } = usePagedFiles(fetchPage, reloadSignal);
+  const { items, reload: load, remove } = usePagedFiles(fetchPage, reloadSignal);
 
   const doImport = async () => {
     const files = await pickFiles();
@@ -1162,6 +1209,7 @@ function GalleryView({ syncing, onSync, showToast, onChanged, reloadSignal }: {
               <span className="muted">{sel.size} selected</span>
               <button onClick={() => setSel(new Set(items.map((f) => f.filename)))}>Select all</button>
               <ActionButtons set={SET_GALLERY} albumId={null} filenames={[...sel]}
+                onTrashed={remove}
                 onDone={() => { setSel(new Set()); load(); onChanged(); }} showToast={showToast} />
               <button onClick={() => setSel(new Set())}>Cancel</button>
             </>
@@ -1186,7 +1234,8 @@ function GalleryView({ syncing, onSync, showToast, onChanged, reloadSignal }: {
       </div>
       {viewerIdx !== null && (
         <Viewer items={items} index={viewerIdx} set={SET_GALLERY} albumId={null}
-          onClose={() => setViewerIdx(null)} onChanged={() => { load(); onChanged(); }} showToast={showToast} />
+          onClose={() => setViewerIdx(null)} onChanged={() => { load(); onChanged(); }}
+          onTrashed={remove} showToast={showToast} />
       )}
     </>
   );
@@ -1253,6 +1302,12 @@ function AlbumDetail({ album, onBack, showToast }: { album: Album; onBack: () =>
   const [sel, setSel] = useState<Set<string>>(new Set());
   const load = useCallback(() => { api.listAlbumFiles(album.album_id).then(setItems); }, [album.album_id]);
   useEffect(() => { load(); }, [load]);
+  // Optimistically drop just-trashed rows so the grid updates immediately,
+  // instead of waiting on the reload to round-trip.
+  const remove = useCallback((filenames: string[]) => {
+    const kill = new Set(filenames);
+    setItems((prev) => prev.filter((f) => !kill.has(f.filename)));
+  }, []);
 
   const clearSel = () => setSel(new Set());
 
@@ -1314,6 +1369,7 @@ function AlbumDetail({ album, onBack, showToast }: { album: Album; onBack: () =>
               <span className="muted">{sel.size} selected</span>
               <button onClick={() => setSel(new Set(items.map((f) => f.filename)))}>Select all</button>
               <ActionButtons set={SET_ALBUM} albumId={album.album_id} filenames={[...sel]}
+                onTrashed={remove}
                 onDone={() => { clearSel(); load(); }} showToast={showToast} />
               <button onClick={clearSel}>Cancel</button>
             </>
@@ -1339,7 +1395,7 @@ function AlbumDetail({ album, onBack, showToast }: { album: Album; onBack: () =>
       </div>
       {viewerIdx !== null && (
         <Viewer items={items} index={viewerIdx} set={SET_ALBUM} albumId={album.album_id}
-          onClose={() => setViewerIdx(null)} onChanged={load} showToast={showToast} />
+          onClose={() => setViewerIdx(null)} onChanged={load} onTrashed={remove} showToast={showToast} />
       )}
     </>
   );
@@ -1560,9 +1616,13 @@ function SettingsView({ session, setSession, showToast }: {
   const doTakeout = async () => {
     const dir = await pickFolder();
     if (!dir) return;
-    showToast("Exporting… this may take a while");
-    const r = await api.takeout(dir, false);
-    showToast(`Takeout complete — ${r.written} files (${r.errors} errors)`);
+    showToast("Exporting… progress is shown in the sidebar");
+    try {
+      const r = await api.takeout(dir, false);
+      showToast(`Takeout complete — ${r.written} files (${r.errors} errors)`);
+    } catch (e) {
+      showToast("Takeout failed: " + e);
+    }
   };
 
   return (
@@ -1905,11 +1965,13 @@ function ConfirmDialog({ title, message, actions, onClose }: {
   );
 }
 
-function ActionButtons({ set, albumId, filenames, onDone, showToast }: {
+function ActionButtons({ set, albumId, filenames, onDone, showToast, onTrashed }: {
   set: number; albumId: string | null; filenames: string[];
   onDone: () => void; showToast: (m: string) => void;
+  onTrashed?: (filenames: string[]) => void;
 }) {
   const [moving, setMoving] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const save = async () => {
     const dir = await pickFolder();
     if (!dir) return;
@@ -1918,7 +1980,9 @@ function ActionButtons({ set, albumId, filenames, onDone, showToast }: {
     showToast(`Saved ${n} file${n === 1 ? "" : "s"}`);
   };
   const del = async () => {
+    setConfirmDelete(false);
     await api.trashCtx(set, albumId, filenames);
+    onTrashed?.(filenames); // optimistic: remove from the grid right away
     showToast("Moved to trash");
     onDone();
   };
@@ -1935,17 +1999,29 @@ function ActionButtons({ set, albumId, filenames, onDone, showToast }: {
     <>
       <button onClick={save}>⤓ Save</button>
       <button onClick={() => setMoving(true)}>→ Move</button>
-      <button onClick={del}>🗑️ Delete</button>
+      <button onClick={() => setConfirmDelete(true)}>🗑️ Delete</button>
       {moving && <MoveDialog fromSet={set} fromAlbum={albumId} count={filenames.length} onPick={move} onClose={() => setMoving(false)} />}
+      {confirmDelete && (
+        <ConfirmDialog
+          title={filenames.length === 1 ? "Move to trash?" : `Move ${filenames.length} items to trash?`}
+          message="You can restore items from Trash later."
+          onClose={() => setConfirmDelete(false)}
+          actions={[
+            { label: "Cancel", onClick: () => setConfirmDelete(false) },
+            { label: "Move to trash", variant: "danger", onClick: del },
+          ]}
+        />
+      )}
     </>
   );
 }
 
 /* ----------------------------- Viewer ----------------------------- */
 
-function Viewer({ items, index, set, albumId, onClose, onChanged, showToast }: {
+function Viewer({ items, index, set, albumId, onClose, onChanged, showToast, onTrashed }: {
   items: FileItem[]; index: number; set: number; albumId: string | null;
   onClose: () => void; onChanged: () => void; showToast: (m: string) => void;
+  onTrashed?: (filenames: string[]) => void;
 }) {
   const [i, setI] = useState(index);
   const vidPress = useRef<{ x: number; y: number } | null>(null);
@@ -1985,6 +2061,7 @@ function Viewer({ items, index, set, albumId, onClose, onChanged, showToast }: {
       <div className="close">✕</div>
       <div className="viewer-actions" onClick={stop}>
         <ActionButtons set={set} albumId={albumId} filenames={[f.filename]}
+          onTrashed={onTrashed}
           onDone={() => { onChanged(); onClose(); }} showToast={showToast} />
       </div>
       {i > 0 && <button className="nav-btn prev" onClick={(e) => { e.stopPropagation(); setI(i - 1); }}>‹</button>}

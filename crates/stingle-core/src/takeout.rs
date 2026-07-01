@@ -2,6 +2,7 @@
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 use stingle_crypto::file;
 use stingle_db::{DbFile, FileSet, Sort};
@@ -19,30 +20,62 @@ pub struct TakeoutStats {
 impl Account {
     /// Decrypt the whole library into `out_dir`, organized as `gallery/` and
     /// `albums/<album name>/`, restoring original filenames where available.
-    pub async fn takeout(&self, out_dir: &Path, include_trash: bool) -> Result<TakeoutStats> {
+    ///
+    /// `progress(done, total)` is called as each file is written so the UI can
+    /// show a live count. The pass stops promptly if [`request_stop_takeout`]
+    /// is called mid-run, returning the partial stats gathered so far.
+    ///
+    /// [`request_stop_takeout`]: Account::request_stop_takeout
+    pub async fn takeout(
+        &self,
+        out_dir: &Path,
+        include_trash: bool,
+        progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
+    ) -> Result<TakeoutStats> {
         let mut stats = TakeoutStats::default();
 
+        // Fresh start: clear any stale cancellation from a previous run.
+        self.stop_takeout.store(false, Ordering::Relaxed);
+
+        // Build the full work list up front so `total` is known for progress.
+        // Each item carries its destination directory (created lazily below).
+        let mut items: Vec<(FileSet, Option<String>, DbFile, PathBuf)> = Vec::new();
+
         let gallery_dir = out_dir.join("gallery");
-        std::fs::create_dir_all(&gallery_dir)?;
         for f in self.db.list_files(FileSet::Gallery, Sort::Asc, None, 0)? {
-            self.takeout_one(FileSet::Gallery, None, &f, &gallery_dir, &mut stats).await;
+            items.push((FileSet::Gallery, None, f, gallery_dir.clone()));
         }
 
         for album in self.db.list_albums(true)? {
             let name = self.album_name(&album).unwrap_or_else(|_| album.album_id.clone());
             let adir = out_dir.join("albums").join(sanitize(&name));
-            std::fs::create_dir_all(&adir)?;
             for f in self.db.list_album_files(&album.album_id, Sort::Asc, None, 0)? {
-                self.takeout_one(FileSet::Album, Some(&album.album_id), &f, &adir, &mut stats)
-                    .await;
+                items.push((FileSet::Album, Some(album.album_id.clone()), f, adir.clone()));
             }
         }
 
         if include_trash {
             let trash_dir = out_dir.join("trash");
-            std::fs::create_dir_all(&trash_dir)?;
             for f in self.db.list_files(FileSet::Trash, Sort::Asc, None, 0)? {
-                self.takeout_one(FileSet::Trash, None, &f, &trash_dir, &mut stats).await;
+                items.push((FileSet::Trash, None, f, trash_dir.clone()));
+            }
+        }
+
+        let total = items.len();
+        if let Some(cb) = progress {
+            cb(0, total);
+        }
+
+        let mut done = 0usize;
+        for (set, album_id, f, dir) in &items {
+            if self.stop_takeout.load(Ordering::Relaxed) {
+                break;
+            }
+            std::fs::create_dir_all(dir)?;
+            self.takeout_one(*set, album_id.as_deref(), f, dir, &mut stats).await;
+            done += 1;
+            if let Some(cb) = progress {
+                cb(done, total);
             }
         }
 

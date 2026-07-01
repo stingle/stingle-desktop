@@ -85,6 +85,8 @@ export const api = {
     invoke("set_album_blank_cover", { albumId }),
   takeout: (outDir: string, includeTrash: boolean) =>
     invoke<{ written: number; errors: number }>("takeout", { outDir, includeTrash }),
+  cancelTakeout: () => invoke<void>("cancel_takeout"),
+  cancelImport: () => invoke<void>("cancel_import"),
   recoveryPhrase: () => invoke<string>("recovery_phrase"),
   isVideo: (set: number, filename: string, albumId: string | null) =>
     invoke<boolean>("is_video", { set, albumId, filename }),
