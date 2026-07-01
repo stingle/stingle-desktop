@@ -126,7 +126,7 @@ mod imp {
 
     pub fn biometric_available() -> bool {
         match UserConsentVerifier::CheckAvailabilityAsync() {
-            Ok(op) => matches!(op.get(), Ok(UserConsentVerifierAvailability::Available)),
+            Ok(op) => matches!(op.join(), Ok(UserConsentVerifierAvailability::Available)),
             Err(_) => false,
         }
     }
@@ -134,7 +134,7 @@ mod imp {
     fn prompt(message: &str) -> Result<(), String> {
         let op = UserConsentVerifier::RequestVerificationAsync(&HSTRING::from(message))
             .map_err(|e| e.to_string())?;
-        match op.get() {
+        match op.join() {
             Ok(UserConsentVerificationResult::Verified) => Ok(()),
             Ok(_) => Err("Windows Hello verification was not completed".into()),
             Err(e) => Err(e.to_string()),
