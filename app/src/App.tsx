@@ -47,8 +47,10 @@ const SettingsIcon = () => (
 );
 
 function fmtMB(mb: number): string {
-  if (mb >= 1024) return (mb / 1024).toFixed(1) + " GB";
-  return mb + " MB";
+  // Never render a negative size — a bad/absent server value must read as 0.
+  const v = Math.max(0, mb);
+  if (v >= 1024) return (v / 1024).toFixed(1) + " GB";
+  return v + " MB";
 }
 
 function sameDay(a: Date, b: Date): boolean {
@@ -821,12 +823,14 @@ type Progress = { done: number; total: number } | null;
 function PhaseRow({ icon, label, value, onCancel }: {
   icon: string; label: string; value: { done: number; total: number }; onCancel?: () => void;
 }) {
-  const pct = value.total > 0 ? Math.min(100, (value.done / value.total) * 100) : 0;
+  const total = Math.max(0, value.total);
+  const done = Math.max(0, Math.min(value.done, total));
+  const pct = total > 0 ? Math.max(0, Math.min(100, (done / total) * 100)) : 0;
   return (
     <div className="phase-row">
       <span className="phase-icon">{icon}</span>
       <span className="phase-label">{label}</span>
-      <span className="phase-count">{value.done} / {value.total}</span>
+      <span className="phase-count">{done} / {total}</span>
       {onCancel && (
         <button className="phase-cancel" onClick={onCancel} title={`Cancel ${label.toLowerCase()}`}>✕</button>
       )}
@@ -1055,7 +1059,7 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
     return () => window.removeEventListener("keydown", onPaste);
   }, [doSync, showToast]);
 
-  const pct = session.space_quota > 0 ? Math.min(100, (session.space_used / session.space_quota) * 100) : 0;
+  const pct = session.space_quota > 0 ? Math.max(0, Math.min(100, (session.space_used / session.space_quota) * 100)) : 0;
 
   return (
     <div className="app">

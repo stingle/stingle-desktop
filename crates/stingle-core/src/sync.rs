@@ -67,18 +67,24 @@ impl Account {
     }
 
     pub fn space(&self) -> Space {
+        // Clamp to >= 0: a transient bad server response (or a value cached by an
+        // older build before the write-side clamp existed) must never surface as
+        // a negative "used"/"quota" in the UI.
         Space {
-            used: self.db.kv_get_i64("spaceUsed").ok().flatten().unwrap_or(0),
-            quota: self.db.kv_get_i64("spaceQuota").ok().flatten().unwrap_or(0),
+            used: self.db.kv_get_i64("spaceUsed").ok().flatten().unwrap_or(0).max(0),
+            quota: self.db.kv_get_i64("spaceQuota").ok().flatten().unwrap_or(0).max(0),
         }
     }
 
     fn update_space(&self, used: Option<i64>, quota: Option<i64>) -> Result<()> {
+        // Never persist a negative usage/quota — the server occasionally returns
+        // a bogus value, and a poisoned cache would then read back negative on
+        // every launch until the next good sync.
         if let Some(u) = used {
-            self.db.kv_set_i64("spaceUsed", u)?;
+            self.db.kv_set_i64("spaceUsed", u.max(0))?;
         }
         if let Some(q) = quota {
-            self.db.kv_set_i64("spaceQuota", q)?;
+            self.db.kv_set_i64("spaceQuota", q.max(0))?;
         }
         Ok(())
     }

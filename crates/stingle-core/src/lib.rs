@@ -13,6 +13,7 @@ pub mod albums;
 pub mod cache;
 pub mod error;
 pub mod fileops;
+pub mod heif;
 pub mod import;
 pub mod media;
 pub mod paths;

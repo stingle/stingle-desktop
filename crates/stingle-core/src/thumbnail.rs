@@ -2,7 +2,10 @@
 //!
 //! SECURITY: this module must never write DECRYPTED bytes to disk. ffmpeg is
 //! driven purely through stdin/stdout pipes (no temp files). The only file
-//! ffmpeg ever reads from a path is the user's own local file during import.
+//! ffmpeg ever reads from a path is the user's own local file during import —
+//! with one narrow exception: the legacy [`ffmpeg_container_to_jpeg`] fallback
+//! (see its SECURITY NOTE), which is only reached for exotic files the primary
+//! pipe-based HEIF path can't parse.
 
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
@@ -14,26 +17,40 @@ use image::imageops::FilterType;
 use image::{DynamicImage, ImageDecoder, ImageReader};
 
 use crate::error::{CoreError, Result};
+use crate::heif;
 
 /// Max thumbnail edge length (px).
 pub const THUMB_MAX_DIM: u32 = 512;
 pub const THUMB_JPEG_QUALITY: u8 = 80;
+/// Full-screen preview transcodes (HEIC/TIFF → JPEG) keep more detail.
+pub const PREVIEW_JPEG_QUALITY: u8 = 90;
 
 /// Decode an image and produce a downscaled JPEG thumbnail.
 pub fn image_thumbnail(image_bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut decoder = ImageReader::new(Cursor::new(image_bytes))
+    let img = if heif::is_heif(image_bytes) {
+        // The image crate can't decode HEVC; go through the HEIF pipeline
+        // (so imported iPhone photos get real thumbnails, not placeholders).
+        decode_heif(image_bytes, "heic")?
+    } else {
+        decode_with_orientation(image_bytes)?
+    };
+    let thumb = img.thumbnail(THUMB_MAX_DIM, THUMB_MAX_DIM);
+    encode_jpeg(&thumb)
+}
+
+/// Decode via the image crate, honoring EXIF orientation so the result matches
+/// how the webview renders the full image. Cameras (Nikon, iPhone, …) store
+/// portrait shots in landscape pixels plus an orientation tag; without this the
+/// output comes out sideways. encode_jpeg re-encodes raw RGB and writes no
+/// EXIF, so baking the rotation in here can't cause a double-rotation later.
+fn decode_with_orientation(bytes: &[u8]) -> Result<DynamicImage> {
+    let mut decoder = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()?
         .into_decoder()?;
-    // Honor EXIF orientation so the thumbnail matches how the webview renders
-    // the full image. Cameras (Nikon, iPhone, …) store portrait shots in
-    // landshape pixels plus an orientation tag; without this the thumbnail
-    // comes out sideways. encode_jpeg re-encodes raw RGB and writes no EXIF, so
-    // baking the rotation in here can't cause a double-rotation in the webview.
     let orientation = decoder.orientation()?;
     let mut img = DynamicImage::from_decoder(decoder)?;
     img.apply_orientation(orientation);
-    let thumb = img.thumbnail(THUMB_MAX_DIM, THUMB_MAX_DIM);
-    encode_jpeg(&thumb)
+    Ok(img)
 }
 
 static FFMPEG: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -161,8 +178,112 @@ pub fn transcode_temp_dir() -> std::path::PathBuf {
     std::env::temp_dir().join("stingle-xcode")
 }
 
-/// Transcode an in-memory image the webview can't render (HEIC/HEIF/TIFF) into a
-/// JPEG for full-screen preview / clipboard copy.
+/// Transcode an in-memory image the webview can't render (HEIC/HEIF/TIFF) into
+/// a JPEG for full-screen preview / clipboard copy.
+///
+/// HEIC/HEIF goes through [`decode_heif`]: we extract the container's PRIMARY
+/// image ourselves and use ffmpeg only as a raw HEVC decoder over pipes. This
+/// is deliberate — handing the whole container to ffmpeg leaves the choice of
+/// image to its automatic stream selection, which varies across ffmpeg
+/// builds/versions and on some platforms picked the depth map or HDR gain map
+/// instead of the photo. TIFF is decoded by the image crate directly. Only if
+/// those fail do we fall back to the legacy whole-container ffmpeg call.
+pub fn transcode_to_jpeg(bytes: &[u8], ext: &str) -> Result<Vec<u8>> {
+    if heif::is_heif(bytes) {
+        return encode_jpeg_quality(&decode_heif(bytes, ext)?, PREVIEW_JPEG_QUALITY);
+    }
+    if let Ok(img) = decode_with_orientation(bytes) {
+        return encode_jpeg_quality(&img, PREVIEW_JPEG_QUALITY);
+    }
+    ffmpeg_container_to_jpeg(bytes, ext)
+}
+
+/// Decode a HEIF/HEIC still to its primary image, falling back to the legacy
+/// whole-container ffmpeg decode for containers our parser doesn't cover.
+fn decode_heif(bytes: &[u8], ext: &str) -> Result<DynamicImage> {
+    match decode_heif_primary(bytes) {
+        Ok(img) => Ok(img),
+        Err(e) => {
+            tracing::warn!(
+                "HEIF primary-item decode failed ({e}); falling back to whole-container ffmpeg"
+            );
+            let jpg = ffmpeg_container_to_jpeg(bytes, ext)?;
+            Ok(image::load_from_memory(&jpg)?)
+        }
+    }
+}
+
+/// Decode the PRIMARY image of a HEIF/HEIC container, deterministically.
+///
+/// The container is parsed in Rust ([`heif::parse_primary`]) to extract the
+/// primary item's HEVC tiles as one Annex-B stream; ffmpeg decodes that stream
+/// to raw RGB frames over stdin/stdout (a raw bitstream needs no seeking, so —
+/// unlike the container path — no decrypted temp file is ever written). Tiles
+/// are stitched, cropped and rotated/mirrored here, per the container's
+/// `grid`/`irot`/`imir` metadata. Same result on every platform and every
+/// ffmpeg version, because nothing is left to ffmpeg's stream selection.
+fn decode_heif_primary(bytes: &[u8]) -> Result<DynamicImage> {
+    let parsed = heif::parse_primary(bytes)?;
+    let (tw, th) = (parsed.tile_width as usize, parsed.tile_height as usize);
+    let (rows, cols) = (parsed.rows as usize, parsed.cols as usize);
+    let n = parsed.tile_count as usize;
+    let frame_len = tw * th * 3;
+
+    let raw = run_ffmpeg(
+        &[
+            "-f", "hevc", "-i", "pipe:0", "-fps_mode", "passthrough", "-pix_fmt", "rgb24", "-f",
+            "rawvideo", "pipe:1",
+        ],
+        Some(parsed.annexb),
+    )?;
+    // Every tile must decode to exactly its declared size — anything else
+    // means the decoder disagreed with the container metadata; bail out (the
+    // caller falls back) rather than render garbage.
+    if frame_len == 0 || raw.len() != frame_len * n {
+        return Err(CoreError::Other(format!(
+            "heif: decoded {} bytes, expected {} ({n} tiles of {tw}x{th})",
+            raw.len(),
+            frame_len * n
+        )));
+    }
+
+    let (cw, ch) = (cols * tw, rows * th);
+    let mut canvas = image::RgbImage::new(cw as u32, ch as u32);
+    let stride = cw * 3;
+    {
+        let buf: &mut [u8] = &mut canvas;
+        for i in 0..n {
+            let tile = &raw[i * frame_len..(i + 1) * frame_len];
+            let (row, col) = (i / cols, i % cols);
+            for y in 0..th {
+                let dst = (row * th + y) * stride + col * tw * 3;
+                buf[dst..dst + tw * 3].copy_from_slice(&tile[y * tw * 3..(y + 1) * tw * 3]);
+            }
+        }
+    }
+
+    let mut img = DynamicImage::ImageRgb8(canvas);
+    // The grid canvas is tile-aligned; crop (top-left anchored) to the real size.
+    let (ow, oh) = (parsed.output_width, parsed.output_height);
+    if (ow as usize) <= cw && (oh as usize) <= ch && ((ow as usize) < cw || (oh as usize) < ch) {
+        img = img.crop_imm(0, 0, ow, oh);
+    }
+    for t in &parsed.transforms {
+        img = match t {
+            // irot angles are anti-clockwise; the image crate rotates clockwise.
+            heif::Transform::Rotate(1) => img.rotate270(),
+            heif::Transform::Rotate(2) => img.rotate180(),
+            heif::Transform::Rotate(3) => img.rotate90(),
+            heif::Transform::Rotate(_) => img,
+            heif::Transform::MirrorVertical => img.fliph(),
+            heif::Transform::MirrorHorizontal => img.flipv(),
+        };
+    }
+    Ok(img)
+}
+
+/// Legacy fallback: hand the whole container to ffmpeg and let it pick a
+/// stream. Only used when the targeted decoders above can't handle the file.
 ///
 /// SECURITY NOTE: unlike video frame-grabs, this cannot use a stdin pipe.
 /// iPhone HEICs are "grid" (tiled) images and ffmpeg can only assemble the grid
@@ -171,7 +292,7 @@ pub fn transcode_temp_dir() -> std::path::PathBuf {
 /// (already-decrypted) bytes to a temp file for the single transcode call and
 /// delete it immediately afterwards (on success or error). Output still streams
 /// over stdout — only the input briefly touches disk.
-pub fn transcode_to_jpeg(bytes: &[u8], ext: &str) -> Result<Vec<u8>> {
+fn ffmpeg_container_to_jpeg(bytes: &[u8], ext: &str) -> Result<Vec<u8>> {
     let dir = transcode_temp_dir();
     std::fs::create_dir_all(&dir).map_err(|e| CoreError::Other(format!("temp dir: {e}")))?;
     // The input briefly holds DECRYPTED bytes — restrict the dir to this user.
@@ -205,9 +326,13 @@ pub fn placeholder_thumbnail() -> Result<Vec<u8>> {
 }
 
 fn encode_jpeg(img: &image::DynamicImage) -> Result<Vec<u8>> {
+    encode_jpeg_quality(img, THUMB_JPEG_QUALITY)
+}
+
+fn encode_jpeg_quality(img: &image::DynamicImage, quality: u8) -> Result<Vec<u8>> {
     let mut out = Cursor::new(Vec::new());
     let rgb = img.to_rgb8();
-    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, THUMB_JPEG_QUALITY);
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
     enc.encode(
         rgb.as_raw(),
         rgb.width(),
