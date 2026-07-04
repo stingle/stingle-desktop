@@ -112,6 +112,21 @@ jobs:
           cp "$exe" app/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe
           app/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe -version | head -1
 
+      # The committed entitlements.plist ships a __TEAM_ID__ placeholder so no
+      # team-specific value lives in git. Substitute the real 10-char Team ID
+      # (from the same secret used for notarization) before Tauri signs the
+      # .app with these entitlements. macOS-only: the entitlements are ignored
+      # on other platforms.
+      - name: Inject Apple Team ID into entitlements
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i '' "s/__TEAM_ID__/${{ secrets.APPLE_TEAM_ID }}/g" \
+            app/src-tauri/entitlements.plist
+          echo "Entitlements after substitution:"
+          cat app/src-tauri/entitlements.plist
+
       - name: Build, sign & publish
         uses: tauri-apps/tauri-action@v0
         env:

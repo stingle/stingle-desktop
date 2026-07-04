@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Grants access to the macOS *data-protection keychain*, which is the only
+    keychain that honors SecAccessControl (the Touch ID / login-password gate
+    used by src/secure_store.rs for the auto-unlock key). Without this
+    entitlement a Developer ID app can only use the legacy login Keychain, and
+    the app silently falls back to the promptless "keyring" tier.
+
+    __TEAM_ID__ is substituted with the real 10-char Apple Team ID at build
+    time by .github/workflows/release.yml (from the APPLE_TEAM_ID secret), so
+    no team-specific value is committed here.
+  -->
+  <key>keychain-access-groups</key>
+  <array>
+    <string>__TEAM_ID__.org.stingle.desktop</string>
+  </array>
+</dict>
+</plist>

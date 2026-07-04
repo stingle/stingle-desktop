@@ -14,6 +14,10 @@ Stack: Tauri 2 (Rust core) + React/TS. See `docs/ROADMAP.md` and `docs/CRYPTO_SP
    - Decryption happens in memory only; decrypted bytes are streamed to the
      webview via the `stingle://` protocol with `Cache-Control: no-store` so the
      webview never persists them to its on-disk HTTP cache.
+   - On Linux only, videos stream through a token-guarded HTTP server bound to
+     127.0.0.1 (`app/src-tauri/src/media_server.rs`) because WebKitGTK can't
+     play custom-scheme media. Same guarantees: decryption in memory in ≤4 MB
+     windows, `no-store`, per-run random URL token.
    - ffmpeg (HEIC transcode, video frame-grab) is driven via stdin/stdout pipes —
      never temp files. The only path ffmpeg reads is the user's own local file
      during import.

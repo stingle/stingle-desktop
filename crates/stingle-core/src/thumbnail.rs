@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use image::imageops::FilterType;
+use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader};
 
 use crate::error::{CoreError, Result};
@@ -43,7 +44,7 @@ pub fn image_thumbnail(image_bytes: &[u8]) -> Result<Vec<u8>> {
 /// portrait shots in landscape pixels plus an orientation tag; without this the
 /// output comes out sideways. encode_jpeg re-encodes raw RGB and writes no
 /// EXIF, so baking the rotation in here can't cause a double-rotation later.
-fn decode_with_orientation(bytes: &[u8]) -> Result<DynamicImage> {
+pub(crate) fn decode_with_orientation(bytes: &[u8]) -> Result<DynamicImage> {
     let mut decoder = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()?
         .into_decoder()?;
@@ -279,6 +280,15 @@ fn decode_heif_primary(bytes: &[u8]) -> Result<DynamicImage> {
             heif::Transform::MirrorHorizontal => img.flipv(),
         };
     }
+    // irot/imir are authoritative when declared, but some encoders (Samsung,
+    // the iPhone 17 front camera) record orientation only in the EXIF block.
+    // Apply EXIF exactly when the container declares NO transform — never
+    // both, which would double-rotate files carrying consistent copies.
+    if !parsed.has_transform_props {
+        if let Some(o) = parsed.exif_orientation.and_then(Orientation::from_exif) {
+            img.apply_orientation(o);
+        }
+    }
     Ok(img)
 }
 
@@ -345,9 +355,72 @@ fn encode_jpeg_quality(img: &image::DynamicImage, quality: u8) -> Result<Vec<u8>
 /// Resize an already-decoded image (utility).
 #[allow(dead_code)]
 pub fn resize_jpeg(image_bytes: &[u8], max_dim: u32) -> Result<Vec<u8>> {
-    let img = ImageReader::new(Cursor::new(image_bytes))
-        .with_guessed_format()?
-        .decode()?;
+    let img = decode_with_orientation(image_bytes)?;
     let resized = img.resize(max_dim, max_dim, FilterType::Triangle);
     encode_jpeg(&resized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 16×8 JPEG: left half red, right half blue (no EXIF).
+    fn test_jpeg() -> Vec<u8> {
+        let mut img = image::RgbImage::new(16, 8);
+        for (x, _, p) in img.enumerate_pixels_mut() {
+            *p = if x < 8 { image::Rgb([255, 0, 0]) } else { image::Rgb([0, 0, 255]) };
+        }
+        encode_jpeg_quality(&DynamicImage::ImageRgb8(img), 100).expect("encode")
+    }
+
+    /// Splice an EXIF APP1 segment carrying only `Orientation = n` after SOI.
+    fn with_exif_orientation(jpeg: &[u8], orientation: u8) -> Vec<u8> {
+        let mut app1 = b"Exif\0\0".to_vec();
+        app1.extend_from_slice(b"II*\0");
+        app1.extend_from_slice(&8u32.to_le_bytes()); // IFD0 offset
+        app1.extend_from_slice(&1u16.to_le_bytes()); // entry count
+        app1.extend_from_slice(&0x0112u16.to_le_bytes()); // Orientation
+        app1.extend_from_slice(&3u16.to_le_bytes()); // type SHORT
+        app1.extend_from_slice(&1u32.to_le_bytes()); // count
+        app1.extend_from_slice(&(orientation as u16).to_le_bytes());
+        app1.extend_from_slice(&0u16.to_le_bytes()); // value padding
+        app1.extend_from_slice(&0u32.to_le_bytes()); // next-IFD offset
+        let mut out = jpeg[..2].to_vec(); // SOI
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&((app1.len() as u16 + 2).to_be_bytes()));
+        out.extend_from_slice(&app1);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    #[test]
+    fn applies_all_eight_exif_orientations() {
+        let base = test_jpeg();
+        let upright = image::load_from_memory(&base).expect("decode base").to_rgb8();
+        for n in 1u8..=8 {
+            let tagged = with_exif_orientation(&base, n);
+            let got = decode_with_orientation(&tagged).expect("decode").to_rgb8();
+            let mut want = DynamicImage::ImageRgb8(upright.clone());
+            want.apply_orientation(Orientation::from_exif(n).expect("valid exif value"));
+            let want = want.to_rgb8();
+            assert_eq!(got.dimensions(), want.dimensions(), "orientation {n}");
+            assert_eq!(got.as_raw(), want.as_raw(), "orientation {n}");
+            // 5..=8 swap width and height.
+            let expect_dims = if n >= 5 { (8, 16) } else { (16, 8) };
+            assert_eq!(got.dimensions(), expect_dims, "orientation {n}");
+        }
+
+        // Semantic spot checks (independent of the image crate's mapping):
+        let red = |p: &image::Rgb<u8>| p.0[0] > 150 && p.0[2] < 100;
+        let blue = |p: &image::Rgb<u8>| p.0[2] > 150 && p.0[0] < 100;
+        // 2 = mirror horizontal → left edge turns blue.
+        let o2 = decode_with_orientation(&with_exif_orientation(&base, 2)).unwrap().to_rgb8();
+        assert!(blue(o2.get_pixel(0, 0)) && red(o2.get_pixel(15, 0)));
+        // 3 = rotate 180 → left edge turns blue.
+        let o3 = decode_with_orientation(&with_exif_orientation(&base, 3)).unwrap().to_rgb8();
+        assert!(blue(o3.get_pixel(0, 0)) && red(o3.get_pixel(15, 7)));
+        // 6 = rotate 90 CW → the red left half becomes the TOP half.
+        let o6 = decode_with_orientation(&with_exif_orientation(&base, 6)).unwrap().to_rgb8();
+        assert!(red(o6.get_pixel(0, 0)) && blue(o6.get_pixel(7, 15)));
+    }
 }

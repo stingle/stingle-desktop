@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import {
-  api, mediaUrl, pickFiles, pickFolder,
+  api, mediaUrl, videoUrl, pickFiles, pickFolder,
   Session, FileItem, Album, LocalAccount, WatchFolder,
   SET_GALLERY, SET_TRASH, SET_ALBUM, BLANK_COVER,
 } from "./api";
@@ -650,10 +650,11 @@ function AuthView({ onAuthed, sessionExpired }: { onAuthed: (s: Session) => void
   const [phrase, setPhrase] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  // Whether biometric auto-unlock is set up, so we can offer a manual retry.
-  // The startup auto-unlock attempt prompts once; if the user cancels it (or it
+  // Whether secure-store auto-unlock is set up, so we can offer a manual
+  // retry. The startup auto-unlock attempt prompts once (Hello / Touch ID, or
+  // the keyring-unlock dialog on Linux); if the user cancels it (or it
   // otherwise fails) this button is the only way back in short of restarting.
-  const [canBiometric, setCanBiometric] = useState(false);
+  const [quickUnlock, setQuickUnlock] = useState<"biometric" | "keyring" | null>(null);
 
   useEffect(() => {
     api.lastAccount().then((a) => { setLastAcc(a); setReady(true); }).catch(() => setReady(true));
@@ -664,22 +665,22 @@ function AuthView({ onAuthed, sessionExpired }: { onAuthed: (s: Session) => void
       try {
         const [enabled, store] = await Promise.all([
           api.isAutoUnlockEnabled().catch(() => false),
-          api.secureStoreStatus().catch(() => ({ biometric: false })),
+          api.secureStoreStatus().catch(() => ({ biometric: false, keyring: false })),
         ]);
-        setCanBiometric(enabled && store.biometric);
+        setQuickUnlock(enabled ? (store.biometric ? "biometric" : store.keyring ? "keyring" : null) : null);
       } catch { /* leave the button hidden */ }
     })();
   }, []);
 
-  // Retry biometric unlock from the login screen (re-triggers the OS prompt).
-  // Only meaningful for an offline resume — a server-expired token can't be
-  // revived this way, so the button is hidden when sessionExpired.
-  const biometricUnlock = async () => {
+  // Retry secure-store unlock from the login screen (re-triggers any OS
+  // prompt). Only meaningful for an offline resume — a server-expired token
+  // can't be revived this way, so the button is hidden when sessionExpired.
+  const quickUnlockNow = async () => {
     setBusy(true); setError("");
     try {
       const u = await api.tryAutoUnlock();
       if (u.logged_in) { onAuthed(u); return; }
-      setError("Biometric unlock was canceled.");
+      setError("Unlock was canceled.");
     } catch (e: any) {
       setError(String(e));
     } finally { setBusy(false); }
@@ -745,9 +746,9 @@ function AuthView({ onAuthed, sessionExpired }: { onAuthed: (s: Session) => void
           <button className="primary" style={{ width: "100%", marginTop: 10 }} disabled={busy} onClick={unlock}>
             {busy ? <span className="spinner" /> : "Unlock"}
           </button>
-          {canBiometric && !sessionExpired && (
-            <button style={{ width: "100%", marginTop: 8 }} disabled={busy} onClick={biometricUnlock}>
-              Unlock with biometrics
+          {quickUnlock && !sessionExpired && (
+            <button style={{ width: "100%", marginTop: 8 }} disabled={busy} onClick={quickUnlockNow}>
+              {quickUnlock === "biometric" ? "Unlock with biometrics" : "Unlock from system keyring"}
             </button>
           )}
           <div className="link-row" style={{ justifyContent: "center" }}>
@@ -1464,8 +1465,10 @@ function SettingsView({ session, setSession, showToast }: {
   const [minTray, setMinTray] = useState(false);
   const [autoUpdate, setAutoUpdate] = useState(true);
   const [syncEvery, setSyncEvery] = useState(false);
+  const [autoSync, setAutoSync] = useState(true);
+  const [autoSyncMins, setAutoSyncMins] = useState(10);
   const [autoUnlock, setAutoUnlock] = useState(false);
-  const [biometric, setBiometric] = useState(false);
+  const [secureStore, setSecureStore] = useState({ biometric: false, keyring: false });
   const [auPrompt, setAuPrompt] = useState(false);
   const [auPassword, setAuPassword] = useState("");
   const [storagePath, setStoragePath] = useState("");
@@ -1491,8 +1494,10 @@ function SettingsView({ session, setSession, showToast }: {
     api.getAutoUpdate().then(setAutoUpdate).catch(() => {});
     api.getAppVersion().then(setVersion).catch(() => {});
     api.getSyncEverything().then(setSyncEvery).catch(() => {});
+    api.getAutoSync().then(setAutoSync).catch(() => {});
+    api.getAutoSyncInterval().then(setAutoSyncMins).catch(() => {});
     api.isAutoUnlockEnabled().then(setAutoUnlock).catch(() => {});
-    api.secureStoreStatus().then((s) => setBiometric(s.biometric)).catch(() => {});
+    api.secureStoreStatus().then(setSecureStore).catch(() => {});
     api.getStoragePath().then(setStoragePath).catch(() => {});
     api.getWatchFolders().then(setWatchFolders).catch(() => {});
   }, []);
@@ -1565,6 +1570,17 @@ function SettingsView({ session, setSession, showToast }: {
     try { await api.setSyncEverything(v); setSyncEvery(v); showToast(v ? "Syncing everything locally" : "Continuous sync off"); }
     catch (e) { showToast("Failed: " + e); }
   };
+  const toggleAutoSync = async (v: boolean) => {
+    try { await api.setAutoSync(v); setAutoSync(v); showToast(v ? "Automatic sync on" : "Automatic sync off"); }
+    catch (e) { showToast("Failed: " + e); }
+  };
+  // Persist the interval on commit (blur/Enter), clamped to a sane range.
+  const commitAutoSyncInterval = async (mins: number) => {
+    const clamped = Math.min(1440, Math.max(1, Math.round(mins || 0)));
+    setAutoSyncMins(clamped);
+    try { await api.setAutoSyncInterval(clamped); }
+    catch (e) { showToast("Failed: " + e); }
+  };
 
   const onAutoUnlockToggle = async (v: boolean) => {
     if (!v) {
@@ -1577,9 +1593,9 @@ function SettingsView({ session, setSession, showToast }: {
   const confirmAutoUnlock = async () => {
     try {
       let allowPlaintext = false;
-      if (!biometric) {
+      if (!secureStore.biometric && !secureStore.keyring) {
         const ok = window.confirm(
-          "This device has no biometric secure store (Windows Hello / Touch ID).\n\n" +
+          "This device has no OS secure store (Windows Hello / Touch ID / system keyring).\n\n" +
           "To unlock automatically, your password will be saved to disk, encrypted with a key " +
           "that is itself stored IN PLAIN TEXT on this PC. Anyone with access to this computer " +
           "could recover your password and decrypt your photos.\n\nEnable anyway?"
@@ -1589,7 +1605,11 @@ function SettingsView({ session, setSession, showToast }: {
       }
       const r = await api.enableAutoUnlock(auPassword, allowPlaintext);
       setAutoUnlock(true); setAuPrompt(false); setAuPassword("");
-      showToast(r.used_plaintext ? "Auto-unlock enabled (plaintext key)" : "Auto-unlock enabled");
+      showToast(
+        r.store === "biometric" ? "Auto-unlock enabled (Windows Hello / Touch ID)"
+        : r.store === "keyring" ? "Auto-unlock enabled (system keyring)"
+        : "Auto-unlock enabled (plaintext key)"
+      );
     } catch (e) { showToast("Failed: " + e); }
   };
 
@@ -1711,9 +1731,11 @@ function SettingsView({ session, setSession, showToast }: {
             <span>
               Unlock automatically on startup
               <span className="muted" style={{ display: "block", fontSize: 12 }}>
-                {biometric
+                {secureStore.biometric
                   ? "Your password is encrypted with a key protected by Windows Hello / Touch ID."
-                  : "No biometric store on this device — enabling will save a key in plain text (you'll be warned)."}
+                  : secureStore.keyring
+                  ? "Your password is encrypted with a key kept in your system keyring (login Keychain / GNOME Keyring / KWallet)."
+                  : "No secure store on this device — enabling will save a key in plain text (you'll be warned)."}
               </span>
             </span>
           </label>
@@ -1732,6 +1754,38 @@ function SettingsView({ session, setSession, showToast }: {
         {tab === "sync" && <>
         <div className="settings-section">
           <h3>Sync</h3>
+          <label className="opt-row">
+            <input type="checkbox" checked={autoSync} onChange={(e) => toggleAutoSync(e.target.checked)} />
+            <span>
+              Sync automatically in the background
+              <span className="muted" style={{ display: "block", fontSize: 12 }}>
+                While idle, periodically pull new photos and push local changes.
+              </span>
+            </span>
+          </label>
+          <label
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              padding: "7px 0 7px 26px",
+              opacity: autoSync ? 1 : 0.5,
+            }}
+          >
+            <span>Sync every</span>
+            <input
+              type="number"
+              min={1}
+              max={1440}
+              disabled={!autoSync}
+              value={autoSyncMins}
+              onChange={(e) => setAutoSyncMins(Number(e.target.value))}
+              onBlur={(e) => commitAutoSyncInterval(Number(e.target.value))}
+              onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+              style={{ width: 56 }}
+            />
+            <span>minutes</span>
+          </label>
           <label className="opt-row">
             <input type="checkbox" checked={syncEvery} onChange={(e) => toggleSyncEvery(e.target.checked)} />
             <span>
@@ -2069,7 +2123,7 @@ function Viewer({ items, index, set, albumId, onClose, onChanged, showToast, onT
           onDone={() => { onChanged(); onClose(); }} showToast={showToast} />
       </div>
       {i > 0 && <button className="nav-btn prev" onClick={(e) => { e.stopPropagation(); setI(i - 1); }}>‹</button>}
-      {isVid ? <video src={fullUrl} controls autoPlay onClick={stop}
+      {isVid ? <video src={videoUrl(set, f.filename, albumId)} controls autoPlay onClick={stop}
             onMouseDown={(e) => {
               // Start a drag only from the video frame, not the bottom controls bar.
               const r = (e.currentTarget as HTMLElement).getBoundingClientRect();

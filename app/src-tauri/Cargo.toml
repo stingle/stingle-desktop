@@ -34,7 +34,7 @@ dirs = "5"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
-# Auto-unlock secure key storage, gated behind a biometric prompt.
+# Auto-unlock secure key storage (see src/secure_store.rs for the tiers).
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Foundation",
@@ -47,4 +47,11 @@ windows = { version = "0.61", features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "3"
+# OSX_10_15 enables PasswordOptions::use_protected_keychain (the data-
+# protection keychain), required for the Touch ID-gated auto-unlock item.
+security-framework = { version = "3", features = ["OSX_10_15"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Auto-unlock key in the freedesktop Secret Service (GNOME Keyring / KWallet).
+# Pure-Rust zbus transport — no system libdbus needed at build or run time.
+secret-service = { version = "5", features = ["rt-tokio-crypto-rust"] }

@@ -81,7 +81,9 @@ impl Account {
     /// Decrypt a photo to raw RGBA pixels (for clipboard copy). Goes through
     /// [`media_response`] so formats the `image` crate can't read natively
     /// (HEIC/HEIF/TIFF) are first transcoded to JPEG via ffmpeg, exactly like
-    /// the full-screen preview. Errors for videos / undecodable media.
+    /// the full-screen preview. EXIF orientation is baked into the pixels —
+    /// clipboard consumers only ever see the raw raster, never the metadata.
+    /// Errors for videos / undecodable media.
     pub async fn decrypt_to_rgba(
         &self,
         set: FileSet,
@@ -92,7 +94,7 @@ impl Account {
         if resp.content_type.starts_with("video/") {
             return Err(CoreError::Other("cannot copy a video as an image".into()));
         }
-        let img = image::load_from_memory(&resp.body)
+        let img = crate::thumbnail::decode_with_orientation(&resp.body)
             .map_err(|err| CoreError::Other(format!("decode image: {err}")))?
             .to_rgba8();
         let (w, h) = img.dimensions();

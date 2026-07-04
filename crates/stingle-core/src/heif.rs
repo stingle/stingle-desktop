@@ -37,6 +37,15 @@ pub struct PrimaryImage {
     pub output_height: u32,
     /// `irot`/`imir` of the primary item, in association (application) order.
     pub transforms: Vec<Transform>,
+    /// Whether the primary item has ANY `irot`/`imir` association — including
+    /// an identity rotation, which still means the container speaks for the
+    /// orientation and the EXIF tag must be ignored.
+    pub has_transform_props: bool,
+    /// EXIF `Orientation` (1..=8) from the primary item's Exif metadata block.
+    /// Per HEIF, `transforms` are authoritative when declared; this is the
+    /// fallback for encoders (e.g. Samsung, the iPhone 17 front camera) that
+    /// record orientation only in EXIF.
+    pub exif_orientation: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +194,8 @@ struct Meta {
     item_types: HashMap<u32, [u8; 4]>,
     /// `dimg` references: derived item → source items, in order.
     dimg: HashMap<u32, Vec<u32>>,
+    /// `cdsc` references: metadata item (e.g. Exif) → described items.
+    cdsc: HashMap<u32, Vec<u32>>,
     iloc: HashMap<u32, ItemLocation>,
     /// Property boxes of `ipco`, in declaration order (indices are 1-based).
     ipco: Vec<BoxRef>,
@@ -256,7 +267,7 @@ fn parse_iref(buf: &[u8], b: BoxRef, meta: &mut Meta) -> Result<()> {
     let mut pos = r.pos;
     while pos + 8 <= b.end {
         let (refbox, next) = read_box(buf, pos, b.end)?;
-        if &refbox.typ == b"dimg" {
+        if matches!(&refbox.typ, b"dimg" | b"cdsc") {
             let mut rr = Reader::new(buf, refbox);
             let from = if v == 0 { rr.u16()? as u32 } else { rr.u32()? };
             let n = rr.u16()?;
@@ -264,7 +275,11 @@ fn parse_iref(buf: &[u8], b: BoxRef, meta: &mut Meta) -> Result<()> {
             for _ in 0..n {
                 to.push(if v == 0 { rr.u16()? as u32 } else { rr.u32()? });
             }
-            meta.dimg.insert(from, to);
+            if &refbox.typ == b"dimg" {
+                meta.dimg.insert(from, to);
+            } else {
+                meta.cdsc.insert(from, to);
+            }
         }
         pos = next;
     }
@@ -378,6 +393,69 @@ fn find_ispe(buf: &[u8], meta: &Meta, item_id: u32) -> Option<(u32, u32)> {
             let w = u32::from_be_bytes(payload[4..8].try_into().unwrap());
             let h = u32::from_be_bytes(payload[8..12].try_into().unwrap());
             return Some((w, h));
+        }
+    }
+    None
+}
+
+/// EXIF `Orientation` of the Exif metadata item describing `item_id`, if any.
+///
+/// An Exif item is linked to the image it describes by a `cdsc` reference;
+/// prefer one that references `item_id`, but accept an unlinked Exif item as a
+/// fallback (some encoders omit the reference in single-image files). Item ids
+/// are tried in sorted order so the choice is deterministic.
+fn find_exif_orientation(buf: &[u8], meta: &Meta, item_id: u32) -> Option<u8> {
+    let mut exif_ids: Vec<u32> = meta
+        .item_types
+        .iter()
+        .filter(|(_, t)| *t == b"Exif")
+        .map(|(&id, _)| id)
+        .collect();
+    exif_ids.sort_unstable();
+    let chosen = exif_ids
+        .iter()
+        .find(|id| meta.cdsc.get(id).is_some_and(|refs| refs.contains(&item_id)))
+        .or_else(|| exif_ids.iter().find(|id| !meta.cdsc.contains_key(id)))?;
+    let data = item_data(buf, meta, *chosen).ok()?;
+    parse_exif_orientation(&data)
+}
+
+/// Parse a HEIF `Exif` item payload (ISO 23008-12 A.2.1: a 4-byte
+/// exif_tiff_header_offset, then the EXIF payload — typically `Exif\0\0` +
+/// TIFF) and return the `Orientation` tag's value.
+fn parse_exif_orientation(data: &[u8]) -> Option<u8> {
+    let hdr_off = u32::from_be_bytes(data.get(..4)?.try_into().ok()?) as usize;
+    let tiff = data.get(4usize.checked_add(hdr_off)?..)?;
+    tiff_orientation(tiff)
+}
+
+/// `Orientation` (tag 0x0112, a SHORT in IFD0) from a TIFF blob. Returns only
+/// valid values (1..=8); anything malformed yields `None`.
+fn tiff_orientation(tiff: &[u8]) -> Option<u8> {
+    let le = match tiff.get(..4)? {
+        b"II*\0" => true,
+        b"MM\0*" => false,
+        _ => return None,
+    };
+    let rd16 = |b: &[u8]| -> Option<u16> {
+        let a: [u8; 2] = b.get(..2)?.try_into().ok()?;
+        Some(if le { u16::from_le_bytes(a) } else { u16::from_be_bytes(a) })
+    };
+    let rd32 = |b: &[u8]| -> Option<u32> {
+        let a: [u8; 4] = b.get(..4)?.try_into().ok()?;
+        Some(if le { u32::from_le_bytes(a) } else { u32::from_be_bytes(a) })
+    };
+    let ifd = rd32(tiff.get(4..)?)? as usize;
+    let count = rd16(tiff.get(ifd..)?)? as usize;
+    for i in 0..count {
+        // Entry: tag(2) type(2) count(4) value(4); short values left-justified.
+        let e = tiff.get(ifd.checked_add(2 + i * 12)?..)?;
+        if rd16(e)? == 0x0112 {
+            if rd16(e.get(2..)?)? != 3 || rd32(e.get(4..)?)? == 0 {
+                return None;
+            }
+            let v = rd16(e.get(8..)?)?;
+            return u8::try_from(v).ok().filter(|v| (1..=8).contains(v));
         }
     }
     None
@@ -550,7 +628,10 @@ pub fn parse_primary(buf: &[u8]) -> Result<PrimaryImage> {
     }
 
     // Transformative properties of the PRIMARY item, in association order.
-    let transforms = item_props(buf, &meta, primary)
+    let props = item_props(buf, &meta, primary);
+    let has_transform_props =
+        props.iter().any(|(b, _)| matches!(&b.typ, b"irot" | b"imir"));
+    let transforms = props
         .into_iter()
         .filter_map(|(b, payload)| match (&b.typ, payload.first()) {
             (b"irot", Some(&v)) if v & 3 != 0 => Some(Transform::Rotate(v & 3)),
@@ -573,6 +654,8 @@ pub fn parse_primary(buf: &[u8]) -> Result<PrimaryImage> {
         output_width: out_w,
         output_height: out_h,
         transforms,
+        has_transform_props,
+        exif_orientation: find_exif_orientation(buf, &meta, primary),
     })
 }
 
@@ -601,15 +684,35 @@ mod tests {
     /// A synthetic two-tile (1 row × 2 cols) grid HEIC. The "HEVC" payloads are
     /// dummies — the parser never decodes video, it only slices the container.
     /// Layout mimics an iPhone file: primary=grid(id 1) → tiles 2,3; an extra
-    /// "auxiliary" hvc1 item (id 4) that must NOT be picked; iloc v1 with
-    /// construction methods 0 (mdat) and 1 (idat, for the grid payload).
-    fn synthetic_heic() -> Vec<u8> {
+    /// "auxiliary" hvc1 item (id 4) that must NOT be picked; an Exif item
+    /// (id 5, cdsc → primary) with Orientation = 3; iloc v1 with construction
+    /// methods 0 (mdat) and 1 (idat, for the grid payload). `with_irot`
+    /// controls whether the primary gets the irot association — off mimics
+    /// encoders that record orientation only in EXIF.
+    fn synthetic_heic_ext(with_irot: bool) -> Vec<u8> {
         let ftyp = mkbox(b"ftyp", b"heic\0\0\0\0mif1heic");
 
         // grid payload (in idat): 1x2, output 6x4 (16-bit fields)
         let grid_payload: &[u8] = &[0, 0, 0, 1, 0, 6, 0, 4];
 
-        // infe entries (v2): ids 1..4
+        // Exif item payload: 4-byte tiff-header offset, "Exif\0\0", then a
+        // little-endian TIFF whose IFD0 holds Orientation (0x0112) = 3.
+        let exif_payload: Vec<u8> = {
+            let mut p = vec![0, 0, 0, 6];
+            p.extend_from_slice(b"Exif\0\0");
+            p.extend_from_slice(b"II*\0");
+            p.extend_from_slice(&8u32.to_le_bytes()); // IFD0 offset
+            p.extend_from_slice(&1u16.to_le_bytes()); // entry count
+            p.extend_from_slice(&0x0112u16.to_le_bytes()); // Orientation
+            p.extend_from_slice(&3u16.to_le_bytes()); // type SHORT
+            p.extend_from_slice(&1u32.to_le_bytes()); // count
+            p.extend_from_slice(&3u16.to_le_bytes()); // value = 3 (rotate 180)
+            p.extend_from_slice(&0u16.to_le_bytes()); // value padding
+            p.extend_from_slice(&0u32.to_le_bytes()); // next-IFD offset
+            p
+        };
+
+        // infe entries (v2): ids 1..5
         let infe = |id: u16, typ: &[u8; 4]| {
             let mut body = Vec::new();
             body.extend_from_slice(&id.to_be_bytes());
@@ -618,21 +721,33 @@ mod tests {
             body.push(0); // empty item_name
             fullbox(b"infe", 2, 0, &body)
         };
-        let mut iinf_body = 4u16.to_be_bytes().to_vec();
-        for b in [infe(1, b"grid"), infe(2, b"hvc1"), infe(3, b"hvc1"), infe(4, b"hvc1")] {
+        let mut iinf_body = 5u16.to_be_bytes().to_vec();
+        for b in [
+            infe(1, b"grid"),
+            infe(2, b"hvc1"),
+            infe(3, b"hvc1"),
+            infe(4, b"hvc1"),
+            infe(5, b"Exif"),
+        ] {
             iinf_body.extend_from_slice(&b);
         }
         let iinf = fullbox(b"iinf", 0, 0, &iinf_body);
 
         let pitm = fullbox(b"pitm", 0, 0, &1u16.to_be_bytes());
 
-        // iref v0: dimg from 1 -> [2, 3]
+        // iref v0: dimg from 1 -> [2, 3]; cdsc from 5 -> [1]
         let mut dimg_body = Vec::new();
         dimg_body.extend_from_slice(&1u16.to_be_bytes());
         dimg_body.extend_from_slice(&2u16.to_be_bytes());
         dimg_body.extend_from_slice(&2u16.to_be_bytes());
         dimg_body.extend_from_slice(&3u16.to_be_bytes());
-        let iref = fullbox(b"iref", 0, 0, &mkbox(b"dimg", &dimg_body));
+        let mut cdsc_body = Vec::new();
+        cdsc_body.extend_from_slice(&5u16.to_be_bytes());
+        cdsc_body.extend_from_slice(&1u16.to_be_bytes());
+        cdsc_body.extend_from_slice(&1u16.to_be_bytes());
+        let mut iref_body = mkbox(b"dimg", &dimg_body);
+        iref_body.extend_from_slice(&mkbox(b"cdsc", &cdsc_body));
+        let iref = fullbox(b"iref", 0, 0, &iref_body);
 
         // ipco: [1]=hvcC, [2]=ispe(tile 3x4), [3]=ispe(grid 6x4), [4]=irot(1)
         // hvcC: 22 bytes header with lengthSizeMinusOne=3, 1 array, 1 "SPS" [0xAA,0xBB]
@@ -654,8 +769,9 @@ mod tests {
         let ipco = mkbox(b"ipco", &ipco_body);
 
         // ipma v0 flags0: item1 -> [3(ispe grid), 4(irot)]; items 2,3,4 -> [1(hvcC), 2(ispe)]
+        let item1_props = if with_irot { vec![3u8, 4] } else { vec![3u8] };
         let mut ipma_body = 4u32.to_be_bytes().to_vec();
-        for (id, props) in [(1u16, vec![3u8, 4]), (2, vec![1, 2]), (3, vec![1, 2]), (4, vec![1, 2])]
+        for (id, props) in [(1u16, item1_props), (2, vec![1, 2]), (3, vec![1, 2]), (4, vec![1, 2])]
         {
             ipma_body.extend_from_slice(&id.to_be_bytes());
             ipma_body.push(props.len() as u8);
@@ -676,15 +792,17 @@ mod tests {
         mdat_payload.extend_from_slice(tile2);
         mdat_payload.extend_from_slice(tile3);
         mdat_payload.extend_from_slice(aux4);
+        mdat_payload.extend_from_slice(&exif_payload);
         let mdat = mkbox(b"mdat", &mdat_payload);
 
-        // iloc v1: item1 via idat (method 1), items 2-4 via absolute offsets
+        // iloc v1: item1 via idat (method 1), items 2-5 via absolute offsets
         // (method 0). Offsets into mdat are computed after layout below.
+        let exif_len = exif_payload.len() as u32;
         let build = |mdat_start: usize| {
             let mut body = Vec::new();
             body.push(0x44); // offset_size=4, length_size=4
             body.push(0x40); // base_offset_size=4, index_size=0
-            body.extend_from_slice(&4u16.to_be_bytes()); // item_count
+            body.extend_from_slice(&5u16.to_be_bytes()); // item_count
             let mut item = |id: u16, method: u16, base: u32, off: u32, len: u32| {
                 body.extend_from_slice(&id.to_be_bytes());
                 body.extend_from_slice(&method.to_be_bytes());
@@ -699,6 +817,7 @@ mod tests {
             item(2, 0, m, 0, 7);
             item(3, 0, m, 7, 6);
             item(4, 0, m, 13, 5);
+            item(5, 0, m, 18, exif_len);
             fullbox(b"iloc", 1, 0, &body)
         };
 
@@ -720,6 +839,10 @@ mod tests {
         let (file, actual) = assemble(build(guess));
         assert_eq!(guess, actual, "layout must be stable across passes");
         file
+    }
+
+    fn synthetic_heic() -> Vec<u8> {
+        synthetic_heic_ext(true)
     }
 
     #[test]
@@ -752,6 +875,60 @@ mod tests {
         expected.extend_from_slice(&[0x44, 0x55]);
         assert_eq!(img.annexb, expected);
         assert!(!img.annexb.contains(&0x99));
+    }
+
+    #[test]
+    fn exif_orientation_and_transform_presence() {
+        // irot associated: the container speaks for orientation — the EXIF tag
+        // is still exposed, but flagged as overridden.
+        let img = parse_primary(&synthetic_heic()).expect("parse");
+        assert_eq!(img.exif_orientation, Some(3));
+        assert!(img.has_transform_props);
+
+        // No irot/imir association (Samsung / iPhone-17-front-camera style):
+        // EXIF is the only orientation source.
+        let img = parse_primary(&synthetic_heic_ext(false)).expect("parse");
+        assert_eq!(img.exif_orientation, Some(3));
+        assert!(!img.has_transform_props);
+        assert!(img.transforms.is_empty());
+    }
+
+    #[test]
+    fn parses_exif_orientation_payloads() {
+        // Big-endian TIFF, orientation 6, with a leading unrelated tag.
+        let mut p = vec![0, 0, 0, 6];
+        p.extend_from_slice(b"Exif\0\0");
+        p.extend_from_slice(b"MM\0*");
+        p.extend_from_slice(&8u32.to_be_bytes()); // IFD0 offset
+        p.extend_from_slice(&2u16.to_be_bytes()); // entry count
+        p.extend_from_slice(&0x0100u16.to_be_bytes()); // ImageWidth
+        p.extend_from_slice(&3u16.to_be_bytes());
+        p.extend_from_slice(&1u32.to_be_bytes());
+        p.extend_from_slice(&64u16.to_be_bytes());
+        p.extend_from_slice(&0u16.to_be_bytes());
+        p.extend_from_slice(&0x0112u16.to_be_bytes()); // Orientation
+        p.extend_from_slice(&3u16.to_be_bytes());
+        p.extend_from_slice(&1u32.to_be_bytes());
+        p.extend_from_slice(&6u16.to_be_bytes());
+        p.extend_from_slice(&0u16.to_be_bytes());
+        p.extend_from_slice(&0u32.to_be_bytes());
+        assert_eq!(parse_exif_orientation(&p), Some(6));
+
+        // Out-of-range orientation value → rejected.
+        let mut bad = p.clone();
+        let vpos = p.len() - 8; // first value byte of the Orientation entry
+        bad[vpos] = 0;
+        bad[vpos + 1] = 9;
+        assert_eq!(parse_exif_orientation(&bad), None);
+
+        // Wrong TIFF magic, truncation, or a header offset past the end → None.
+        let mut wrong = p.clone();
+        wrong[10] = b'X';
+        assert_eq!(parse_exif_orientation(&wrong), None);
+        assert_eq!(parse_exif_orientation(&p[..16]), None);
+        let mut far = p.clone();
+        far[..4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_exif_orientation(&far), None);
     }
 
     #[test]

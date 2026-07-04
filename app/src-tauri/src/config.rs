@@ -13,6 +13,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Default interval between automatic background ("idle") syncs.
+pub const DEFAULT_AUTO_SYNC_INTERVAL_SECS: u64 = 600;
+/// Floor for the auto-sync interval, so a tiny value can't hammer the server.
+pub const MIN_AUTO_SYNC_INTERVAL_SECS: u64 = 60;
+
 /// The `secretbox`-encrypted account password, persisted so the app can unlock
 /// itself after retrieving the symmetric key from the OS secure store. Only the
 /// ciphertext lives here — the key never touches this file.
@@ -61,6 +66,13 @@ pub struct AppConfig {
     pub auto_update: Option<bool>,
     /// Continuously sync & download all originals in the background.
     pub sync_everything: bool,
+    /// Periodically run a background sync while the app is idle. `None` defaults
+    /// to enabled; `Some(false)` disables it. (Tri-state like `auto_update` so an
+    /// old config file without the field still defaults to on.)
+    pub auto_sync: Option<bool>,
+    /// Interval between automatic idle syncs, in seconds. `None` uses
+    /// `DEFAULT_AUTO_SYNC_INTERVAL_SECS`; values below the floor are clamped up.
+    pub auto_sync_interval_secs: Option<u64>,
     /// Folders watched for new media to auto-import (each with its own
     /// delete-after-import setting).
     pub watch_folders: Vec<WatchFolder>,
@@ -113,6 +125,19 @@ impl AppConfig {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let bytes = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
         std::fs::write(config_file(), bytes).map_err(|e| e.to_string())
+    }
+
+    /// Whether the periodic idle-sync is enabled (defaults to on).
+    pub fn auto_sync_enabled(&self) -> bool {
+        self.auto_sync.unwrap_or(true)
+    }
+
+    /// The effective idle-sync interval in seconds: the configured value clamped
+    /// to at least `MIN_AUTO_SYNC_INTERVAL_SECS`, or the default when unset.
+    pub fn auto_sync_interval(&self) -> u64 {
+        self.auto_sync_interval_secs
+            .map(|s| s.max(MIN_AUTO_SYNC_INTERVAL_SECS))
+            .unwrap_or(DEFAULT_AUTO_SYNC_INTERVAL_SECS)
     }
 
     /// The directory that holds the per-account folders. When the user has chosen

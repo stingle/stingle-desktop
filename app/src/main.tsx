@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import { initVideoServer } from "./api";
 import "./styles.css";
 
 // Suppress the webview's native context menu (Save image as / Copy image / etc.).
@@ -13,8 +14,13 @@ document.addEventListener("contextmenu", (e) => {
   e.preventDefault();
 });
 
-ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-);
+// On Linux videos stream from a loopback HTTP server (WebKitGTK can't play
+// custom-scheme media); resolve its address before the first render so
+// videoUrl() is always ready. One fast IPC call — imperceptible at startup.
+initVideoServer().finally(() => {
+  ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>,
+  );
+});

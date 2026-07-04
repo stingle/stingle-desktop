@@ -14,9 +14,11 @@ fn main() {
     let bytes = std::fs::read(&input).expect("read input");
     match stingle_core::heif::parse_primary(&bytes) {
         Ok(p) => println!(
-            "primary item: {} tile(s) of {}x{} in a {}x{} grid -> {}x{}, transforms {:?}, {} bytes HEVC",
+            "primary item: {} tile(s) of {}x{} in a {}x{} grid -> {}x{}, transforms {:?} \
+             (declared: {}), exif orientation {:?}, {} bytes HEVC",
             p.tile_count, p.tile_width, p.tile_height, p.rows, p.cols,
-            p.output_width, p.output_height, p.transforms, p.annexb.len(),
+            p.output_width, p.output_height, p.transforms, p.has_transform_props,
+            p.exif_orientation, p.annexb.len(),
         ),
         Err(e) => println!("container parse failed ({e}) — transcode will use the ffmpeg fallback"),
     }

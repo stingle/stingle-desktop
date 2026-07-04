@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 
 mod clipboard_files;
 mod config;
+mod media_server;
 mod secure_store;
 mod tray;
 mod updater;
@@ -45,12 +46,23 @@ pub struct AppState {
     account: Mutex<Option<Arc<Account>>>,
     /// Handle to the background continuous-sync loop, if running.
     sync_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    /// Handle to the always-on periodic idle-sync loop, if started.
+    idle_sync_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    /// Serializes sync passes (`sync_cloud_to_local` + `upload_to_cloud`) so a
+    /// manual sync and the periodic idle-sync never run concurrently. The idle
+    /// loop `try_lock`s it and skips its tick when the guard is held — that's
+    /// how "sync only while idle" is enforced.
+    sync_guard: Arc<Mutex<()>>,
     /// Handle to the background watch-folder import loop, if running.
     watch_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     /// An update downloaded at startup (auto-update on) but not yet installed;
     /// applied when the app quits. A plain `std::sync::Mutex` so the quit handler
     /// (sync context) can lock it without a runtime.
     staged_update: std::sync::Mutex<Option<updater::StagedUpdate>>,
+    /// Port + auth token of the loopback video server, set once at startup on
+    /// Linux (WebKitGTK can't play custom-scheme media — see `media_server`).
+    /// Stays unset on Windows/macOS where stingle:// videos work natively.
+    video_server: std::sync::OnceLock<(u16, String)>,
 }
 
 impl AppState {
@@ -71,8 +83,11 @@ impl AppState {
             minimize_to_tray: AtomicBool::new(minimize),
             account: Mutex::new(None),
             sync_task: Mutex::new(None),
+            idle_sync_task: Mutex::new(None),
+            sync_guard: Arc::new(Mutex::new(())),
             watch_task: Mutex::new(None),
             staged_update: std::sync::Mutex::new(None),
+            video_server: std::sync::OnceLock::new(),
         }
     }
 
@@ -362,6 +377,9 @@ async fn handle_session_expired(app: &tauri::AppHandle, state: &AppState) {
 #[tauri::command]
 async fn sync(app: tauri::AppHandle, state: State<'_, AppState>) -> CmdResult<SyncResultDto> {
     let acc = state.current().await.ok_or("Not logged in")?;
+    // Hold the sync guard for the metadata+upload phases so the periodic
+    // idle-sync loop backs off while a manual sync is running.
+    let _sync_guard = state.sync_guard.lock().await;
     // Run the two sync phases directly (instead of full_sync) so we can surface
     // per-file upload progress to the UI between the metadata pull and prefetch.
     if let Err(err) = acc.sync_cloud_to_local().await {
@@ -1028,6 +1046,16 @@ fn get_app_version(app: tauri::AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
+/// Base URL (`http://127.0.0.1:<port>/<token>`) of the loopback video server,
+/// or `None` on platforms where videos stream via stingle:// directly.
+#[tauri::command]
+fn video_server_base(state: State<'_, AppState>) -> Option<String> {
+    state
+        .video_server
+        .get()
+        .map(|(port, token)| format!("http://127.0.0.1:{port}/{token}"))
+}
+
 /// Manual "check for updates now": returns the new version string if one is
 /// available, else `None`.
 #[tauri::command]
@@ -1084,12 +1112,17 @@ async fn get_storage_path(state: State<'_, AppState>) -> CmdResult<String> {
 #[derive(Serialize)]
 struct SecureStoreStatusDto {
     biometric: bool,
+    keyring: bool,
 }
 
+// async: the availability probes touch the OS keychain / D-Bus and must not
+// run on the main thread (sync Tauri commands do).
 #[tauri::command]
-fn secure_store_status() -> SecureStoreStatusDto {
+async fn secure_store_status() -> SecureStoreStatusDto {
+    let avail = secure_store::availability();
     SecureStoreStatusDto {
-        biometric: secure_store::biometric_available(),
+        biometric: avail.biometric,
+        keyring: avail.keyring,
     }
 }
 
@@ -1100,7 +1133,8 @@ async fn is_auto_unlock_enabled(state: State<'_, AppState>) -> CmdResult<bool> {
 
 #[derive(Serialize)]
 struct EnableAutoUnlockDto {
-    used_plaintext: bool,
+    /// Which tier holds the key: "biometric" | "keyring" | "plaintext".
+    store: &'static str,
 }
 
 #[tauri::command]
@@ -1125,13 +1159,13 @@ async fn enable_auto_unlock(
     let cipher =
         stingle_crypto::sodium::secretbox_easy(&key, &nonce, password.as_bytes()).map_err(e)?;
 
-    // Store the key: biometric store if available, else plaintext on opt-in only.
-    let used_plaintext = if secure_store::biometric_available() {
-        secure_store::store_biometric(&account_key, &key)?;
-        false
+    // Store the key: best secure store if any, else plaintext on opt-in only.
+    let avail = secure_store::availability();
+    let kind = if avail.biometric || avail.keyring {
+        secure_store::store_secure(&account_key, &key)?
     } else if allow_plaintext {
         secure_store::store_plaintext(&account_key, &key)?;
-        true
+        secure_store::StoreKind::Plaintext
     } else {
         return Err("No secure store available; plaintext fallback was not permitted".into());
     };
@@ -1145,7 +1179,9 @@ async fn enable_auto_unlock(
     });
     cfg.last_account = Some(account_key);
     cfg.save()?;
-    Ok(EnableAutoUnlockDto { used_plaintext })
+    Ok(EnableAutoUnlockDto {
+        store: kind.as_str(),
+    })
 }
 
 #[tauri::command]
@@ -1246,6 +1282,78 @@ async fn stop_sync_loop(state: &AppState) {
     }
 }
 
+/// Start the always-on periodic idle-sync loop (no-op if already running).
+///
+/// Every `auto_sync_interval` (from config) it pulls new cloud metadata, pushes
+/// local changes, and prefetches thumbnails — but only *while idle*: it skips the
+/// tick when disabled in settings, logged out, when the "sync everything" loop
+/// already handles this, or when another sync holds `sync_guard`. Started once at
+/// launch; it self-idles until an account is unlocked, so it never needs stopping.
+async fn start_idle_sync_loop(app: tauri::AppHandle, state: &AppState) {
+    let mut guard = state.idle_sync_task.lock().await;
+    if guard.is_some() {
+        return;
+    }
+    let app2 = app.clone();
+    let handle = tauri::async_runtime::spawn(async move {
+        loop {
+            // Re-read the interval each cycle so a tuned value takes effect on the
+            // next tick without restarting the loop.
+            let interval = app2.state::<AppState>().config.lock().await.auto_sync_interval();
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            let state = app2.state::<AppState>();
+            // Skip while disabled (keep looping so re-enabling takes effect) or
+            // while the continuous "sync everything" loop already covers this.
+            {
+                let cfg = state.config.lock().await;
+                if !cfg.auto_sync_enabled() || cfg.sync_everything {
+                    continue;
+                }
+            }
+            let Some(acc) = state.current().await else { continue };
+            // Only sync while idle: if a manual sync is running, skip this tick.
+            let synced;
+            let uploaded;
+            {
+                let Ok(_busy) = state.sync_guard.try_lock() else { continue };
+                let app_up = app2.clone();
+                let upcb = move |done: usize, total: usize| {
+                    let _ = app_up.emit("upload-progress", (done, total));
+                };
+                synced = acc.sync_cloud_to_local().await;
+                uploaded = if synced.is_ok() {
+                    acc.upload_to_cloud(Some(&upcb)).await
+                } else {
+                    Ok(())
+                };
+                let _ = app2.emit("upload-done", ());
+            }
+            if let Err(err) = synced.and(uploaded) {
+                if err.is_logged_out() {
+                    // Token died: tear down the session so we stop hammering the
+                    // server with a dead token (mirrors the "sync everything"
+                    // loop). The loop keeps running, idling until the next login.
+                    if let Some(a) = state.account.lock().await.take() {
+                        a.request_stop_originals();
+                    }
+                    stop_sync_loop(&state).await;
+                    let _ = app2.emit("session-expired", ());
+                }
+                continue;
+            }
+            // Prefetch any newly-arrived thumbnails (unguarded — a plain fetch,
+            // safe to overlap a manual sync's own prefetch).
+            let app_cb = app2.clone();
+            let cb = move |done: usize, total: usize| {
+                let _ = app_cb.emit("thumbs-progress", (done, total));
+            };
+            let n = acc.download_all_thumbs(64, Some(&cb)).await.unwrap_or(0);
+            let _ = app2.emit("thumbs-done", n);
+        }
+    });
+    *guard = Some(handle);
+}
+
 #[tauri::command]
 async fn get_sync_everything(state: State<'_, AppState>) -> CmdResult<bool> {
     Ok(state.config.lock().await.sync_everything)
@@ -1276,6 +1384,36 @@ async fn set_sync_everything(
         let _ = app.emit("originals-done", 0usize);
         let _ = app.emit("upload-done", ());
     }
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_auto_sync(state: State<'_, AppState>) -> CmdResult<bool> {
+    Ok(state.config.lock().await.auto_sync_enabled())
+}
+
+#[tauri::command]
+async fn set_auto_sync(state: State<'_, AppState>, enabled: bool) -> CmdResult<()> {
+    let mut cfg = state.config.lock().await;
+    cfg.auto_sync = Some(enabled);
+    cfg.save()?;
+    Ok(())
+}
+
+/// The idle-sync interval in **minutes** (what the UI shows), clamped to the
+/// configured floor.
+#[tauri::command]
+async fn get_auto_sync_interval(state: State<'_, AppState>) -> CmdResult<u64> {
+    Ok(state.config.lock().await.auto_sync_interval() / 60)
+}
+
+/// Set the idle-sync interval, given in **minutes**; stored in seconds and
+/// clamped to at least 1 minute. Takes effect on the loop's next tick.
+#[tauri::command]
+async fn set_auto_sync_interval(state: State<'_, AppState>, minutes: u64) -> CmdResult<()> {
+    let mut cfg = state.config.lock().await;
+    cfg.auto_sync_interval_secs = Some(minutes.saturating_mul(60).max(config::MIN_AUTO_SYNC_INTERVAL_SECS));
+    cfg.save()?;
     Ok(())
 }
 
@@ -1559,27 +1697,32 @@ fn not_found() -> tauri::http::Response<Vec<u8>> {
         .unwrap()
 }
 
+/// Split a `<set>!<isThumb>!<album-or-->!<filename>` media payload into its
+/// decoded components. Delimiter is `!` (never appears in base64, never
+/// percent-encoded), so a `/`, `+` or `=` inside a base64 filename/album-id
+/// can't break parsing. Each component is percent-decoded back to its raw
+/// value. Shared by the stingle:// protocol and the Linux loopback video
+/// server, whose URLs carry the identical payload.
+fn parse_media_path(raw_path: &str) -> Option<(FileSet, bool, Option<String>, String)> {
+    let parts: Vec<&str> = raw_path.trim_start_matches('/').splitn(4, '!').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let set = set_from_i32(parts[0].parse().unwrap_or(0));
+    let is_thumb = parts[1] == "1";
+    let album_dec = percent_decode(parts[2]);
+    let album = if album_dec == "-" { None } else { Some(album_dec) };
+    Some((set, is_thumb, album, percent_decode(parts[3])))
+}
+
 async fn build_media_response(
     app: tauri::AppHandle,
     raw_path: String,
     range_header: Option<String>,
 ) -> tauri::http::Response<Vec<u8>> {
-    // Delimiter is `!` (never appears in base64, never percent-encoded), so a
-    // `/`, `+` or `=` inside a base64 filename/album-id can't break parsing.
-    // Each component is then percent-decoded back to its raw value.
-    let parts: Vec<&str> = raw_path.trim_start_matches('/').splitn(4, '!').collect();
-    if parts.len() < 4 {
+    let Some((set, is_thumb, album, filename)) = parse_media_path(&raw_path) else {
         return not_found();
-    }
-    let set = set_from_i32(parts[0].parse().unwrap_or(0));
-    let is_thumb = parts[1] == "1";
-    let album_dec = percent_decode(parts[2]);
-    let album = if album_dec == "-" {
-        None
-    } else {
-        Some(album_dec.as_str())
     };
-    let filename = percent_decode(parts[3]);
     let range = range_header.as_deref().and_then(parse_range);
 
     // Clone the account handle and release the state lock immediately so many
@@ -1589,7 +1732,10 @@ async fn build_media_response(
         None => return not_found(),
     };
 
-    match acc.media_response(set, album, &filename, is_thumb, range).await {
+    match acc
+        .media_response(set, album.as_deref(), &filename, is_thumb, range)
+        .await
+    {
         Ok(m) => {
             let builder = tauri::http::Response::builder()
                 .header("Accept-Ranges", "bytes")
@@ -1695,6 +1841,19 @@ pub fn run() {
         })
         .setup(|app| {
             tray::setup_tray(app.handle())?;
+            // Linux: WebKitGTK's GStreamer media player can't load
+            // custom-scheme URLs (WebKit bug 146351), so videos stream from a
+            // token-guarded loopback HTTP server instead of stingle://.
+            // Bound synchronously so `video_server_base` is ready before the
+            // webview's first request.
+            if cfg!(target_os = "linux") {
+                match tauri::async_runtime::block_on(media_server::start(app.handle().clone())) {
+                    Ok(info) => {
+                        let _ = app.state::<AppState>().video_server.set(info);
+                    }
+                    Err(err) => tracing::warn!("video server failed to start: {err}"),
+                }
+            }
             // The window starts hidden (`"visible": false`). Show it now unless
             // this is a login launch (carries `--minimized`) and the user asked
             // to start in the tray — in which case it stays hidden until they
@@ -1744,6 +1903,9 @@ pub fn run() {
                 if has_watch {
                     start_watch_loop(handle.clone(), &state).await;
                 }
+                // Always-on: syncs every 10 min while idle (self-idles until an
+                // account is unlocked, and backs off when the loops above run).
+                start_idle_sync_loop(handle.clone(), &state).await;
             });
             Ok(())
         })
@@ -1797,6 +1959,7 @@ pub fn run() {
             get_auto_update,
             set_auto_update,
             get_app_version,
+            video_server_base,
             check_for_update,
             install_update_now,
             get_autostart,
@@ -1810,6 +1973,10 @@ pub fn run() {
             try_auto_unlock,
             get_sync_everything,
             set_sync_everything,
+            get_auto_sync,
+            set_auto_sync,
+            get_auto_sync_interval,
+            set_auto_sync_interval,
             get_watch_folders,
             set_watch_folders,
             copy_to_clipboard,

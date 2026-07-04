@@ -117,10 +117,11 @@ export const api = {
   forgetAccount: (accountKey: string) =>
     invoke("forget_account", { accountKey }),
   // Auto-unlock
-  secureStoreStatus: () => invoke<{ biometric: boolean }>("secure_store_status"),
+  secureStoreStatus: () =>
+    invoke<{ biometric: boolean; keyring: boolean }>("secure_store_status"),
   isAutoUnlockEnabled: () => invoke<boolean>("is_auto_unlock_enabled"),
   enableAutoUnlock: (password: string, allowPlaintext: boolean) =>
-    invoke<{ used_plaintext: boolean }>("enable_auto_unlock", { password, allowPlaintext }),
+    invoke<{ store: "biometric" | "keyring" | "plaintext" }>("enable_auto_unlock", { password, allowPlaintext }),
   disableAutoUnlock: () => invoke("disable_auto_unlock"),
   tryAutoUnlock: () => invoke<Session>("try_auto_unlock"),
   // App options
@@ -132,6 +133,11 @@ export const api = {
   setStartMinimized: (enabled: boolean) => invoke("set_start_minimized", { enabled }),
   getSyncEverything: () => invoke<boolean>("get_sync_everything"),
   setSyncEverything: (enabled: boolean) => invoke("set_sync_everything", { enabled }),
+  getAutoSync: () => invoke<boolean>("get_auto_sync"),
+  setAutoSync: (enabled: boolean) => invoke("set_auto_sync", { enabled }),
+  /** Idle-sync interval, in minutes. */
+  getAutoSyncInterval: () => invoke<number>("get_auto_sync_interval"),
+  setAutoSyncInterval: (minutes: number) => invoke("set_auto_sync_interval", { minutes }),
   getWatchFolders: () => invoke<WatchFolder[]>("get_watch_folders"),
   setWatchFolders: (folders: WatchFolder[]) => invoke("set_watch_folders", { folders }),
   getStoragePath: () => invoke<string>("get_storage_path"),
@@ -167,6 +173,30 @@ export function mediaUrl(
   // `!` delimiter: never appears in base64 and is left untouched by
   // encodeURIComponent, so filenames/album-ids containing / + = parse cleanly.
   return convertFileSrc(`${set}!${isThumb ? 1 : 0}!${a}!${filename}`, "stingle");
+}
+
+/** Base URL of the loopback video server (Linux only). WebKitGTK's media
+ *  player can't load custom-scheme URLs, so <video> streams over
+ *  http://127.0.0.1 there; stays null on Windows/macOS where stingle://
+ *  videos work natively. */
+let videoServerBase: string | null = null;
+
+/** Resolve the video server base once, before the first render. */
+export async function initVideoServer(): Promise<void> {
+  try {
+    videoServerBase = await invoke<string | null>("video_server_base");
+  } catch {
+    videoServerBase = null;
+  }
+}
+
+/** URL for streaming a full-res video: loopback HTTP on Linux, stingle://
+ *  elsewhere. Same `!`-delimited payload as `mediaUrl`, but each part is
+ *  percent-encoded here since there's no `convertFileSrc` doing it for us. */
+export function videoUrl(set: number, filename: string, albumId?: string | null): string {
+  if (!videoServerBase) return mediaUrl(set, filename, false, albumId);
+  const a = albumId && albumId.length ? encodeURIComponent(albumId) : "-";
+  return `${videoServerBase}/${set}!0!${a}!${encodeURIComponent(filename)}`;
 }
 
 export async function pickFiles(): Promise<string[]> {
