@@ -29,7 +29,10 @@
     "targets": "all",
     "createUpdaterArtifacts": true,
     "macOS": {
-      "entitlements": "entitlements.plist"
+      "entitlements": "entitlements.plist",
+      "files": {
+        "embedded.provisionprofile": "embedded.provisionprofile"
+      }
     },
     "linux": {
       "appimage": {

@@ -89,6 +89,11 @@ async fn check_once(app: &AppHandle) {
 
 /// Install a staged update synchronously from the quit path. No-op if nothing is
 /// staged. Errors are logged, not propagated — the app is already exiting.
+///
+/// This path is crash-safe on macOS *because it only installs and exits* — it
+/// never re-execs the replaced binary. The caller quits right after (the user
+/// asked to quit), and the next launch is a fresh process. Contrast
+/// [`relaunch`], which must avoid the in-process re-exec.
 pub fn install_staged_on_exit(app: &AppHandle) {
     let staged = app
         .state::<AppState>()
@@ -101,4 +106,58 @@ pub fn install_staged_on_exit(app: &AppHandle) {
             tracing::warn!("staged update install failed: {err}");
         }
     }
+}
+
+/// Relaunch the app after applying an in-place update (the user-driven
+/// "restart to apply now" path).
+///
+/// On macOS, `AppHandle::restart()` `execv`s the executable that the updater
+/// just overwrote, straight from the still-running process. macOS still holds a
+/// cached code-signing verdict for that path — computed from the *pre-update*
+/// bytes — so the re-exec is killed with `SIGKILL (Code Signature Invalid)`.
+/// That is the "crash on update" users report (the freshly-swapped bundle is
+/// perfectly valid; only the in-process re-exec of it is rejected). Instead we
+/// launch a detached helper that waits for THIS process to fully exit — which
+/// releases the stale vnode — then opens a brand-new instance, and we exit
+/// cleanly here rather than exec-ing.
+#[cfg(target_os = "macos")]
+pub fn relaunch(app: &AppHandle) {
+    if let Some(bundle) = current_app_bundle() {
+        // Detached `sh`: spin (bounded to ~10s) until our pid is gone, add a
+        // small buffer, then re-open the bundle. Orphaned to launchd when we
+        // exit, so it outlives us.
+        let script = format!(
+            "i=0; while /bin/kill -0 {pid} 2>/dev/null && [ $i -lt 50 ]; \
+             do sleep 0.2; i=$((i+1)); done; sleep 0.4; /usr/bin/open \"{bundle}\"",
+            pid = std::process::id(),
+            bundle = bundle.to_string_lossy(),
+        );
+        if let Err(err) = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .spawn()
+        {
+            tracing::warn!("failed to spawn relaunch helper: {err}");
+        }
+    }
+    app.exit(0);
+}
+
+/// Path to the enclosing `.app` bundle (`.../Foo.app`), if we're running inside
+/// one. `current_exe()` is `.../Foo.app/Contents/MacOS/<bin>`, so we walk up to
+/// the first ancestor whose name ends in `.app`.
+#[cfg(target_os = "macos")]
+fn current_app_bundle() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    exe.ancestors()
+        .find(|p| p.extension().is_some_and(|ext| ext == "app"))
+        .map(|p| p.to_path_buf())
+}
+
+/// Non-macOS: the in-process re-exec is correct. Windows relaunches via the
+/// NSIS/MSI installer and Linux via the AppImage swap — neither has the macOS
+/// code-signing-vnode problem.
+#[cfg(not(target_os = "macos"))]
+pub fn relaunch(app: &AppHandle) {
+    app.restart();
 }

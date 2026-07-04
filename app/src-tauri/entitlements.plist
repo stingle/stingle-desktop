@@ -5,14 +5,31 @@
   <!--
     Grants access to the macOS *data-protection keychain*, which is the only
     keychain that honors SecAccessControl (the Touch ID / login-password gate
-    used by src/secure_store.rs for the auto-unlock key). Without this
-    entitlement a Developer ID app can only use the legacy login Keychain, and
-    the app silently falls back to the promptless "keyring" tier.
+    used by src/secure_store.rs for the auto-unlock key). Without it the app
+    silently falls back to the promptless, ungated login Keychain ("keyring"
+    tier) — the auto-unlock key then sits on disk readable by any process
+    running as the user with no biometric prompt.
+
+    IMPORTANT: on macOS these are *restricted* entitlements. Merely claiming
+    them in the signature is NOT enough — the OS ignores them (keychain calls
+    return errSecMissingEntitlement, -34018) unless they are ALSO allow-listed
+    by an embedded Developer ID *provisioning profile*. CI materializes that
+    profile into Contents/embedded.provisionprofile before signing (see
+    bundle.macOS.files in tauri.conf.json and .github/workflows/release.yml).
+    The profile is generated from an explicit App ID (org.stingle.desktop) with
+    the Keychain Sharing capability, and its allow-list must be a superset of
+    the entitlements below.
+
+    `application-identifier` is what establishes the app's default keychain
+    access group (TEAMID.org.stingle.desktop); without it SecItemAdd on the
+    data-protection keychain has no default group and also fails with -34018.
 
     __TEAM_ID__ is substituted with the real 10-char Apple Team ID at build
     time by .github/workflows/release.yml (from the APPLE_TEAM_ID secret), so
     no team-specific value is committed here.
   -->
+  <key>com.apple.application-identifier</key>
+  <string>__TEAM_ID__.org.stingle.desktop</string>
   <key>keychain-access-groups</key>
   <array>
     <string>__TEAM_ID__.org.stingle.desktop</string>

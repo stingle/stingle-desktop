@@ -1080,8 +1080,10 @@ async fn install_update_now(app: tauri::AppHandle) -> CmdResult<()> {
         .download_and_install(|_, _| {}, || {})
         .await
         .map_err(e)?;
-    app.restart();
-    #[allow(unreachable_code)]
+    // NOT `app.restart()`: on macOS that re-execs the just-overwritten binary
+    // in-process and macOS SIGKILLs it as "Code Signature Invalid". `relaunch`
+    // exits cleanly and re-opens a fresh instance instead. See updater.rs.
+    updater::relaunch(&app);
     Ok(())
 }
 

@@ -24,3 +24,6 @@ Thumbs.db
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# Materialized in CI from APPLE_PROVISIONING_PROFILE_BASE64 (see release.yml); never commit
+app/src-tauri/embedded.provisionprofile
