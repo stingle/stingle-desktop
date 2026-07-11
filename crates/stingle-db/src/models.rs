@@ -51,6 +51,9 @@ pub struct DbFile {
     pub date_created: i64,
     pub date_modified: i64,
     pub headers: String,
+    /// Derived from the encrypted header once (at ingest or lazy backfill);
+    /// `None` = not derived yet, so callers must fall back to decoding.
+    pub is_video: Option<bool>,
 }
 
 /// An album row.

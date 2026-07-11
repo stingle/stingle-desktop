@@ -144,19 +144,23 @@ a { color: var(--accent2); cursor: pointer; }
 .settings-tabs button:hover { color: var(--fg); }
 .settings-tabs button.active { color: var(--fg); border-bottom-color: var(--accent2); }
 
-/* Grid — square, cropped thumbnails, date-ordered */
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 8px; }
-.date-header { font-size: 13px; color: var(--muted); font-weight: 600; margin: 18px 2px 9px; }
-.date-header:first-child { margin-top: 0; }
+/* Grid — square, cropped thumbnails, date-ordered. The grid is VIRTUALIZED:
+   .grid-wrap gets an explicit total height; each row (.vrow / .date-header) is
+   absolutely positioned at its precomputed offset, and only rows near the
+   viewport are mounted. Tile size is computed in JS (same result as the old
+   `repeat(auto-fill, minmax(148px, 1fr))`). */
+.vrow { position: absolute; left: 0; right: 0; display: flex; gap: 8px; align-items: flex-start; }
+.date-header {
+  position: absolute; left: 0; right: 0;
+  display: flex; align-items: flex-end; padding: 0 2px 9px;
+  font-size: 13px; color: var(--muted); font-weight: 600;
+}
 .tile {
-  position: relative; aspect-ratio: 1; background: var(--bg3);
+  position: relative; flex: none; background: var(--bg3);
   border-radius: 8px; overflow: hidden; cursor: pointer; border: 2px solid transparent;
-  /* Let the browser skip layout/paint/raster for off-screen tiles. This is what
-     makes a 10k+ photo grid scroll smoothly without a JS virtualization library:
-     only tiles near the viewport are actually rendered. `auto` remembers each
-     tile's real size after first paint so the scrollbar stays stable. */
-  content-visibility: auto;
-  contain-intrinsic-size: auto 148px;
+  /* Fixed-size leaf boxes: keep their layout/paint churn (img loads, hover
+     badges) from ever invalidating anything outside the tile. */
+  contain: content;
 }
 .tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .tile .cover-btn {
@@ -268,3 +272,83 @@ a { color: var(--accent2); cursor: pointer; }
 .move-cover.special { background: linear-gradient(135deg, #2a2e38, #20232b); }
 .move-name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .move-count { font-size: 11px; color: var(--muted); }
+
+/* Share / members dialog */
+.share-dialog { width: 460px; max-width: 92vw; max-height: 82vh; overflow-y: auto; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; min-height: 30px; align-items: center; margin: 8px 0; }
+.chip { display: inline-flex; align-items: center; gap: 6px; background: var(--bg3); border: 1px solid var(--border); border-radius: 14px; padding: 4px 6px 4px 11px; font-size: 13px; }
+.chip button { border: none; background: transparent; color: var(--muted); padding: 0 2px; font-size: 12px; line-height: 1; }
+.chip button:hover { color: var(--accent); background: transparent; }
+.share-name-label { display: block; font-size: 12px; color: var(--muted); margin: 2px 0 6px; }
+.share-name-input { margin-bottom: 14px; }
+.share-add { display: flex; gap: 8px; margin-bottom: 10px; }
+.share-add input { flex: 1; }
+.contact-list { display: flex; flex-direction: column; gap: 2px; max-height: 240px; overflow-y: auto; margin-bottom: 10px; }
+.contact-row { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; background: transparent; border: none; border-radius: 8px; padding: 7px 8px; }
+.contact-row:hover { background: var(--bg3); }
+.contact-row.static { cursor: default; }
+.contact-row.static:hover { background: transparent; }
+.avatar { flex: 0 0 auto; width: 28px; height: 28px; border-radius: 50%; background: var(--accent2); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 600; }
+.avatar.big { width: 44px; height: 44px; font-size: 18px; }
+.c-email { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.c-add { color: var(--muted); font-size: 16px; }
+.c-remove { flex: 0 0 auto; font-size: 12px; padding: 4px 9px; }
+.c-remove:hover { border-color: var(--accent); color: var(--accent); }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+.perm-head { margin: 16px 0 4px; font-size: 14px; }
+.perm-list { display: flex; flex-direction: column; }
+.perm-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 9px 0; cursor: pointer; border-top: 1px solid var(--border); }
+.perm-row:first-child { border-top: none; }
+.perm-label { font-weight: 600; font-size: 14px; }
+.perm-desc { font-size: 12px; margin-top: 2px; }
+.perm-row input[type="checkbox"] { width: 18px; height: 18px; flex: 0 0 auto; }
+
+.perm-badge { flex: 0 0 auto; font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 12px; border: 1px solid var(--border); }
+.perm-badge.yes { color: #4ade80; border-color: #2f6b45; }
+.perm-badge.no { color: var(--muted); }
+button.danger { border-color: #6b2f2f; color: #f87171; }
+button.danger:hover { background: #3a2424; }
+
+/* Sharing view — cover grid with corner direction badge + member avatars */
+.share-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 14px; }
+.share-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; cursor: pointer; transition: border-color .12s ease, transform .12s ease, box-shadow .12s ease; }
+.share-card:hover { border-color: #3a4150; transform: translateY(-2px); box-shadow: 0 8px 20px rgba(0,0,0,0.3); }
+.share-card .cover { position: relative; aspect-ratio: 4/3; background: var(--bg3); display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 34px; }
+.share-card .cover img { width: 100%; height: 100%; object-fit: cover; }
+.share-card .cover .blank-cover { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 42px; background: linear-gradient(135deg, #2a2e38, #20232b); }
+.sc-badge { position: absolute; top: 8px; left: 8px; display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600; padding: 4px 9px; border-radius: 999px; backdrop-filter: blur(4px); }
+.sc-badge.sent { color: #bfdbfe; background: rgba(30, 64, 120, 0.74); }
+.sc-badge.recv { color: #bbf7d0; background: rgba(20, 83, 45, 0.74); }
+.sc-body { padding: 10px 12px; }
+.sc-name { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sc-foot { display: flex; align-items: center; gap: 8px; margin-top: 9px; min-height: 24px; }
+.sc-stack { display: flex; }
+.sc-stack .av { width: 24px; height: 24px; border-radius: 50%; margin-left: -7px; border: 2px solid var(--bg2); font-size: 11px; font-weight: 600; color: #fff; display: flex; align-items: center; justify-content: center; }
+.sc-stack .av:first-child { margin-left: 0; }
+.sc-stack .av.more { background: #3a3f4a; color: #c3c8d2; }
+.sc-count { font-size: 12px; color: var(--muted); }
+
+/* Contacts view */
+.contact-search { width: 240px; }
+.contacts-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
+.contact-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center; cursor: pointer; transition: border-color .12s ease, transform .12s ease, box-shadow .12s ease; }
+.contact-card:hover { border-color: #3a4150; transform: translateY(-2px); box-shadow: 0 8px 20px rgba(0,0,0,0.3); }
+.contact-card .c-email { flex: none; width: 100%; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Contact detail (relationship) view */
+.rel-wrap { max-width: 720px; }
+.rel-headcard { display: flex; align-items: center; gap: 14px; background: var(--bg2); border: 1px solid var(--border); border-radius: 14px; padding: 16px; margin-bottom: 20px; }
+.rel-headinfo { flex: 1; min-width: 0; }
+.rel-heademail { font-size: 16px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rel-headdate { font-size: 12px; margin-top: 2px; }
+.rel-headactions { flex: 0 0 auto; display: flex; gap: 8px; }
+.rel-sec { font-size: 14px; margin: 18px 0 10px; }
+.rel-list { display: flex; flex-direction: column; gap: 8px; }
+.rel-empty { font-size: 13px; padding: 2px 0 4px; }
+.rel-row { display: flex; align-items: center; gap: 12px; background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px; }
+.rel-cover { flex: 0 0 auto; width: 46px; height: 46px; border-radius: 8px; overflow: hidden; background: var(--bg3); display: flex; align-items: center; justify-content: center; font-size: 20px; cursor: pointer; }
+.rel-cover img { width: 100%; height: 100%; object-fit: cover; }
+.rel-main { flex: 1; min-width: 0; cursor: pointer; }
+.rel-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rel-sub { font-size: 12px; margin-top: 2px; }
+.c-sub { font-size: 12px; }

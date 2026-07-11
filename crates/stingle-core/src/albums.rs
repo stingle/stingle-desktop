@@ -23,6 +23,13 @@ fn new_album_id() -> Result<String> {
 impl Account {
     /// Create an album, register it on the server, and store it locally.
     pub async fn create_album(&self, name: &str) -> Result<String> {
+        self.create_album_inner(name, false).await
+    }
+
+    /// Create an album, optionally hidden. A hidden album is used when sharing
+    /// loose files (it holds the shared copies but stays out of the Albums grid),
+    /// matching Android's auto-created share album.
+    pub(crate) async fn create_album_inner(&self, name: &str, hidden: bool) -> Result<String> {
         let (_album_kp, enc) =
             album::generate_encrypted_album_data(&self.keypair.public_key, name)?;
         let album_id = new_album_id()?;
@@ -45,7 +52,7 @@ impl Account {
             public_key: enc.public_key,
             metadata: enc.metadata,
             is_shared: false,
-            is_hidden: false,
+            is_hidden: hidden,
             is_owner: true,
             members: String::new(),
             permissions: String::new(),

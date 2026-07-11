@@ -12,6 +12,7 @@ fn sample_file(name: &str, created: i64) -> DbFile {
         date_created: created,
         date_modified: created,
         headers: "H".to_string(),
+        is_video: None,
     }
 }
 
@@ -95,6 +96,37 @@ fn album_files_and_albums() {
 }
 
 #[test]
+fn is_video_roundtrip_and_backfill() {
+    let db = Db::open_in_memory().unwrap();
+
+    // Unknown (None) survives insert + read back.
+    db.insert_file(FileSet::Gallery, &sample_file("u.sp", 1)).unwrap();
+    assert_eq!(db.get_file(FileSet::Gallery, "u.sp").unwrap().unwrap().is_video, None);
+
+    // Known value survives insert + read back.
+    let mut v = sample_file("v.sp", 2);
+    v.is_video = Some(true);
+    db.insert_file(FileSet::Gallery, &v).unwrap();
+    assert_eq!(db.get_file(FileSet::Gallery, "v.sp").unwrap().unwrap().is_video, Some(true));
+
+    // Batch backfill fills unknowns.
+    db.set_is_video_batch(FileSet::Gallery, &[("u.sp".to_string(), false)]).unwrap();
+    assert_eq!(db.get_file(FileSet::Gallery, "u.sp").unwrap().unwrap().is_video, Some(false));
+
+    // A header rewrite resets the derived flag.
+    db.update_file_meta(FileSet::Gallery, "v.sp", 2, "H2", 2, 3).unwrap();
+    assert_eq!(db.get_file(FileSet::Gallery, "v.sp").unwrap().unwrap().is_video, None);
+
+    // Album files: keyed batch backfill.
+    let mut af = sample_file("a.sp", 3);
+    af.album_id = Some("AID".into());
+    db.insert_album_file(&af).unwrap();
+    assert_eq!(db.get_album_file("AID", "a.sp").unwrap().unwrap().is_video, None);
+    db.set_album_is_video_batch(&[("AID".to_string(), "a.sp".to_string(), true)]).unwrap();
+    assert_eq!(db.get_album_file("AID", "a.sp").unwrap().unwrap().is_video, Some(true));
+}
+
+#[test]
 fn contacts_imported_and_kv() {
     let db = Db::open_in_memory().unwrap();
     db.upsert_contact(&DbContact {
@@ -117,4 +149,40 @@ fn contacts_imported_and_kv() {
     db.kv_set_i64("filesST", 12345).unwrap();
     assert_eq!(db.kv_get_i64("filesST").unwrap(), Some(12345));
     assert_eq!(db.kv_get("missing").unwrap(), None);
+}
+
+#[test]
+fn contacts_ordered_by_recency_and_recency_preserved() {
+    let db = Db::open_in_memory().unwrap();
+    let mk = |uid: i64, email: &str, used: i64| DbContact {
+        user_id: uid,
+        email: email.into(),
+        public_key: "PK".into(),
+        date_used: used,
+        date_modified: 1,
+    };
+    // Insert out of recency order; two share date_used=0.
+    db.upsert_contact(&mk(1, "old@x.com", 100)).unwrap();
+    db.upsert_contact(&mk(2, "never@x.com", 0)).unwrap();
+    db.upsert_contact(&mk(3, "recent@x.com", 500)).unwrap();
+    db.upsert_contact(&mk(4, "also-never@x.com", 0)).unwrap();
+
+    let emails: Vec<String> = db.list_contacts().unwrap().into_iter().map(|c| c.email).collect();
+    // date_used DESC first, then email ASC for the zero-date ties.
+    assert_eq!(
+        emails,
+        vec![
+            "recent@x.com".to_string(),
+            "old@x.com".to_string(),
+            "also-never@x.com".to_string(),
+            "never@x.com".to_string(),
+        ]
+    );
+
+    // A later sync with date_used=0 must NOT lower the stored recency (MAX guard).
+    db.upsert_contact(&mk(3, "recent@x.com", 0)).unwrap();
+    assert_eq!(db.get_contact_by_user_id(3).unwrap().unwrap().date_used, 500);
+    // A higher date_used does advance it.
+    db.upsert_contact(&mk(3, "recent@x.com", 900)).unwrap();
+    assert_eq!(db.get_contact_by_user_id(3).unwrap().unwrap().date_used, 900);
 }

@@ -204,11 +204,12 @@ Reference: the Android screen inventory. Each maps to a desktop view/route.
   download; permission-aware disabling (no-copy albums).
 
 ### 5d. Albums & sharing
-- ☐ Albums view (grid + shared list), create/rename/delete, set cover, leave.
-- ☐ Add-to-album selector; hidden/shared distinction; album info & settings.
-- ☐ Sharing flow (step 1 recipients via `getContact`/contacts; step 2 name +
-  permissions allowAdd/allowShare/allowCopy); members management (add/remove);
-  edit permissions; unshare. Re-seal album SK to each recipient PK.
+- ☑ Albums view (grid + shared list), create/rename/delete, set cover, leave.
+- ☑ Add-to-album selector; hidden/shared distinction; album info & settings.
+- ☑ Sharing flow (step 1 recipients via `getContact`/contacts; step 2
+  permissions allowAdd/allowShare/allowCopy); members management (view/remove);
+  edit permissions; unshare. Re-seal album SK to each recipient PK. Dedicated
+  Contacts view. (Sharing loose gallery files as a hidden album: follow-up.)
 
 ### 5e. Trash
 - ☐ Trash view, restore, permanently delete, empty trash, confirmations.

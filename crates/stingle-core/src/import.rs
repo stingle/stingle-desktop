@@ -111,6 +111,7 @@ impl Account {
             date_created: date,
             date_modified: date,
             headers,
+            is_video: Some(is_video),
         };
         if set == FileSet::Album {
             self.db.insert_album_file(&row)?;
@@ -250,6 +251,7 @@ impl Account {
             date_created: date,
             date_modified: date,
             headers,
+            is_video: Some(false), // import_bytes is always a pasted image
         };
         if set == FileSet::Album {
             self.db.insert_album_file(&row)?;

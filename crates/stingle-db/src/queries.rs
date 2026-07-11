@@ -7,8 +7,8 @@ use crate::models::{DbAlbum, DbContact, DbFile, FileSet, Sort};
 use crate::Db;
 
 const FILE_COLS: &str =
-    "_id, filename, is_local, is_remote, version, reupload, date_created, date_modified, headers";
-const ALBUM_FILE_COLS: &str = "_id, album_id, filename, is_local, is_remote, version, reupload, date_created, date_modified, headers";
+    "_id, filename, is_local, is_remote, version, reupload, date_created, date_modified, headers, is_video";
+const ALBUM_FILE_COLS: &str = "_id, album_id, filename, is_local, is_remote, version, reupload, date_created, date_modified, headers, is_video";
 
 fn map_file(row: &Row) -> rusqlite::Result<DbFile> {
     Ok(DbFile {
@@ -22,6 +22,7 @@ fn map_file(row: &Row) -> rusqlite::Result<DbFile> {
         date_created: row.get(6)?,
         date_modified: row.get(7)?,
         headers: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
+        is_video: row.get(9)?,
     })
 }
 
@@ -37,6 +38,7 @@ fn map_album_file(row: &Row) -> rusqlite::Result<DbFile> {
         date_created: row.get(7)?,
         date_modified: row.get(8)?,
         headers: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+        is_video: row.get(10)?,
     })
 }
 
@@ -88,15 +90,15 @@ impl Db {
     pub fn insert_file(&self, set: FileSet, f: &DbFile) -> Result<()> {
         self.with_conn(|c| {
             let sql = format!(
-                "INSERT OR REPLACE INTO {} (filename, is_local, is_remote, version, reupload, date_created, date_modified, headers) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                "INSERT OR REPLACE INTO {} (filename, is_local, is_remote, version, reupload, date_created, date_modified, headers, is_video) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                 table(set)
             );
             c.execute(
                 &sql,
                 params![
                     f.filename, f.is_local, f.is_remote, f.version, f.reupload,
-                    f.date_created, f.date_modified, f.headers
+                    f.date_created, f.date_modified, f.headers, f.is_video
                 ],
             )?;
             Ok(())
@@ -113,11 +115,48 @@ impl Db {
         date_modified: i64,
     ) -> Result<()> {
         self.with_conn(|c| {
+            // New headers may describe different content — drop the derived
+            // `is_video` so the next listing re-derives it from the header.
             let sql = format!(
-                "UPDATE {} SET version=?2, headers=?3, date_created=?4, date_modified=?5 WHERE filename=?1",
+                "UPDATE {} SET version=?2, headers=?3, date_created=?4, date_modified=?5, is_video=NULL WHERE filename=?1",
                 table(set)
             );
             c.execute(&sql, params![filename, version, headers, date_created, date_modified])?;
+            Ok(())
+        })
+    }
+
+    /// Batch-store derived `is_video` flags (gallery/trash) in one transaction —
+    /// the lazy backfill for rows that predate the `is_video` column.
+    pub fn set_is_video_batch(&self, set: FileSet, items: &[(String, bool)]) -> Result<()> {
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            {
+                let sql = format!("UPDATE {} SET is_video=?2 WHERE filename=?1", table(set));
+                let mut stmt = tx.prepare(&sql)?;
+                for (filename, v) in items {
+                    stmt.execute(params![filename, v])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Batch-store derived `is_video` flags for album files, keyed by
+    /// `(album_id, filename)`.
+    pub fn set_album_is_video_batch(&self, items: &[(String, String, bool)]) -> Result<()> {
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "UPDATE album_files SET is_video=?3 WHERE album_id=?1 AND filename=?2",
+                )?;
+                for (album_id, filename, v) in items {
+                    stmt.execute(params![album_id, filename, v])?;
+                }
+            }
+            tx.commit()?;
             Ok(())
         })
     }
@@ -240,11 +279,11 @@ impl Db {
         let album_id = f.album_id.clone().unwrap_or_default();
         self.with_conn(|c| {
             c.execute(
-                "INSERT OR REPLACE INTO album_files (album_id, filename, is_local, is_remote, version, reupload, headers, date_created, date_modified) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                "INSERT OR REPLACE INTO album_files (album_id, filename, is_local, is_remote, version, reupload, headers, date_created, date_modified, is_video) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 params![
                     album_id, f.filename, f.is_local, f.is_remote, f.version, f.reupload,
-                    f.headers, f.date_created, f.date_modified
+                    f.headers, f.date_created, f.date_modified, f.is_video
                 ],
             )?;
             Ok(())
@@ -392,8 +431,11 @@ impl Db {
     pub fn upsert_contact(&self, ct: &DbContact) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
+                // `date_used` keeps the greater of the stored/incoming value: sharing sets
+                // it to now_ms() locally, but a later sync upserts the same contact with
+                // the server's value (often 0) — MAX stops that from clobbering recency.
                 "INSERT INTO contacts (user_id, email, pk, date_used, date_modified) VALUES (?1,?2,?3,?4,?5) \
-                 ON CONFLICT(user_id) DO UPDATE SET email=excluded.email, pk=excluded.pk, date_used=excluded.date_used, date_modified=excluded.date_modified",
+                 ON CONFLICT(user_id) DO UPDATE SET email=excluded.email, pk=excluded.pk, date_used=MAX(contacts.date_used, excluded.date_used), date_modified=excluded.date_modified",
                 params![ct.user_id, ct.email, ct.public_key, ct.date_used, ct.date_modified],
             )?;
             Ok(())
@@ -426,7 +468,7 @@ impl Db {
         self.with_conn(|c| {
             collect(
                 c,
-                "SELECT user_id, email, pk, date_used, date_modified FROM contacts ORDER BY email ASC",
+                "SELECT user_id, email, pk, date_used, date_modified FROM contacts ORDER BY date_used DESC, email ASC",
                 [],
                 map_contact,
             )

@@ -376,8 +376,19 @@ pub fn decrypt_with_external_header(
     let mut br = std::io::Cursor::new(blob);
     let _ = extract_header_bytes(&mut br)?; // skip the blob's embedded header
     let mut out = Vec::new();
-    decrypt_data(&mut br, &mut out, &header)?;
-    Ok(out)
+    match decrypt_data(&mut br, &mut out, &header) {
+        Ok(()) => Ok(out),
+        Err(data_err) => {
+            // The external header's data key didn't authenticate the blob. This
+            // happens when the stored (DB) header is stale relative to the blob —
+            // e.g. the file was re-uploaded with a fresh key/file_id but the cached
+            // header wasn't updated, so the two describe different encryptions.
+            // The blob is self-describing: if its OWN embedded header is sealed to
+            // the key we hold (true for files in albums we own), decrypt straight
+            // from it. Fall back to the original error if that doesn't work either.
+            decrypt_bytes(blob, pk, sk).map_err(|_| data_err)
+        }
+    }
 }
 
 /// Generate a fresh random 32-byte file id.
@@ -474,4 +485,57 @@ fn read_u64_be<R: Read>(r: &mut R) -> Result<u64> {
     let mut b = [0u8; 8];
     r.read_exact(&mut b)?;
     Ok(u64::from_be_bytes(b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sodium;
+
+    #[test]
+    fn external_header_uses_external_key_when_it_matches() {
+        let (pk, sk) = sodium::box_keypair().unwrap();
+        let data = b"hello world".repeat(1000);
+        let (blob, _h) = encrypt_bytes(&data, "a.jpg", 1, new_file_id().unwrap(), 0, &pk).unwrap();
+        // Correct external header == the blob's own header: the primary path works.
+        let ext = extract_header_bytes(&mut std::io::Cursor::new(&blob)).unwrap();
+        let out = decrypt_with_external_header(&ext, &blob, &pk, &sk).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn external_header_falls_back_to_embedded_on_stale_key() {
+        let (pk, sk) = sodium::box_keypair().unwrap();
+        let data = b"the quick brown fox jumps over the lazy dog".repeat(50);
+
+        // Blob encrypted with its own random data key (in its embedded header).
+        let (blob, _h) = encrypt_bytes(&data, "a.jpg", 1, new_file_id().unwrap(), 0, &pk).unwrap();
+
+        // A DIFFERENT valid header, sealed to the same recipient but carrying an
+        // unrelated data key + file_id — i.e. a stale external header, exactly the
+        // real-world mismatch (re-uploaded file, cached header not refreshed).
+        let (other, _h2) =
+            encrypt_bytes(b"unrelated", "b.jpg", 1, new_file_id().unwrap(), 0, &pk).unwrap();
+        let stale_ext = extract_header_bytes(&mut std::io::Cursor::new(&other)).unwrap();
+
+        // Primary decrypt (with the stale key) fails to authenticate, so the code
+        // must fall back to the blob's own embedded header and still recover data.
+        let out = decrypt_with_external_header(&stale_ext, &blob, &pk, &sk).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn external_header_still_errors_on_truly_corrupt_blob() {
+        let (pk, sk) = sodium::box_keypair().unwrap();
+        let (blob, _h) =
+            encrypt_bytes(b"payload".repeat(20).as_slice(), "a.jpg", 1, new_file_id().unwrap(), 0, &pk)
+                .unwrap();
+        let ext = extract_header_bytes(&mut std::io::Cursor::new(&blob)).unwrap();
+        // Corrupt a data-chunk byte (past the outer header) so neither the external
+        // nor the embedded key can authenticate it: must surface an error.
+        let mut bad = blob.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 0xff;
+        assert!(decrypt_with_external_header(&ext, &bad, &pk, &sk).is_err());
+    }
 }

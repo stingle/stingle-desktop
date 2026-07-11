@@ -28,7 +28,34 @@ export type Album = {
   is_shared: boolean;
   cover: string;
   count: number;
+  /** 4-char permission string `"1"+add+share+copy`; empty for un-shared albums. */
+  permissions: string;
 };
+
+export type Contact = {
+  user_id: string;
+  email: string;
+  date_used: number;
+};
+
+export type AlbumMember = {
+  user_id: string;
+  email: string | null;
+  is_owner: boolean;
+};
+
+/** An album in the Sharing view: album fields plus its resolved members. */
+export type SharedAlbum = Album & {
+  members: AlbumMember[];
+};
+
+/** Decode the 4-char `"1"+add+share+copy` permission string. Defaults to all-on
+ *  (matches Android's SharingPermissions, which treats a malformed string as all
+ *  allowed). */
+export function parsePermissions(p: string): { add: boolean; share: boolean; copy: boolean } {
+  if (!p || p.length !== 4) return { add: true, share: true, copy: true };
+  return { add: p[1] === "1", share: p[2] === "1", copy: p[3] === "1" };
+}
 
 export type LocalAccount = {
   account_key: string;
@@ -61,11 +88,13 @@ export const api = {
     invoke<Session>("resume", { accountKey, password }),
   lock: () => invoke("lock"),
   logout: (wipe: boolean) => invoke("logout", { wipe }),
-  sync: () => invoke<{ gallery: number; trash: number; albums: number }>("sync"),
+  /** `changes` = remote updates applied; 0 means the library didn't change. */
+  sync: () => invoke<{ gallery: number; trash: number; albums: number; changes: number }>("sync"),
   listGallery: (offset: number, limit: number) =>
     invoke<FileItem[]>("list_gallery", { offset, limit }),
   listTrash: () => invoke<FileItem[]>("list_trash"),
   listAlbums: () => invoke<Album[]>("list_albums"),
+  listSharedAlbums: () => invoke<SharedAlbum[]>("list_shared_albums"),
   listAlbumFiles: (albumId: string) =>
     invoke<FileItem[]>("list_album_files", { albumId }),
   importPaths: (paths: string[], albumId: string | null) =>
@@ -90,14 +119,30 @@ export const api = {
   recoveryPhrase: () => invoke<string>("recovery_phrase"),
   isVideo: (set: number, filename: string, albumId: string | null) =>
     invoke<boolean>("is_video", { set, albumId, filename }),
+  /** Warm the encrypted on-disk cache for files about to be viewed (viewer
+   *  neighbors). Download-only, fire-and-forget. */
+  prefetchMedia: (set: number, filenames: string[]) =>
+    invoke("prefetch_media", { set, filenames }),
   recover: (serverUrl: string, email: string, mnemonic: string, newPassword: string) =>
     invoke<Session>("recover", { serverUrl, email, mnemonic, newPassword }),
   shareAlbum: (
     albumId: string, emails: string[],
     allowAdd: boolean, allowShare: boolean, allowCopy: boolean
   ) => invoke("share_album", { albumId, emails, allowAdd, allowShare, allowCopy }),
+  shareNewAlbum: (
+    set: number, albumId: string | null, filenames: string[], name: string,
+    emails: string[], allowAdd: boolean, allowShare: boolean, allowCopy: boolean
+  ) => invoke<string>("share_new_album", { set, albumId, filenames, name, emails, allowAdd, allowShare, allowCopy }),
   unshareAlbum: (albumId: string) => invoke("unshare_album", { albumId }),
   leaveAlbum: (albumId: string) => invoke("leave_album", { albumId }),
+  listContacts: () => invoke<Contact[]>("list_contacts"),
+  listAlbumMembers: (albumId: string) =>
+    invoke<AlbumMember[]>("list_album_members", { albumId }),
+  editAlbumPerms: (
+    albumId: string, allowAdd: boolean, allowShare: boolean, allowCopy: boolean
+  ) => invoke("edit_album_perms", { albumId, allowAdd, allowShare, allowCopy }),
+  removeAlbumMember: (albumId: string, memberUserId: string) =>
+    invoke("remove_album_member", { albumId, memberUserId }),
   // Cache management
   getCacheLimit: () => invoke<number>("get_cache_limit"),
   setCacheLimit: (bytes: number) => invoke("set_cache_limit", { bytes }),

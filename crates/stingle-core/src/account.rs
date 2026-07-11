@@ -108,7 +108,18 @@ pub struct Account {
     /// queue behind a heavy decrypt); the frontend observer caps their fan-out.
     pub(crate) decrypt_sem: tokio::sync::Semaphore,
     /// In-memory LRU of decrypted thumbnails so scrolling back is instant.
-    pub(crate) thumb_cache: crate::thumb_cache::ThumbCache,
+    pub(crate) thumb_cache: crate::media_cache::MediaCache,
+    /// In-memory LRU of decrypted full-resolution images (post-transcode), so
+    /// re-opening a recently viewed photo skips the disk read + decrypt (+ the
+    /// ffmpeg transcode for HEIC/TIFF). Never holds video bodies.
+    pub(crate) media_cache: crate::media_cache::MediaCache,
+    /// Decrypted album keypairs, keyed by album id and validated against the
+    /// album's current `enc_private_key` (so a re-keyed album never hits a
+    /// stale entry). Saves a box-open + scalarmult on every album media
+    /// request / header decode. Bounded by the number of albums.
+    pub(crate) album_kp_cache: std::sync::Mutex<
+        std::collections::HashMap<String, (String, Vec<u8>, zeroize::Zeroizing<Vec<u8>>)>,
+    >,
     /// Throttle for cache-limit enforcement (ms epoch of last check).
     pub(crate) last_cache_check_ms: std::sync::atomic::AtomicI64,
     /// Cooperative cancellation flag for the bulk "download all originals" pass.
@@ -131,6 +142,9 @@ pub(crate) const MAX_CONCURRENT_DOWNLOADS: usize = 56;
 pub(crate) const MAX_BULK_DOWNLOADS: usize = 48;
 /// Byte budget for the in-memory decrypted-thumbnail LRU (~128 MB).
 const THUMB_CACHE_BYTES: usize = 128 * 1024 * 1024;
+/// Byte budget for the in-memory decrypted full-image LRU (~256 MB ≈ a few
+/// dozen originals) — sized so viewer back/forward and re-opens are instant.
+const MEDIA_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 /// Permits for concurrent on-demand decrypts — the machine's parallelism, so a
 /// burst of cache-misses uses every core without oversubscribing them.
@@ -207,7 +221,9 @@ impl Account {
             download_sem: tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS),
             bulk_sem: tokio::sync::Semaphore::new(MAX_BULK_DOWNLOADS),
             decrypt_sem: tokio::sync::Semaphore::new(decrypt_permits()),
-            thumb_cache: crate::thumb_cache::ThumbCache::new(THUMB_CACHE_BYTES),
+            thumb_cache: crate::media_cache::MediaCache::new(THUMB_CACHE_BYTES),
+            media_cache: crate::media_cache::MediaCache::new(MEDIA_CACHE_BYTES),
+            album_kp_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_cache_check_ms: std::sync::atomic::AtomicI64::new(0),
             stop_originals: std::sync::atomic::AtomicBool::new(false),
             stop_takeout: std::sync::atomic::AtomicBool::new(false),
@@ -285,7 +301,9 @@ impl Account {
             download_sem: tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS),
             bulk_sem: tokio::sync::Semaphore::new(MAX_BULK_DOWNLOADS),
             decrypt_sem: tokio::sync::Semaphore::new(decrypt_permits()),
-            thumb_cache: crate::thumb_cache::ThumbCache::new(THUMB_CACHE_BYTES),
+            thumb_cache: crate::media_cache::MediaCache::new(THUMB_CACHE_BYTES),
+            media_cache: crate::media_cache::MediaCache::new(MEDIA_CACHE_BYTES),
+            album_kp_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_cache_check_ms: std::sync::atomic::AtomicI64::new(0),
             stop_originals: std::sync::atomic::AtomicBool::new(false),
             stop_takeout: std::sync::atomic::AtomicBool::new(false),
@@ -318,7 +336,9 @@ impl Account {
             download_sem: tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS),
             bulk_sem: tokio::sync::Semaphore::new(MAX_BULK_DOWNLOADS),
             decrypt_sem: tokio::sync::Semaphore::new(decrypt_permits()),
-            thumb_cache: crate::thumb_cache::ThumbCache::new(THUMB_CACHE_BYTES),
+            thumb_cache: crate::media_cache::MediaCache::new(THUMB_CACHE_BYTES),
+            media_cache: crate::media_cache::MediaCache::new(MEDIA_CACHE_BYTES),
+            album_kp_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_cache_check_ms: std::sync::atomic::AtomicI64::new(0),
             stop_originals: std::sync::atomic::AtomicBool::new(false),
             stop_takeout: std::sync::atomic::AtomicBool::new(false),

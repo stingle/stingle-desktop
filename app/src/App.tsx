@@ -3,13 +3,13 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import {
-  api, mediaUrl, videoUrl, pickFiles, pickFolder,
-  Session, FileItem, Album, LocalAccount, WatchFolder,
+  api, mediaUrl, videoUrl, pickFiles, pickFolder, parsePermissions,
+  Session, FileItem, Album, SharedAlbum, Contact, AlbumMember, LocalAccount, WatchFolder,
   SET_GALLERY, SET_TRASH, SET_ALBUM, BLANK_COVER,
 } from "./api";
 import logoUrl from "./assets/stingle-logo.png";
 
-type View = "gallery" | "albums" | "trash" | "settings";
+type View = "gallery" | "albums" | "sharing" | "contacts" | "trash" | "settings";
 
 /* ----------------------------- Icons ----------------------------- */
 // Crisp inline stroke icons (currentColor) replacing the generic emoji.
@@ -37,6 +37,22 @@ const TrashIcon = () => (
     <path d="M9 7V5.2A1.2 1.2 0 0 1 10.2 4h3.6A1.2 1.2 0 0 1 15 5.2V7" />
     <path d="M6 7l1 12.2A1.8 1.8 0 0 0 8.8 21h6.4a1.8 1.8 0 0 0 1.8-1.8L18 7" />
     <path d="M10 11v6M14 11v6" />
+  </svg>
+);
+const SharingIcon = () => (
+  <svg {...ICON_PROPS}>
+    <circle cx="18" cy="5" r="2.6" />
+    <circle cx="6" cy="12" r="2.6" />
+    <circle cx="18" cy="19" r="2.6" />
+    <path d="M8.3 10.7l7.4-4.3M8.3 13.3l7.4 4.3" />
+  </svg>
+);
+const ContactsIcon = () => (
+  <svg {...ICON_PROPS}>
+    <circle cx="9" cy="8" r="3.2" />
+    <path d="M3.5 20a5.5 5.5 0 0 1 11 0" />
+    <path d="M16 5.2a3.2 3.2 0 0 1 0 6" />
+    <path d="M17.5 14.3A5.5 5.5 0 0 1 20.5 19" />
   </svg>
 );
 const SettingsIcon = () => (
@@ -69,14 +85,21 @@ function dateLabel(ms: number): string {
 
 type DateGroup = { label: string; entries: { f: FileItem; idx: number }[] };
 
-/** Group a date-descending file list into per-day sections (order preserved). */
+/** Group a date-descending file list into per-day sections (order preserved).
+ *  Day boundaries are detected with a cheap numeric key; the human label
+ *  (which goes through Intl and costs ~40µs a call) is formatted once per
+ *  GROUP, not per item — at 25k items that's the difference between ~1s and
+ *  a few ms per (re)grouping. */
 function groupByDate(items: FileItem[]): DateGroup[] {
   const groups: DateGroup[] = [];
   let cur: DateGroup | null = null;
+  let curKey = -1;
   items.forEach((f, idx) => {
-    const label = dateLabel(f.date_created);
-    if (!cur || cur.label !== label) {
-      cur = { label, entries: [] };
+    const d = new Date(f.date_created);
+    const key = d.getFullYear() * 10000 + d.getMonth() * 100 + d.getDate();
+    if (!cur || key !== curKey) {
+      curKey = key;
+      cur = { label: dateLabel(f.date_created), entries: [] };
       groups.push(cur);
     }
     cur.entries.push({ f, idx });
@@ -120,71 +143,27 @@ function inTextField(e: KeyboardEvent): boolean {
   return !!t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
 }
 
-/** One thumbnail. Memoized so a selection change (or a sync-triggered reload)
- *  only re-renders the tiles that actually changed — critical with thousands of
- *  tiles, where re-rendering the whole grid on every marquee frame would jank. */
-/** A shared IntersectionObserver for the whole grid: each tile registers its
- *  element + a setter, and is told when it enters/leaves a band ~2 viewports tall
- *  around the scroll viewport. One observer for the whole grid is O(visible) work
- *  per scroll, not O(items) — so a 10k-photo grid stays cheap. The band (rootMargin)
- *  is generous enough that tiles reload before they scroll back into view, so there
- *  is no blank flash on normal scrolling. */
-function useTileVisibility(): (el: Element, cb: (visible: boolean) => void) => () => void {
-  const cbs = useRef<Map<Element, (v: boolean) => void>>(new Map()).current;
-  const ioRef = useRef<IntersectionObserver | null>(null);
-
-  const register = useCallback((el: Element, cb: (visible: boolean) => void) => {
-    if (!ioRef.current) {
-      // Resolve the scroll container from a real tile (it's an ancestor and is
-      // attached by the time a ref callback runs); fall back to the viewport.
-      const root = (el.closest(".content") as Element | null) ?? null;
-      ioRef.current = new IntersectionObserver(
-        (entries) => {
-          for (const e of entries) {
-            const setter = cbs.get(e.target);
-            if (setter) setter(e.isIntersecting);
-          }
-        },
-        { root, rootMargin: "200% 0px", threshold: 0 },
-      );
-    }
-    cbs.set(el, cb);
-    ioRef.current.observe(el);
-    return () => {
-      ioRef.current?.unobserve(el);
-      cbs.delete(el);
-    };
-  }, [cbs]);
-
-  useEffect(() => () => { ioRef.current?.disconnect(); cbs.clear(); }, [cbs]);
-
-  return register;
-}
-
+/** One thumbnail tile. Memoized so a selection change (or a scroll-driven
+ *  window shift) only re-renders the tiles that actually changed. The grid is
+ *  VIRTUALIZED — only tiles near the viewport exist in the DOM. The `<img>` is
+ *  mounted only when `load` is true: during a fast scroll/fling the window
+ *  slides over hundreds of tiles per second, and mounting each one's <img>
+ *  would fire a stingle:// request that the backend decrypts to completion even
+ *  after the tile scrolls away — starving the thumbnails you actually land on.
+ *  `w` is the computed square tile size (a number so memoization survives). */
 const TileView = React.memo(function TileView({
-  f, set, albumId, selected, selectionEmpty, renderExtra, register,
+  f, idx, set, albumId, w, load, selected, selectionEmpty, renderExtra, onLoaded,
 }: {
-  f: FileItem; set: number; albumId: string | null;
-  selected: boolean; selectionEmpty: boolean;
+  f: FileItem; idx: number; set: number; albumId: string | null; w: number;
+  load: boolean; selected: boolean; selectionEmpty: boolean;
   renderExtra?: (f: FileItem) => React.ReactNode;
-  // Registers this tile with the grid's shared IntersectionObserver; the callback
-  // flips whether the <img> is mounted as the tile enters/leaves the load band.
-  register: (el: Element, cb: (visible: boolean) => void) => () => void;
+  onLoaded: (filename: string) => void;
 }) {
-  const tileRef = useRef<HTMLDivElement>(null);
-  // Only mount the <img> while the tile is within the observer's band. Removing it
-  // when far off-screen ABORTS any in-flight stingle:// request — the one thing
-  // native loading="lazy" can't do — so a fast scroll never builds a backlog of
-  // stale requests that starve the now-visible thumbnails.
-  const [show, setShow] = useState(false);
-  useEffect(() => {
-    const el = tileRef.current;
-    if (!el) return;
-    return register(el, setShow);
-  }, [register]);
   return (
-    <div ref={tileRef} data-fn={f.filename} className={"tile" + (selected ? " sel" : "")}>
-      {show && <img draggable={false} src={mediaUrl(set, f.filename, true, albumId)} />}
+    <div data-fn={f.filename} data-idx={idx} className={"tile" + (selected ? " sel" : "")}
+      style={{ width: w, height: w }}>
+      {load && <img draggable={false} src={mediaUrl(set, f.filename, true, albumId)}
+        onLoad={() => onLoaded(f.filename)} />}
       {f.is_video && <div className="vid-badge" aria-label="Video"><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M8 5v14l11-7z" /></svg></div>}
       {f.is_local && !f.is_remote && (
         <div className="cloud-badge" aria-label="Not uploaded yet" title="Not uploaded yet">
@@ -196,6 +175,28 @@ const TileView = React.memo(function TileView({
     </div>
   );
 });
+
+/* ------------------------- grid virtualization -------------------------
+ * The browser must never hold tens of thousands of tiles in the DOM: even
+ * fully memoized and content-visibility-locked, a full-viewport overlay
+ * mount/unmount forces an O(N) layout walk (~300 ms at 25k tiles) and every
+ * rendered frame pays an O(N) IntersectionObserver pass (~50 ms). Windowing
+ * rows keeps all of that O(visible). */
+const GRID_GAP = 8;
+const MIN_TILE = 148; // matches the old `minmax(148px, 1fr)` column sizing
+const OVERSCAN_PX = 600; // band above/below the viewport kept mounted
+const HEADER_H = 46; // date header row: 18px gap above + label + 9px below
+const HEADER_H_FIRST = 28; // first header has no gap above
+// A per-frame scroll jump larger than this (≈2.5 tile rows) means the user is
+// flinging or dragging the scrollbar, not reading — so hold off mounting new
+// thumbnails until it settles. Deliberate wheel scrolling stays under this and
+// keeps loading live.
+const FLING_PX = 400;
+const SETTLE_MS = 120; // resume loading this long after the last fast frame
+
+type GridRow =
+  | { kind: "header"; label: string; top: number; h: number }
+  | { kind: "tiles"; entries: { f: FileItem; idx: number }[]; top: number; h: number };
 
 /** A selectable photo grid: click opens; checkbox/Ctrl-click toggles; Shift-click
  *  selects a range; drag a thumbnail to drag the file(s) out; drag from empty
@@ -353,8 +354,8 @@ const PhotoGrid = React.memo(function PhotoGrid({ items, set, albumId, grouped, 
   }, [set, albumId, showToast]);
 
   const tileIndexFrom = (target: HTMLElement): number => {
-    const el = target.closest("[data-fn]") as HTMLElement | null;
-    return el ? items.findIndex((x) => x.filename === el.dataset.fn) : -1;
+    const el = target.closest("[data-idx]") as HTMLElement | null;
+    return el ? Number(el.dataset.idx) : -1;
   };
 
   // All tile interaction is resolved from mousedown / mouseup — no onClick — so
@@ -404,27 +405,133 @@ const PhotoGrid = React.memo(function PhotoGrid({ items, set, albumId, grouped, 
   };
 
   const selectionEmpty = sel.size === 0;
-  const register = useTileVisibility();
-  const Tile = (f: FileItem) => (
-    <TileView key={f.filename} f={f} set={set} albumId={albumId}
-      selected={sel.has(f.filename)} selectionEmpty={selectionEmpty} renderExtra={renderExtra}
-      register={register} />
+
+  // Thumbnails that have finished loading at least once this mount. Kept in a
+  // ref (survives tile unmount/remount) so scrolling back over seen photos shows
+  // them instantly and without a grey flash, even mid-fling — those are cheap
+  // in-memory cache hits on the backend, not part of the decrypt backlog.
+  const loadedRef = useRef<Set<string>>(new Set());
+  const markLoaded = useCallback((filename: string) => { loadedRef.current.add(filename); }, []);
+
+  // ---- virtualization: track the scroller's viewport + our width ----
+  const [vp, setVp] = useState({ w: 0, h: 0, top: 0 });
+  // True while the user is flinging/dragging fast; new thumbnails hold off until
+  // it clears (see FLING_PX / SETTLE_MS). Not folded into `vp` so a settle-only
+  // change doesn't recompute the window geometry.
+  const [flinging, setFlinging] = useState(false);
+  useLayoutEffect(() => {
+    const wrap = wrapRef.current;
+    const sc = wrap?.closest(".content") as HTMLElement | null;
+    if (!wrap || !sc) return;
+    let raf = 0;
+    let lastTop = sc.scrollTop;
+    let settle: ReturnType<typeof setTimeout> | undefined;
+    const measure = () => {
+      const top = sc.scrollTop;
+      // A big per-frame jump = fling/scrollbar-drag → defer loads until it stops.
+      if (Math.abs(top - lastTop) > FLING_PX) {
+        setFlinging(true);
+        if (settle) clearTimeout(settle);
+        settle = setTimeout(() => setFlinging(false), SETTLE_MS);
+      }
+      lastTop = top;
+      setVp((v) => {
+        const next = { w: wrap.clientWidth, h: sc.clientHeight, top };
+        return v.w === next.w && v.h === next.h && v.top === next.top ? v : next;
+      });
+    };
+    // Coalesce scroll events to one state update per frame.
+    const onScroll = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => { raf = 0; measure(); });
+    };
+    measure(); // before first paint, so the initial window is correct
+    sc.addEventListener("scroll", onScroll, { passive: true });
+    const ro = new ResizeObserver(measure);
+    ro.observe(sc);
+    ro.observe(wrap);
+    return () => {
+      sc.removeEventListener("scroll", onScroll);
+      ro.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+      if (settle) clearTimeout(settle);
+    };
+  }, []);
+
+  // Same column math as the old `repeat(auto-fill, minmax(148px, 1fr))`.
+  const cols = Math.max(1, Math.floor((vp.w + GRID_GAP) / (MIN_TILE + GRID_GAP)));
+  const tileW = vp.w > 0 ? (vp.w - (cols - 1) * GRID_GAP) / cols : MIN_TILE;
+  const rowH = tileW + GRID_GAP;
+
+  // Grouping only depends on the list; a resize must not pay for re-grouping.
+  const groups = useMemo<DateGroup[]>(
+    () =>
+      grouped
+        ? groupByDate(items)
+        : [{ label: "", entries: items.map((f, idx) => ({ f, idx })) }],
+    [items, grouped],
   );
 
-  // Re-grouping the whole list is cheap but pointless on every render (e.g. each
-  // marquee frame), so cache it until the items array itself changes.
-  const groups = useMemo(() => (grouped ? groupByDate(items) : null), [grouped, items]);
+  // Flatten the groups into fixed-height rows with precomputed offsets.
+  // Rebuilt only when the list or the geometry changes — never on scroll or
+  // selection.
+  const { rows, total } = useMemo(() => {
+    const out: GridRow[] = [];
+    let y = 0;
+    for (const g of groups) {
+      if (g.label) {
+        const h = y === 0 ? HEADER_H_FIRST : HEADER_H;
+        out.push({ kind: "header", label: g.label, top: y, h });
+        y += h;
+      }
+      for (let i = 0; i < g.entries.length; i += cols) {
+        out.push({ kind: "tiles", entries: g.entries.slice(i, i + cols), top: y, h: rowH });
+        y += rowH;
+      }
+    }
+    return { rows: out, total: y };
+  }, [groups, cols, rowH]);
+
+  // The mounted slice: rows intersecting viewport ± overscan (binary search).
+  const [start, end] = useMemo(() => {
+    if (rows.length === 0) return [0, 0];
+    const lo = vp.top - OVERSCAN_PX;
+    const hi = vp.top + vp.h + OVERSCAN_PX;
+    let a = 0, b = rows.length - 1, first = rows.length;
+    while (a <= b) {
+      const m = (a + b) >> 1;
+      if (rows[m].top + rows[m].h > lo) { first = m; b = m - 1; } else a = m + 1;
+    }
+    let c = first, d = rows.length - 1, last = first - 1;
+    while (c <= d) {
+      const m = (c + d) >> 1;
+      if (rows[m].top < hi) { last = m; c = m + 1; } else d = m - 1;
+    }
+    return [first, last + 1];
+  }, [rows, vp.top, vp.h]);
 
   return (
-    <div ref={wrapRef} className="grid-wrap" onMouseDown={startDrag}>
-      {groups
-        ? groups.map((g) => (
-            <div key={g.label}>
-              <div className="date-header">{g.label}</div>
-              <div className="grid">{g.entries.map(({ f }) => Tile(f))}</div>
-            </div>
-          ))
-        : <div className="grid">{items.map((f) => Tile(f))}</div>}
+    <div ref={wrapRef} className="grid-wrap" onMouseDown={startDrag} style={{ height: total }}>
+      {rows.slice(start, end).map((row) =>
+        row.kind === "header" ? (
+          <div key={"h:" + row.label} className="date-header"
+            style={{ top: row.top, height: row.h }}>
+            {row.label}
+          </div>
+        ) : (
+          <div key={row.entries[0].f.filename} className="vrow"
+            style={{ top: row.top, height: row.h }}>
+            {row.entries.map(({ f, idx }) => (
+              // Load now unless we're flinging past — but always keep a thumbnail
+              // we've already shown (cheap cache hit, avoids a grey flash).
+              <TileView key={f.filename} f={f} idx={idx} set={set} albumId={albumId} w={tileW}
+                load={!flinging || loadedRef.current.has(f.filename)}
+                selected={sel.has(f.filename)} selectionEmpty={selectionEmpty}
+                renderExtra={renderExtra} onLoaded={markLoaded} />
+            ))}
+          </div>
+        )
+      )}
       {box && <div className="marquee" style={{ left: box.l, top: box.t, width: box.w, height: box.h }} />}
     </div>
   );
@@ -976,11 +1083,17 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
       setTakeoutProg((prev) => (e.payload[1] > 0 ? merge(prev, e.payload[0], e.payload[1]) : null))
     );
     const u8 = listen("takeout-done", () => setTakeoutProg(null));
+    // Any sync pass (manual, idle, background) that actually changed the local
+    // library. The per-phase *-done events above are now only emitted when
+    // their phase did work, so this is the reload signal for delete-only or
+    // metadata-only changes that download nothing.
+    const u9 = listen("library-changed", () => scheduleReload());
     return () => {
       if (reloadTimer) clearTimeout(reloadTimer);
       u0.then((f) => f()); u0b.then((f) => f());
       u1.then((f) => f()); u2.then((f) => f()); u3.then((f) => f()); u4.then((f) => f());
       u5.then((f) => f()); u6.then((f) => f()); u7.then((f) => f()); u8.then((f) => f());
+      u9.then((f) => f());
     };
   }, []);
 
@@ -989,7 +1102,9 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
     try {
       const r = await api.sync();
       await refreshSession();
-      reload();
+      // Refresh the lists only when the sync actually changed something — a
+      // no-op sync must not make every view re-fetch and re-render.
+      if (r.changes > 0) reload();
       showToast(`Synced — ${r.gallery} photos, ${r.albums} albums`);
     } catch (e) { showToast("Sync failed: " + e); }
     finally { setSyncing(false); }
@@ -1073,6 +1188,8 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
         <div className="nav">
           <button className={view === "gallery" ? "active" : ""} onClick={() => setView("gallery")}><GalleryIcon /> Gallery</button>
           <button className={view === "albums" ? "active" : ""} onClick={() => setView("albums")}><AlbumsIcon /> Albums</button>
+          <button className={view === "sharing" ? "active" : ""} onClick={() => setView("sharing")}><SharingIcon /> Sharing</button>
+          <button className={view === "contacts" ? "active" : ""} onClick={() => setView("contacts")}><ContactsIcon /> Contacts</button>
           <button className={view === "trash" ? "active" : ""} onClick={() => setView("trash")}><TrashIcon /> Trash</button>
           <button className={view === "settings" ? "active" : ""} onClick={() => setView("settings")}><SettingsIcon /> Settings</button>
         </div>
@@ -1103,6 +1220,8 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
       <div className="main">
         {view === "gallery" && <GalleryView reloadSignal={reloadKey} syncing={syncing} onSync={doSync} showToast={showToast} onChanged={reload} />}
         {view === "albums" && <AlbumsView reloadSignal={reloadKey} showToast={showToast} />}
+        {view === "sharing" && <SharingView reloadSignal={reloadKey} showToast={showToast} />}
+        {view === "contacts" && <ContactsView reloadSignal={reloadKey} showToast={showToast} />}
         {view === "trash" && <TrashView reloadSignal={reloadKey} showToast={showToast} onChanged={reload} />}
         {view === "settings" && <SettingsView session={session} setSession={setSession} showToast={showToast} />}
       </div>
@@ -1215,7 +1334,7 @@ function GalleryView({ syncing, onSync, showToast, onChanged, reloadSignal }: {
               <button onClick={() => setSel(new Set(items.map((f) => f.filename)))}>Select all</button>
               <ActionButtons set={SET_GALLERY} albumId={null} filenames={[...sel]}
                 onTrashed={remove}
-                onDone={() => { setSel(new Set()); load(); onChanged(); }} showToast={showToast} />
+                onDone={() => { setSel(new Set()); onChanged(); }} showToast={showToast} />
               <button onClick={() => setSel(new Set())}>Cancel</button>
             </>
           ) : (
@@ -1239,7 +1358,7 @@ function GalleryView({ syncing, onSync, showToast, onChanged, reloadSignal }: {
       </div>
       {viewerIdx !== null && (
         <Viewer items={items} index={viewerIdx} set={SET_GALLERY} albumId={null}
-          onClose={() => setViewerIdx(null)} onChanged={() => { load(); onChanged(); }}
+          onClose={() => setViewerIdx(null)} onChanged={onChanged}
           onTrashed={remove} showToast={showToast} />
       )}
     </>
@@ -1301,10 +1420,25 @@ function AlbumsView({ showToast, reloadSignal }: { showToast: (m: string) => voi
   );
 }
 
-function AlbumDetail({ album, onBack, showToast }: { album: Album; onBack: () => void; showToast: (m: string) => void }) {
+function AlbumDetail({ album: initialAlbum, onBack, showToast }: { album: Album; onBack: () => void; showToast: (m: string) => void }) {
+  // Local copy so share/unshare/perm changes reflect immediately without a full
+  // albums-list round-trip. The parent list reloads on back.
+  const [album, setAlbum] = useState<Album>(initialAlbum);
   const [items, setItems] = useState<FileItem[]>([]);
   const [viewerIdx, setViewerIdx] = useState<number | null>(null);
   const [sel, setSel] = useState<Set<string>>(new Set());
+  const [showShare, setShowShare] = useState(false);
+  const [showSharing, setShowSharing] = useState(false);
+
+  // Permission-gated capabilities (mirrors the Android matrix). For an owned or
+  // unshared album these are all true; for a received album they follow the
+  // album's permission string.
+  const P = parsePermissions(album.permissions);
+  const canAdd = album.is_owner || (album.is_shared && P.add);
+  const canCopy = album.is_owner || P.copy;
+  const canShare = album.is_owner || (album.is_shared && P.share);
+  const caps = { canCopy, canDelete: album.is_owner, canShare };
+
   const load = useCallback(() => { api.listAlbumFiles(album.album_id).then(setItems); }, [album.album_id]);
   useEffect(() => { load(); }, [load]);
   // Optimistically drop just-trashed rows so the grid updates immediately,
@@ -1337,18 +1471,6 @@ function AlbumDetail({ album, onBack, showToast }: { album: Album; onBack: () =>
     if (!confirm("Hide this album's contents behind a blank cover?")) return;
     await api.setAlbumBlankCover(album.album_id); showToast("Blank album cover set");
   };
-  const share = async () => {
-    const email = prompt("Share with (email):");
-    if (!email) return;
-    try {
-      await api.shareAlbum(album.album_id, [email.trim()], true, true, true);
-      showToast("Album shared with " + email);
-    } catch (e) { showToast("Share failed: " + e); }
-  };
-  const unshare = async () => {
-    if (!confirm("Stop sharing this album?")) return;
-    await api.unshareAlbum(album.album_id); showToast("Unshared");
-  };
   const leave = async () => {
     if (!confirm("Leave this shared album?")) return;
     await api.leaveAlbum(album.album_id); onBack();
@@ -1374,15 +1496,15 @@ function AlbumDetail({ album, onBack, showToast }: { album: Album; onBack: () =>
               <span className="muted">{sel.size} selected</span>
               <button onClick={() => setSel(new Set(items.map((f) => f.filename)))}>Select all</button>
               <ActionButtons set={SET_ALBUM} albumId={album.album_id} filenames={[...sel]}
-                onTrashed={remove}
+                caps={caps} onTrashed={remove}
                 onDone={() => { clearSel(); load(); }} showToast={showToast} />
               <button onClick={clearSel}>Cancel</button>
             </>
           ) : (
             <>
-              {album.is_owner && <button onClick={addFiles}>＋ Add</button>}
-              {album.is_owner && <button onClick={share}>👥 Share</button>}
-              {album.is_owner && album.is_shared && <button onClick={unshare}>Unshare</button>}
+              {canAdd && <button onClick={addFiles}>＋ Add</button>}
+              {album.is_owner && !album.is_shared && <button onClick={() => setShowShare(true)}>👥 Share</button>}
+              {album.is_shared && <button onClick={() => setShowSharing(true)}>{album.is_owner ? "👥 Sharing" : "ℹ Info"}</button>}
               {album.is_owner && <button onClick={rename}>Rename</button>}
               {album.is_owner && <button onClick={blankCover}>Blank cover</button>}
               {album.is_owner && <button onClick={del}>Delete</button>}
@@ -1399,10 +1521,728 @@ function AlbumDetail({ album, onBack, showToast }: { album: Album; onBack: () =>
         )}
       </div>
       {viewerIdx !== null && (
-        <Viewer items={items} index={viewerIdx} set={SET_ALBUM} albumId={album.album_id}
+        <Viewer items={items} index={viewerIdx} set={SET_ALBUM} albumId={album.album_id} caps={caps}
           onClose={() => setViewerIdx(null)} onChanged={load} onTrashed={remove} showToast={showToast} />
       )}
+      {showShare && (
+        <ShareDialog album={album}
+          onClose={() => setShowShare(false)}
+          onShared={(perms) => { setAlbum((a) => ({ ...a, is_shared: true, permissions: perms })); }}
+          showToast={showToast} />
+      )}
+      {showSharing && (
+        <AlbumSharingDialog album={album} canShare={canShare}
+          onClose={() => setShowSharing(false)}
+          onChanged={(perms) => { if (perms) setAlbum((a) => ({ ...a, permissions: perms })); }}
+          onUnshared={() => { setAlbum((a) => ({ ...a, is_shared: false, permissions: "" })); setShowSharing(false); }}
+          showToast={showToast} />
+      )}
     </>
+  );
+}
+
+/* ----------------------------- Sharing ----------------------------- */
+
+/** Share dialog. Fresh-share mode (owner, not-yet-shared) is a two-step wizard —
+ *  pick recipients, then set permissions. Add-mode (adding people to an already
+ *  shared album) is one step and reuses the album's current permissions, matching
+ *  Android's onlyAddMembers flow. */
+function ShareDialog({ album, onClose, onShared, showToast, addMode = false, excludeEmails = [] }: {
+  album: Album;
+  onClose: () => void;
+  onShared: (permissions: string) => void;
+  showToast: (m: string) => void;
+  addMode?: boolean;
+  excludeEmails?: string[];
+}) {
+  const [step, setStep] = useState<1 | 2>(1);
+  const [contacts, setContacts] = useState<Contact[]>([]);
+  const [query, setQuery] = useState("");
+  const [recipients, setRecipients] = useState<string[]>([]); // emails
+  const [allowAdd, setAllowAdd] = useState(true);
+  const [allowShare, setAllowShare] = useState(true);
+  const [allowCopy, setAllowCopy] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  const excluded = useMemo(
+    () => new Set(excludeEmails.map((x) => x.toLowerCase())),
+    [excludeEmails]
+  );
+
+  useEffect(() => {
+    api.listContacts().then(setContacts).catch(() => setContacts([]));
+    const h = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [onClose]);
+
+  const add = (email: string) => {
+    const e = email.trim().toLowerCase();
+    if (!e) return;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) { showToast("Enter a valid email"); return; }
+    if (excluded.has(e)) { showToast("Already a member"); return; }
+    if (recipients.includes(e)) return;
+    setRecipients((r) => [...r, e]);
+    setQuery("");
+  };
+  const removeRcpt = (email: string) => setRecipients((r) => r.filter((x) => x !== email));
+
+  const q = query.trim().toLowerCase();
+  const suggestions = contacts
+    .filter((c) => !recipients.includes(c.email.toLowerCase()))
+    .filter((c) => !excluded.has(c.email.toLowerCase()))
+    .filter((c) => !q || c.email.toLowerCase().includes(q));
+
+  const doShare = async () => {
+    if (!recipients.length) return;
+    // Add-mode keeps the album's existing album-wide permissions untouched.
+    const cur = parsePermissions(album.permissions);
+    const [a, s, cp] = addMode
+      ? [cur.add, cur.share, cur.copy]
+      : [allowAdd, allowShare, allowCopy];
+    setBusy(true);
+    try {
+      await api.shareAlbum(album.album_id, recipients, a, s, cp);
+      onShared(`1${a ? 1 : 0}${s ? 1 : 0}${cp ? 1 : 0}`);
+      showToast(`${addMode ? "Added" : "Shared with"} ${recipients.length} ${recipients.length === 1 ? "person" : "people"}`);
+      onClose();
+    } catch (err) {
+      showToast((addMode ? "Add" : "Share") + " failed: " + err);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal share-dialog" onClick={(e) => e.stopPropagation()}>
+        <div className="move-head">
+          <h3>{addMode ? "Add people to" : "Share"} “{album.name}”</h3>
+          <button className="icon-btn" onClick={onClose}>✕</button>
+        </div>
+
+        {step === 1 ? (
+          <>
+            <div className="chips">
+              {recipients.map((r) => (
+                <span key={r} className="chip">{r}<button onClick={() => removeRcpt(r)}>✕</button></span>
+              ))}
+              {recipients.length === 0 && <span className="muted">No recipients yet.</span>}
+            </div>
+            <div className="share-add">
+              <input autoFocus placeholder="Email address" value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") add(query); }} />
+              <button onClick={() => add(query)}>Add</button>
+            </div>
+            {suggestions.length > 0 && (
+              <div className="contact-list">
+                {suggestions.map((c) => (
+                  <button key={c.user_id} className="contact-row" onClick={() => add(c.email)}>
+                    <span className="avatar">{c.email[0]?.toUpperCase()}</span>
+                    <span className="c-email">{c.email}</span>
+                    <span className="c-add">＋</span>
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="modal-actions">
+              <button onClick={onClose} disabled={busy}>Cancel</button>
+              {addMode ? (
+                <button className="primary" disabled={!recipients.length || busy} onClick={doShare}>{busy ? "Adding…" : "Add"}</button>
+              ) : (
+                <button className="primary" disabled={!recipients.length} onClick={() => setStep(2)}>Next</button>
+              )}
+            </div>
+          </>
+        ) : (
+          <>
+            <p className="muted">Sharing with {recipients.length} {recipients.length === 1 ? "person" : "people"}. Choose what they can do:</p>
+            <PermToggles
+              allowAdd={allowAdd} allowShare={allowShare} allowCopy={allowCopy}
+              setAllowAdd={setAllowAdd} setAllowShare={setAllowShare} setAllowCopy={setAllowCopy} />
+            <div className="modal-actions">
+              <button onClick={() => setStep(1)} disabled={busy}>Back</button>
+              <button className="primary" onClick={doShare} disabled={busy}>{busy ? "Sharing…" : "Share"}</button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Share loose files (a gallery/album selection, or one item in the viewer) by
+ *  auto-creating an album and sharing it. Two steps: recipients, then album name
+ *  + permissions. Mirrors Android's loose-files share. */
+function ShareFilesDialog({ set, albumId, filenames, onClose, onShared, showToast }: {
+  set: number;
+  albumId: string | null;
+  filenames: string[];
+  onClose: () => void;
+  onShared: () => void;
+  showToast: (m: string) => void;
+}) {
+  const defaultName = useMemo(
+    () => new Date().toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" }),
+    []
+  );
+  const [step, setStep] = useState<1 | 2>(1);
+  const [contacts, setContacts] = useState<Contact[]>([]);
+  const [query, setQuery] = useState("");
+  const [recipients, setRecipients] = useState<string[]>([]);
+  const [name, setName] = useState(defaultName);
+  const [allowAdd, setAllowAdd] = useState(true);
+  const [allowShare, setAllowShare] = useState(true);
+  const [allowCopy, setAllowCopy] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    api.listContacts().then(setContacts).catch(() => setContacts([]));
+    const h = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [onClose]);
+
+  const add = (email: string) => {
+    const e = email.trim().toLowerCase();
+    if (!e) return;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) { showToast("Enter a valid email"); return; }
+    if (recipients.includes(e)) return;
+    setRecipients((r) => [...r, e]);
+    setQuery("");
+  };
+  const removeRcpt = (email: string) => setRecipients((r) => r.filter((x) => x !== email));
+
+  const q = query.trim().toLowerCase();
+  const suggestions = contacts
+    .filter((c) => !recipients.includes(c.email.toLowerCase()))
+    .filter((c) => !q || c.email.toLowerCase().includes(q));
+
+  const doShare = async () => {
+    if (!recipients.length) return;
+    setBusy(true);
+    try {
+      await api.shareNewAlbum(set, albumId, filenames, name.trim() || defaultName,
+        recipients, allowAdd, allowShare, allowCopy);
+      showToast(`Shared ${filenames.length} item${filenames.length === 1 ? "" : "s"} with ${recipients.length} ${recipients.length === 1 ? "person" : "people"}`);
+      onShared();
+    } catch (err) {
+      showToast("Share failed: " + err);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal share-dialog" onClick={(e) => e.stopPropagation()}>
+        <div className="move-head">
+          <h3>Share {filenames.length} item{filenames.length === 1 ? "" : "s"}</h3>
+          <button className="icon-btn" onClick={onClose}>✕</button>
+        </div>
+
+        {step === 1 ? (
+          <>
+            <div className="chips">
+              {recipients.map((r) => (
+                <span key={r} className="chip">{r}<button onClick={() => removeRcpt(r)}>✕</button></span>
+              ))}
+              {recipients.length === 0 && <span className="muted">Who do you want to share with?</span>}
+            </div>
+            <div className="share-add">
+              <input autoFocus placeholder="Email address" value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") add(query); }} />
+              <button onClick={() => add(query)}>Add</button>
+            </div>
+            {suggestions.length > 0 && (
+              <div className="contact-list">
+                {suggestions.map((c) => (
+                  <button key={c.user_id} className="contact-row" onClick={() => add(c.email)}>
+                    <span className="avatar" style={{ background: avatarColor(c.email) }}>{c.email[0]?.toUpperCase()}</span>
+                    <span className="c-email">{c.email}</span>
+                    <span className="c-add">＋</span>
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="modal-actions">
+              <button onClick={onClose}>Cancel</button>
+              <button className="primary" disabled={!recipients.length} onClick={() => setStep(2)}>Next</button>
+            </div>
+          </>
+        ) : (
+          <>
+            <label className="share-name-label">Album name</label>
+            <input className="share-name-input" value={name} onChange={(e) => setName(e.target.value)} />
+            <PermToggles
+              allowAdd={allowAdd} allowShare={allowShare} allowCopy={allowCopy}
+              setAllowAdd={setAllowAdd} setAllowShare={setAllowShare} setAllowCopy={setAllowCopy} />
+            <div className="modal-actions">
+              <button onClick={() => setStep(1)} disabled={busy}>Back</button>
+              <button className="primary" onClick={doShare} disabled={busy}>{busy ? "Sharing…" : "Share"}</button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** The three permission rows. Editable (checkboxes) for owners, or a read-only
+ *  Yes/No summary for members viewing album info. */
+function PermToggles({ allowAdd, allowShare, allowCopy, setAllowAdd, setAllowShare, setAllowCopy, readOnly = false }: {
+  allowAdd: boolean; allowShare: boolean; allowCopy: boolean;
+  setAllowAdd?: (v: boolean) => void; setAllowShare?: (v: boolean) => void; setAllowCopy?: (v: boolean) => void;
+  readOnly?: boolean;
+}) {
+  const Row = (label: string, desc: string, val: boolean, set?: (v: boolean) => void) => (
+    <label className="perm-row">
+      <div>
+        <div className="perm-label">{label}</div>
+        <div className="perm-desc muted">{desc}</div>
+      </div>
+      {readOnly
+        ? <span className={"perm-badge " + (val ? "yes" : "no")}>{val ? "Yes" : "No"}</span>
+        : <input type="checkbox" checked={val} onChange={(e) => set?.(e.target.checked)} />}
+    </label>
+  );
+  return (
+    <div className="perm-list">
+      {Row("Allow adding photos", "Members can add photos and videos to this album.", allowAdd, setAllowAdd)}
+      {Row("Allow re-sharing", "Members can share this album with other people.", allowShare, setAllowShare)}
+      {Row("Allow copying", "Members can save and export copies of the photos.", allowCopy, setAllowCopy)}
+    </div>
+  );
+}
+
+/** Unified album sharing panel. For the owner it's editable (members add/remove,
+ *  permission toggles, unshare); for a member it's read-only info, plus an
+ *  "Add people" action when they hold the re-share permission. Mirrors Android's
+ *  AlbumSettingsDialogFragment / AlbumInfoDialogFragment. */
+function AlbumSharingDialog({ album, canShare, onClose, onChanged, onUnshared, showToast }: {
+  album: Album;
+  canShare: boolean;
+  onClose: () => void;
+  onChanged: (permissions?: string) => void;
+  onUnshared: () => void;
+  showToast: (m: string) => void;
+}) {
+  const isOwner = album.is_owner;
+  const [members, setMembers] = useState<AlbumMember[]>([]);
+  const perms = parsePermissions(album.permissions);
+  const [allowAdd, setAllowAdd] = useState(perms.add);
+  const [allowShare, setAllowShare] = useState(perms.share);
+  const [allowCopy, setAllowCopy] = useState(perms.copy);
+  const [busy, setBusy] = useState(false);
+  const [showAdd, setShowAdd] = useState(false);
+  const [confirmUnshare, setConfirmUnshare] = useState(false);
+
+  const load = useCallback(() => {
+    api.listAlbumMembers(album.album_id).then(setMembers).catch(() => setMembers([]));
+  }, [album.album_id]);
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    // Only close on Escape when no nested dialog is on top — otherwise a single
+    // Escape would dismiss both (all use window listeners).
+    const h = (e: KeyboardEvent) => { if (e.key === "Escape" && !showAdd && !confirmUnshare) onClose(); };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [onClose, showAdd, confirmUnshare]);
+
+  const dirty = allowAdd !== perms.add || allowShare !== perms.share || allowCopy !== perms.copy;
+
+  const savePerms = async () => {
+    setBusy(true);
+    try {
+      await api.editAlbumPerms(album.album_id, allowAdd, allowShare, allowCopy);
+      onChanged(`1${allowAdd ? 1 : 0}${allowShare ? 1 : 0}${allowCopy ? 1 : 0}`);
+      showToast("Permissions updated");
+    } catch (err) { showToast("Update failed: " + err); }
+    setBusy(false);
+  };
+
+  const remove = async (m: AlbumMember) => {
+    if (!confirm(`Remove ${m.email ?? "this member"} from the album?`)) return;
+    try {
+      await api.removeAlbumMember(album.album_id, m.user_id);
+      showToast("Member removed");
+      load();
+    } catch (err) { showToast("Remove failed: " + err); }
+  };
+
+  const unshare = async () => {
+    setConfirmUnshare(false);
+    try {
+      await api.unshareAlbum(album.album_id);
+      showToast("Unshared");
+      onUnshared();
+    } catch (err) { showToast("Unshare failed: " + err); }
+  };
+
+  const memberEmails = members.map((m) => m.email).filter((x): x is string => !!x);
+
+  return (
+    <>
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal share-dialog" onClick={(e) => e.stopPropagation()}>
+        <div className="move-head">
+          <h3>{isOwner ? "Sharing" : "Album info"} — “{album.name}”</h3>
+          <button className="icon-btn" onClick={onClose}>✕</button>
+        </div>
+
+        <h4 className="perm-head">Members</h4>
+        <div className="contact-list">
+          {members.length === 0 && <span className="muted">No members yet.</span>}
+          {members.map((m) => {
+            const label = m.is_owner ? "Me" : (m.email ?? `User ${m.user_id}`);
+            return (
+              <div key={m.user_id} className="contact-row static">
+                <span className="avatar">{label[0]?.toUpperCase()}</span>
+                <span className="c-email">{label}</span>
+                {isOwner && !m.is_owner && <button className="c-remove" onClick={() => remove(m)}>Remove</button>}
+              </div>
+            );
+          })}
+        </div>
+        {canShare && (
+          <button onClick={() => setShowAdd(true)}>＋ Add people</button>
+        )}
+
+        <h4 className="perm-head">Permissions</h4>
+        <PermToggles
+          allowAdd={allowAdd} allowShare={allowShare} allowCopy={allowCopy}
+          setAllowAdd={setAllowAdd} setAllowShare={setAllowShare} setAllowCopy={setAllowCopy}
+          readOnly={!isOwner} />
+
+        <div className="modal-actions">
+          {isOwner && <button className="danger" onClick={() => setConfirmUnshare(true)} style={{ marginRight: "auto" }}>Unshare</button>}
+          <button onClick={onClose}>Close</button>
+          {isOwner && <button className="primary" onClick={savePerms} disabled={busy || !dirty}>{busy ? "Saving…" : "Save permissions"}</button>}
+        </div>
+      </div>
+    </div>
+
+      {showAdd && (
+        <ShareDialog album={album} addMode excludeEmails={memberEmails}
+          onClose={() => setShowAdd(false)}
+          onShared={() => { load(); }}
+          showToast={showToast} />
+      )}
+      {confirmUnshare && (
+        <ConfirmDialog
+          title="Stop sharing this album?"
+          message="Everyone you shared it with will lose access."
+          onClose={() => setConfirmUnshare(false)}
+          actions={[
+            { label: "Cancel", onClick: () => setConfirmUnshare(false) },
+            { label: "Unshare", variant: "danger", onClick: unshare },
+          ]}
+        />
+      )}
+    </>
+  );
+}
+
+const AVATAR_COLORS = ["#378add", "#1d9e75", "#d85a30", "#7f77dd", "#d4537e", "#ba7517"];
+/** Deterministic avatar color from a seed (email or user-id). */
+function avatarColor(seed: string): string {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) | 0;
+  return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length];
+}
+
+function SharingView({ showToast, reloadSignal }: { showToast: (m: string) => void; reloadSignal: number }) {
+  const [albums, setAlbums] = useState<SharedAlbum[]>([]);
+  const [open, setOpen] = useState<SharedAlbum | null>(null);
+  const load = useCallback(() => { api.listSharedAlbums().then(setAlbums); }, []);
+  useEffect(() => { load(); }, [load, reloadSignal]);
+
+  if (open) return <AlbumDetail album={open} onBack={() => { setOpen(null); load(); }} showToast={showToast} />;
+
+  return (
+    <>
+      <div className="topbar"><h2>Sharing</h2></div>
+      <div className="content">
+        {albums.length === 0 ? (
+          <div className="empty">Nothing shared yet. Share an album, or albums shared with you will appear here after a sync.</div>
+        ) : (
+          <div className="share-grid">
+            {albums.map((a) => {
+              const others = a.members.filter((m) => !m.is_owner);
+              return (
+                <div key={a.album_id} className="share-card" onClick={() => setOpen(a)}>
+                  <div className="cover">
+                    {a.cover === BLANK_COVER
+                      ? <div className="blank-cover">🖼️</div>
+                      : a.cover ? <img src={mediaUrl(SET_ALBUM, a.cover, true, a.album_id)} /> : "📁"}
+                    <span className={"sc-badge " + (a.is_owner ? "sent" : "recv")}>
+                      {a.is_owner ? "↗ Shared by you" : "↙ Shared with you"}
+                    </span>
+                  </div>
+                  <div className="sc-body">
+                    <div className="sc-name">{a.name}</div>
+                    <div className="sc-foot">
+                      {others.length > 0 ? (
+                        <>
+                          <div className="sc-stack">
+                            {others.slice(0, 3).map((m) => (
+                              <span key={m.user_id} className="av"
+                                style={{ background: avatarColor(m.email ?? m.user_id) }}
+                                title={m.email ?? `User ${m.user_id}`}>
+                                {(m.email?.[0] ?? "?").toUpperCase()}
+                              </span>
+                            ))}
+                            {others.length > 3 && <span className="av more">+{others.length - 3}</span>}
+                          </div>
+                          <span className="sc-count">{others.length} {others.length === 1 ? "person" : "people"}</span>
+                        </>
+                      ) : (
+                        <span className="sc-count">No other members</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+/* ----------------------------- Contacts ----------------------------- */
+
+function ContactsView({ showToast, reloadSignal }: { showToast: (m: string) => void; reloadSignal: number }) {
+  const [contacts, setContacts] = useState<Contact[]>([]);
+  const [shared, setShared] = useState<SharedAlbum[]>([]);
+  const [query, setQuery] = useState("");
+  const [selected, setSelected] = useState<Contact | null>(null);
+  const [openAlbum, setOpenAlbum] = useState<SharedAlbum | null>(null);
+
+  const load = useCallback(() => {
+    api.listContacts().then(setContacts).catch(() => setContacts([]));
+    api.listSharedAlbums().then(setShared).catch(() => setShared([]));
+  }, []);
+  useEffect(() => { load(); }, [load, reloadSignal]);
+
+  // A contact's relationship: albums you own & shared with them (actionable), and
+  // shared albums you both belong to (you don't own — open only).
+  const relFor = useCallback((c: Contact) => ({
+    byMe: shared.filter((a) => a.is_owner && a.members.some((m) => m.user_id === c.user_id)),
+    bothIn: shared.filter((a) => !a.is_owner && a.members.some((m) => m.user_id === c.user_id)),
+  }), [shared]);
+
+  if (openAlbum) {
+    return <AlbumDetail album={openAlbum} showToast={showToast}
+      onBack={() => { setOpenAlbum(null); load(); }} />;
+  }
+  if (selected) {
+    // Re-resolve against the freshest data so actions reflect immediately.
+    const fresh = contacts.find((c) => c.user_id === selected.user_id) ?? selected;
+    return <ContactDetail contact={fresh} rel={relFor(fresh)}
+      onBack={() => { setSelected(null); load(); }}
+      onOpenAlbum={setOpenAlbum} onChanged={load} showToast={showToast} />;
+  }
+
+  const q = query.trim().toLowerCase();
+  const shown = contacts.filter((c) => !q || c.email.toLowerCase().includes(q));
+
+  return (
+    <>
+      <div className="topbar">
+        <h2>Contacts</h2>
+        <div className="actionbar">
+          <input className="contact-search" placeholder="Search contacts…" value={query}
+            onChange={(e) => setQuery(e.target.value)} />
+        </div>
+      </div>
+      <div className="content">
+        {contacts.length === 0 ? (
+          <div className="empty">No contacts yet. People you share albums with — and who share with you — appear here after a sync.</div>
+        ) : shown.length === 0 ? (
+          <div className="empty">No contacts match “{query}”.</div>
+        ) : (
+          <div className="contacts-grid">
+            {shown.map((c) => {
+              const { byMe, bothIn } = relFor(c);
+              const parts = [
+                byMe.length ? `You share ${byMe.length}` : null,
+                bothIn.length ? `${bothIn.length} in common` : null,
+              ].filter(Boolean);
+              return (
+                <div key={c.user_id} className="contact-card" onClick={() => setSelected(c)}>
+                  <span className="avatar big" style={{ background: avatarColor(c.email) }}>{c.email[0]?.toUpperCase()}</span>
+                  <div className="c-email" title={c.email}>{c.email}</div>
+                  <div className="c-sub muted">{parts.length ? parts.join(" · ") : "No shared albums"}</div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+function ContactDetail({ contact, rel, onBack, onOpenAlbum, onChanged, showToast }: {
+  contact: Contact;
+  rel: { byMe: SharedAlbum[]; bothIn: SharedAlbum[] };
+  onBack: () => void;
+  onOpenAlbum: (a: SharedAlbum) => void;
+  onChanged: () => void;
+  showToast: (m: string) => void;
+}) {
+  const [showShare, setShowShare] = useState(false);
+  const [confirmRevoke, setConfirmRevoke] = useState(false);
+
+  const removeFrom = async (a: SharedAlbum) => {
+    if (!confirm(`Remove ${contact.email} from “${a.name}”?`)) return;
+    try {
+      await api.removeAlbumMember(a.album_id, contact.user_id);
+      showToast(`Removed from ${a.name}`);
+      onChanged();
+    } catch (e) { showToast("Remove failed: " + e); }
+  };
+
+  const revokeAll = async () => {
+    setConfirmRevoke(false);
+    if (!rel.byMe.length) return;
+    let ok = 0;
+    for (const a of rel.byMe) {
+      try { await api.removeAlbumMember(a.album_id, contact.user_id); ok++; } catch { /* keep going */ }
+    }
+    showToast(`Stopped sharing ${ok} album${ok === 1 ? "" : "s"} with ${contact.email}`);
+    onChanged();
+  };
+
+  const row = (a: SharedAlbum, owned: boolean) => (
+    <div key={a.album_id} className="rel-row">
+      <div className="rel-cover" onClick={() => onOpenAlbum(a)}>
+        {a.cover === BLANK_COVER ? <span>🖼️</span>
+          : a.cover ? <img src={mediaUrl(SET_ALBUM, a.cover, true, a.album_id)} /> : <span>📁</span>}
+      </div>
+      <div className="rel-main" onClick={() => onOpenAlbum(a)}>
+        <div className="rel-name">{a.name}</div>
+        <div className="rel-sub muted">{a.count} item{a.count === 1 ? "" : "s"}</div>
+      </div>
+      {owned
+        ? <button className="c-remove" onClick={() => removeFrom(a)}>Remove</button>
+        : <button onClick={() => onOpenAlbum(a)}>Open</button>}
+    </div>
+  );
+
+  return (
+    <>
+      <div className="topbar">
+        <button onClick={onBack}>←</button>
+        <h2>{contact.email}</h2>
+      </div>
+      <div className="content">
+        <div className="rel-wrap">
+          <div className="rel-headcard">
+            <span className="avatar big" style={{ background: avatarColor(contact.email) }}>{contact.email[0]?.toUpperCase()}</span>
+            <div className="rel-headinfo">
+              <div className="rel-heademail">{contact.email}</div>
+              {contact.date_used > 0 && <div className="muted rel-headdate">Last shared {dateLabel(contact.date_used)}</div>}
+            </div>
+            <div className="rel-headactions">
+              <button className="primary" onClick={() => setShowShare(true)}>＋ Share an album</button>
+              {rel.byMe.length > 0 && <button className="danger" onClick={() => setConfirmRevoke(true)}>Stop sharing all</button>}
+            </div>
+          </div>
+
+          <h3 className="rel-sec">Albums you share with them</h3>
+          {rel.byMe.length === 0
+            ? <div className="rel-empty muted">You haven't shared any albums with {contact.email}.</div>
+            : <div className="rel-list">{rel.byMe.map((a) => row(a, true))}</div>}
+
+          <h3 className="rel-sec">Shared albums you're both in</h3>
+          {rel.bothIn.length === 0
+            ? <div className="rel-empty muted">No albums shared with you that {contact.email} is also in.</div>
+            : <div className="rel-list">{rel.bothIn.map((a) => row(a, false))}</div>}
+        </div>
+      </div>
+
+      {showShare && (
+        <ShareAlbumToContactDialog contact={contact}
+          alreadyShared={new Set(rel.byMe.map((a) => a.album_id))}
+          onClose={() => setShowShare(false)}
+          onShared={() => { setShowShare(false); onChanged(); }}
+          showToast={showToast} />
+      )}
+      {confirmRevoke && (
+        <ConfirmDialog
+          title={`Stop sharing with ${contact.email}?`}
+          message={`They'll lose access to all ${rel.byMe.length} album${rel.byMe.length === 1 ? "" : "s"} you've shared with them.`}
+          onClose={() => setConfirmRevoke(false)}
+          actions={[
+            { label: "Cancel", onClick: () => setConfirmRevoke(false) },
+            { label: "Stop sharing", variant: "danger", onClick: revokeAll },
+          ]}
+        />
+      )}
+    </>
+  );
+}
+
+/** Pick one of your albums to share with a specific contact. */
+function ShareAlbumToContactDialog({ contact, alreadyShared, onClose, onShared, showToast }: {
+  contact: Contact;
+  alreadyShared: Set<string>;
+  onClose: () => void;
+  onShared: () => void;
+  showToast: (m: string) => void;
+}) {
+  const [albums, setAlbums] = useState<Album[]>([]);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    api.listAlbums().then(setAlbums).catch(() => setAlbums([]));
+    const h = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [onClose]);
+
+  // Only your own albums you haven't already shared with this person.
+  const candidates = albums.filter((a) => a.is_owner && !alreadyShared.has(a.album_id));
+
+  const share = async (a: Album) => {
+    if (busy) return;
+    setBusy(true);
+    // Preserve an already-shared album's permissions; default all-on for a fresh share.
+    const p = a.is_shared ? parsePermissions(a.permissions) : { add: true, share: true, copy: true };
+    try {
+      await api.shareAlbum(a.album_id, [contact.email], p.add, p.share, p.copy);
+      showToast(`Shared “${a.name}” with ${contact.email}`);
+      onShared();
+    } catch (e) { showToast("Share failed: " + e); setBusy(false); }
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal move-dialog" onClick={(e) => e.stopPropagation()}>
+        <div className="move-head">
+          <h3>Share an album with {contact.email}</h3>
+          <button className="icon-btn" onClick={onClose}>✕</button>
+        </div>
+        {candidates.length === 0 ? (
+          <p className="muted">No albums left to share with this person.</p>
+        ) : (
+          <div className="move-grid">
+            {candidates.map((a) => (
+              <div key={a.album_id} className="move-card" onClick={() => share(a)}>
+                <div className="move-cover">
+                  {a.cover === BLANK_COVER ? <span>🖼️</span>
+                    : a.cover ? <img src={mediaUrl(SET_ALBUM, a.cover, true, a.album_id)} /> : <span>📁</span>}
+                </div>
+                <div className="move-name" title={a.name}>{a.name}</div>
+                <div className="move-count">{a.count} item{a.count === 1 ? "" : "s"}{a.is_shared ? " · shared" : ""}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -1422,7 +2262,7 @@ function TrashView({ showToast, onChanged, reloadSignal }: { showToast: (m: stri
           {sel.size > 0 && <>
             <span className="muted">{sel.size} selected</span>
             <button onClick={() => setSel(new Set(items.map((f) => f.filename)))}>Select all</button>
-            <button onClick={async () => { await api.restore([...sel]); setSel(new Set()); showToast("Restored"); load(); onChanged(); }}>Restore</button>
+            <button onClick={async () => { await api.restore([...sel]); setSel(new Set()); showToast("Restored"); onChanged(); }}>Restore</button>
             <button onClick={async () => { if (confirm("Delete forever?")) { await api.deletePermanently([...sel]); setSel(new Set()); load(); } }}>Delete</button>
             <button onClick={() => setSel(new Set())}>Cancel</button>
           </>}
@@ -1925,7 +2765,10 @@ function MoveDialog({ fromSet, fromAlbum, count, onPick, onClose }: {
     return () => window.removeEventListener("keydown", h);
   }, [onClose]);
 
-  const targets = albums.filter((a) => a.album_id !== fromAlbum && a.is_owner);
+  // You can add into your own albums, or a shared album where you have allowAdd.
+  const targets = albums.filter((a) =>
+    a.album_id !== fromAlbum &&
+    (a.is_owner || (a.is_shared && parsePermissions(a.permissions).add)));
   const priv = targets.filter((a) => !a.is_shared);
   const shared = targets.filter((a) => a.is_shared);
   const verb = isMoving ? "Move" : "Copy";
@@ -2023,12 +2866,18 @@ function ConfirmDialog({ title, message, actions, onClose }: {
   );
 }
 
-function ActionButtons({ set, albumId, filenames, onDone, showToast, onTrashed }: {
+/** Per-album capability flags. Omitted (gallery/trash) ⇒ everything allowed. */
+type FileCaps = { canCopy: boolean; canDelete: boolean; canShare: boolean };
+const FULL_CAPS: FileCaps = { canCopy: true, canDelete: true, canShare: true };
+
+function ActionButtons({ set, albumId, filenames, onDone, showToast, onTrashed, caps = FULL_CAPS }: {
   set: number; albumId: string | null; filenames: string[];
   onDone: () => void; showToast: (m: string) => void;
   onTrashed?: (filenames: string[]) => void;
+  caps?: FileCaps;
 }) {
   const [moving, setMoving] = useState(false);
+  const [sharing, setSharing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const save = async () => {
     const dir = await pickFolder();
@@ -2055,10 +2904,17 @@ function ActionButtons({ set, albumId, filenames, onDone, showToast, onTrashed }
   };
   return (
     <>
-      <button onClick={save}>⤓ Save</button>
-      <button onClick={() => setMoving(true)}>→ Move</button>
-      <button onClick={() => setConfirmDelete(true)}>🗑️ Delete</button>
+      {caps.canShare && <button onClick={() => setSharing(true)}>👥 Share</button>}
+      {caps.canCopy && <button onClick={save}>⤓ Save</button>}
+      {caps.canCopy && <button onClick={() => setMoving(true)}>→ Move</button>}
+      {caps.canDelete && <button onClick={() => setConfirmDelete(true)}>🗑️ Delete</button>}
       {moving && <MoveDialog fromSet={set} fromAlbum={albumId} count={filenames.length} onPick={move} onClose={() => setMoving(false)} />}
+      {sharing && (
+        <ShareFilesDialog set={set} albumId={albumId} filenames={filenames}
+          onClose={() => setSharing(false)}
+          onShared={() => { setSharing(false); onDone(); }}
+          showToast={showToast} />
+      )}
       {confirmDelete && (
         <ConfirmDialog
           title={filenames.length === 1 ? "Move to trash?" : `Move ${filenames.length} items to trash?`}
@@ -2076,10 +2932,11 @@ function ActionButtons({ set, albumId, filenames, onDone, showToast, onTrashed }
 
 /* ----------------------------- Viewer ----------------------------- */
 
-function Viewer({ items, index, set, albumId, onClose, onChanged, showToast, onTrashed }: {
+function Viewer({ items, index, set, albumId, onClose, onChanged, showToast, onTrashed, caps = FULL_CAPS }: {
   items: FileItem[]; index: number; set: number; albumId: string | null;
   onClose: () => void; onChanged: () => void; showToast: (m: string) => void;
   onTrashed?: (filenames: string[]) => void;
+  caps?: FileCaps;
 }) {
   const [i, setI] = useState(index);
   const vidPress = useRef<{ x: number; y: number } | null>(null);
@@ -2094,16 +2951,28 @@ function Viewer({ items, index, set, albumId, onClose, onChanged, showToast, onT
     return () => window.removeEventListener("keydown", h);
   }, [items.length, onClose]);
 
-  // Ctrl/Cmd+C copies the currently-viewed item.
+  // Ctrl/Cmd+C copies the currently-viewed item — blocked without copy permission.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "c") return;
-      if (inTextField(e) || !f) return;
+      if (inTextField(e) || !f || !caps.canCopy) return;
       copyToClipboard(set, albumId, [f.filename], showToast);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [f, set, albumId, showToast]);
+  }, [f, set, albumId, showToast, caps.canCopy]);
+
+  // Warm the encrypted on-disk cache for the neighbors so next/back doesn't
+  // stall on a full network download (most of a large gallery is remote-only).
+  // Slightly debounced so holding an arrow key doesn't queue a fetch per step.
+  useEffect(() => {
+    const neighbors = [i + 1, i - 1, i + 2]
+      .filter((j) => j >= 0 && j < items.length && j !== i)
+      .map((j) => items[j].filename);
+    if (neighbors.length === 0) return;
+    const t = setTimeout(() => { api.prefetchMedia(set, neighbors).catch(() => {}); }, 150);
+    return () => clearTimeout(t);
+  }, [i, items, set]);
 
   if (!f) return null;
   // `is_video` already comes with the listed row (decoded from its header), so use
@@ -2119,7 +2988,7 @@ function Viewer({ items, index, set, albumId, onClose, onChanged, showToast, onT
       <div className="close">✕</div>
       <div className="viewer-actions" onClick={stop}>
         <ActionButtons set={set} albumId={albumId} filenames={[f.filename]}
-          onTrashed={onTrashed}
+          caps={caps} onTrashed={onTrashed}
           onDone={() => { onChanged(); onClose(); }} showToast={showToast} />
       </div>
       {i > 0 && <button className="nav-btn prev" onClick={(e) => { e.stopPropagation(); setI(i - 1); }}>‹</button>}
@@ -2133,12 +3002,12 @@ function Viewer({ items, index, set, albumId, onClose, onChanged, showToast, onT
               const p = vidPress.current;
               if (p && Math.hypot(e.clientX - p.x, e.clientY - p.y) >= 6) {
                 vidPress.current = null;
-                nativeDragOut(set, albumId, [f.filename]);
+                if (caps.canCopy) nativeDragOut(set, albumId, [f.filename]);
               }
             }}
             onMouseUp={() => { vidPress.current = null; }} />
         : <ZoomableImage key={f.filename} thumbUrl={thumbUrl} fullUrl={fullUrl}
-            onDragOut={() => nativeDragOut(set, albumId, [f.filename])} />}
+            onDragOut={caps.canCopy ? () => nativeDragOut(set, albumId, [f.filename]) : undefined} />}
       {i < items.length - 1 && <button className="nav-btn next" onClick={(e) => { e.stopPropagation(); setI(i + 1); }}>›</button>}
       <div className="name">{i + 1} / {items.length}</div>
     </div>

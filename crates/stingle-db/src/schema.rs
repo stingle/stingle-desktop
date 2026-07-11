@@ -1,8 +1,11 @@
 //! Schema DDL, mirroring `StingleDbContract` plus a `kv` table for sync cursors,
 //! cached space, and app settings.
 
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
+// v2: `is_video` on files/trash/album_files — derived once from the encrypted
+// header (at sync/import ingest, or lazily backfilled) so listings never have
+// to seal-open every row's header. NULL = not derived yet (legacy rows).
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
     _id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -13,7 +16,8 @@ CREATE TABLE IF NOT EXISTS files (
     reupload      INTEGER NOT NULL DEFAULT 0,
     date_created  INTEGER NOT NULL DEFAULT 0,
     date_modified INTEGER NOT NULL DEFAULT 0,
-    headers       TEXT
+    headers       TEXT,
+    is_video      INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_files_localremote ON files(is_local, is_remote);
 -- Composite so paginated `ORDER BY date_created, _id` (both directions) is served
@@ -31,7 +35,8 @@ CREATE TABLE IF NOT EXISTS trash (
     reupload      INTEGER NOT NULL DEFAULT 0,
     date_created  INTEGER NOT NULL DEFAULT 0,
     date_modified INTEGER NOT NULL DEFAULT 0,
-    headers       TEXT
+    headers       TEXT,
+    is_video      INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_trash_localremote ON trash(is_local, is_remote);
 DROP INDEX IF EXISTS idx_trash_date;
@@ -66,6 +71,7 @@ CREATE TABLE IF NOT EXISTS album_files (
     headers       TEXT,
     date_created  INTEGER NOT NULL DEFAULT 0,
     date_modified INTEGER NOT NULL DEFAULT 0,
+    is_video      INTEGER,
     UNIQUE(album_id, filename)
 );
 CREATE INDEX IF NOT EXISTS idx_album_files_album ON album_files(album_id, date_created DESC);

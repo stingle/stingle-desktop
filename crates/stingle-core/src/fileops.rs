@@ -177,6 +177,8 @@ impl Account {
                 headers: new_headers,
                 date_created: row.date_created,
                 date_modified: row.date_modified,
+                // Re-sealing changes the header's recipient, not the content type.
+                is_video: row.is_video,
             })?;
             // Copy keeps the source; move removes it.
             if is_moving {
@@ -231,6 +233,7 @@ impl Account {
                     headers: new_headers,
                     date_created: row.date_created,
                     date_modified: row.date_modified,
+                    is_video: row.is_video,
                 },
             )?;
             // Copy keeps the album entry; move removes it.
@@ -292,6 +295,7 @@ impl Account {
                     headers: new_headers,
                     date_created: row.date_created,
                     date_modified: row.date_modified,
+                    is_video: row.is_video,
                 },
             )?;
             self.db.delete_album_file(album, &row.filename)?;

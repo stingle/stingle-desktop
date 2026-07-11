@@ -100,9 +100,18 @@ impl Account {
 
     // ------------------------- cloud → local -------------------------
 
-    pub async fn sync_cloud_to_local(&self) -> Result<()> {
+    /// Pull and apply remote changes. Returns the number of applied updates
+    /// (files, trash, albums, album files, contacts, deletes) — `0` means the
+    /// local library did not change, so callers can skip refresh work.
+    pub async fn sync_cloud_to_local(&self) -> Result<usize> {
         let mut cur = self.load_cursors();
         let updates: Updates = self.client.get_updates(self.token(), cur).await?;
+        let changed = updates.files.len()
+            + updates.trash.len()
+            + updates.albums.len()
+            + updates.album_files.len()
+            + updates.contacts.len()
+            + updates.deletes.len();
 
         for rf in &updates.files {
             self.process_file(FileSet::Gallery, rf)?;
@@ -143,7 +152,7 @@ impl Account {
         if had_deletes {
             let _ = self.prune_orphan_blobs();
         }
-        Ok(())
+        Ok(changed)
     }
 
     fn process_file(&self, set: FileSet, rf: &RemoteFile) -> Result<()> {
@@ -157,6 +166,14 @@ impl Account {
         let existing = self.db.get_file(set, &rf.filename)?;
         let is_local =
             existing.as_ref().map(|e| e.is_local).unwrap_or(false) || self.paths.original(&rf.filename).exists();
+        // Derive `is_video` once, at ingest, so listings never seal-open headers.
+        // An unchanged header keeps the already-derived value for free.
+        let is_video = existing
+            .as_ref()
+            .filter(|e| e.headers == rf.headers)
+            .and_then(|e| e.is_video)
+            .map(Some)
+            .unwrap_or_else(|| self.try_row_is_video(set, None, &rf.headers));
         self.db.insert_file(
             set,
             &DbFile {
@@ -170,6 +187,7 @@ impl Account {
                 date_created: rf.date_created,
                 date_modified: rf.date_modified,
                 headers: rf.headers.clone(),
+                is_video,
             },
         )?;
         Ok(())
@@ -180,12 +198,17 @@ impl Account {
             tracing::warn!("skipping album file with unsafe name from server: {:?}", rf.filename);
             return Ok(());
         }
-        let is_local = self
-            .db
-            .get_album_file(&rf.album_id, &rf.filename)?
-            .map(|e| e.is_local)
-            .unwrap_or(false)
+        let existing = self.db.get_album_file(&rf.album_id, &rf.filename)?;
+        let is_local = existing.as_ref().map(|e| e.is_local).unwrap_or(false)
             || self.paths.original(&rf.filename).exists();
+        let is_video = existing
+            .as_ref()
+            .filter(|e| e.headers == rf.headers)
+            .and_then(|e| e.is_video)
+            .map(Some)
+            .unwrap_or_else(|| {
+                self.try_row_is_video(FileSet::Album, Some(&rf.album_id), &rf.headers)
+            });
         self.db.insert_album_file(&DbFile {
             id: 0,
             album_id: Some(rf.album_id.clone()),
@@ -197,6 +220,7 @@ impl Account {
             date_created: rf.date_created,
             date_modified: rf.date_modified,
             headers: rf.headers.clone(),
+            is_video,
         })?;
         Ok(())
     }
@@ -288,6 +312,10 @@ impl Account {
         }
         let _ = std::fs::remove_file(self.paths.original(filename));
         let _ = std::fs::remove_file(self.paths.thumb(filename));
+        // Drop any decrypted in-memory copies so a deleted file can't be served
+        // from the session caches.
+        self.thumb_cache.remove(filename);
+        self.media_cache.remove(filename);
     }
 
     // ------------------------- local → cloud -------------------------
@@ -295,10 +323,12 @@ impl Account {
     /// Upload every pending local-only / re-upload file. `progress(done, total)`
     /// is called once up front with the full count and again after each file, so
     /// the UI can show upload progress (file-count granularity).
+    /// Push local-only / reupload-flagged files. Returns how many were
+    /// uploaded — `0` means nothing changed remotely or locally.
     pub async fn upload_to_cloud(
         &self,
         progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         // Build the full work list first so `total` is known before we start.
         let mut work: Vec<(FileSet, DbFile)> = Vec::new();
         for set in [FileSet::Gallery, FileSet::Trash] {
@@ -323,7 +353,7 @@ impl Account {
                 cb(i + 1, total);
             }
         }
-        Ok(())
+        Ok(total)
     }
 
     async fn upload_one(&self, set: FileSet, f: &DbFile) -> Result<()> {
@@ -477,18 +507,42 @@ impl Account {
     }
 
     /// Decrypt an album's secret key with the user keypair and rebuild it.
+    /// Cached per album id (validated against the current `enc_private_key`, so
+    /// a re-keyed album can never hit a stale entry) — album media requests and
+    /// header decodes would otherwise pay a box-open + scalarmult each time.
     pub fn album_keypair(&self, album_id: &str) -> Result<KeyPair> {
         let a = self
             .db
             .get_album(album_id)?
             .ok_or(CoreError::Other("album not found".into()))?;
+        if let Ok(cache) = self.album_kp_cache.lock() {
+            if let Some((enc, pk, sk)) = cache.get(album_id) {
+                if *enc == a.enc_private_key {
+                    return Ok(KeyPair {
+                        public_key: pk.clone(),
+                        secret_key: zeroize::Zeroizing::new(sk.to_vec()),
+                    });
+                }
+            }
+        }
         let enc_sk = B64.decode(a.enc_private_key.trim())?;
         let album_sk = stingle_crypto::album::decrypt_album_sk(
             &enc_sk,
             &self.keypair.public_key,
             &self.keypair.secret_key,
         )?;
-        Ok(KeyPair::from_secret_key(&album_sk)?)
+        let kp = KeyPair::from_secret_key(&album_sk)?;
+        if let Ok(mut cache) = self.album_kp_cache.lock() {
+            cache.insert(
+                album_id.to_string(),
+                (
+                    a.enc_private_key.clone(),
+                    kp.public_key.clone(),
+                    zeroize::Zeroizing::new(kp.secret_key.to_vec()),
+                ),
+            );
+        }
+        Ok(kp)
     }
 }
 

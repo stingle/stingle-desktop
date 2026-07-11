@@ -30,6 +30,41 @@ fn needs_transcode(content_type: &str) -> bool {
     matches!(content_type, "image/heic" | "image/heif" | "image/tiff")
 }
 
+/// Detect a decrypted image's real format from its magic bytes. Returns the
+/// content type to serve and, for formats the webview can't render, the ffmpeg
+/// input extension to transcode from.
+///
+/// Thumbnails are *usually* JPEG, but some clients store PNG/HEIC/TIFF/… ones.
+/// The webview sniffs the web formats (JPEG/PNG/GIF/WebP/BMP/AVIF) from the bytes
+/// regardless of the declared content type, so those only need a correct label;
+/// HEIC/HEIF/TIFF it cannot decode, so they must be transcoded to JPEG — the same
+/// treatment full-resolution images already get.
+fn sniff_image(body: &[u8]) -> (&'static str, Option<&'static str>) {
+    let starts = |sig: &[u8]| body.len() >= sig.len() && &body[..sig.len()] == sig;
+    if starts(&[0xff, 0xd8, 0xff]) {
+        ("image/jpeg", None)
+    } else if starts(b"\x89PNG\r\n\x1a\n") {
+        ("image/png", None)
+    } else if starts(b"GIF8") {
+        ("image/gif", None)
+    } else if starts(b"RIFF") && body.len() >= 12 && &body[8..12] == b"WEBP" {
+        ("image/webp", None)
+    } else if starts(b"BM") {
+        ("image/bmp", None)
+    } else if body.len() >= 12 && &body[4..8] == b"ftyp" {
+        // ISO-BMFF container: AVIF renders in the webview; HEIC/HEIF do not.
+        match &body[8..12] {
+            b"avif" | b"avis" => ("image/avif", None),
+            _ => ("image/heic", Some("heic")),
+        }
+    } else if starts(&[0x49, 0x49, 0x2a, 0x00]) || starts(&[0x4d, 0x4d, 0x00, 0x2a]) {
+        ("image/tiff", Some("tiff"))
+    } else {
+        // Unknown: label it JPEG and let the webview sniff the bytes.
+        ("image/jpeg", None)
+    }
+}
+
 fn mime_for(filename: &str, file_type: u8) -> String {
     let ext = Path::new(filename)
         .extension()
@@ -105,6 +140,18 @@ impl Account {
     /// string (no extra DB query). For listing many files at once. Returns
     /// false on any decode error rather than failing the whole listing.
     pub fn row_is_video(&self, set: FileSet, album_id: Option<&str>, headers: &str) -> bool {
+        self.try_row_is_video(set, album_id, headers).unwrap_or(false)
+    }
+
+    /// Like [`Self::row_is_video`] but distinguishes "couldn't decode" (`None`)
+    /// from a real answer — so callers persisting the derived flag never store
+    /// a guessed `false` for an undecodable header.
+    pub fn try_row_is_video(
+        &self,
+        set: FileSet,
+        album_id: Option<&str>,
+        headers: &str,
+    ) -> Option<bool> {
         (|| -> Result<bool> {
             let part = headers_part(headers, false)?;
             let kp = self.keypair_for(set, album_id)?;
@@ -112,7 +159,7 @@ impl Account {
                 file::read_header(&mut Cursor::new(&part), &kp.public_key, &kp.secret_key)?;
             Ok(header.file_type == stingle_crypto::constants::FILE_TYPE_VIDEO)
         })()
-        .unwrap_or(false)
+        .ok()
     }
 
     /// Produce a decrypted media response for the UI/protocol handler.
@@ -129,9 +176,21 @@ impl Account {
         // Skips the DB lookup, header decrypt, disk read, and blob decrypt.
         // (Thumbnails are whole-file requests; ranges only apply to video.)
         if is_thumb && range.is_none() {
-            if let Some(body) = self.thumb_cache.get(filename) {
+            if let Some((content_type, body)) = self.thumb_cache.get(filename) {
                 return Ok(MediaResponse {
-                    content_type: "image/jpeg".to_string(),
+                    content_type,
+                    total_size: body.len() as u64,
+                    body,
+                    range: None,
+                });
+            }
+        }
+        // Same fast path for full-resolution images (viewer back/forward and
+        // re-opens): skips the disk read, blob decrypt, and any transcode.
+        if !is_thumb && range.is_none() {
+            if let Some((content_type, body)) = self.media_cache.get(filename) {
+                return Ok(MediaResponse {
+                    content_type,
                     total_size: body.len() as u64,
                     body,
                     range: None,
@@ -187,8 +246,25 @@ impl Account {
                 .await
                 .map_err(|e| CoreError::Other(format!("decrypt task failed: {e}")))??;
                 let mut ct = content_type;
-                // Transcode formats the webview can't display for full preview.
-                if !is_thumb && needs_transcode(&ct) {
+                if is_thumb {
+                    // A thumbnail's declared type was assumed JPEG, but the actual
+                    // bytes may be PNG/HEIC/TIFF/… Serve the real type; transcode
+                    // the ones the webview can't render (HEIC/HEIF/TIFF) to JPEG.
+                    let (sniffed_ct, transcode_ext) = sniff_image(&body);
+                    match transcode_ext {
+                        Some(ext) => match crate::thumbnail::transcode_to_jpeg(&body, ext) {
+                            Ok(jpg) => {
+                                body = jpg;
+                                ct = "image/jpeg".to_string();
+                            }
+                            // Transcode failed: send the real type so the webview
+                            // can at least try, rather than mislabelling it JPEG.
+                            Err(_) => ct = sniffed_ct.to_string(),
+                        },
+                        None => ct = sniffed_ct.to_string(),
+                    }
+                } else if needs_transcode(&ct) {
+                    // Transcode formats the webview can't display for full preview.
                     let ext = Path::new(&header.filename)
                         .extension()
                         .and_then(|e| e.to_str())
@@ -199,9 +275,13 @@ impl Account {
                         ct = "image/jpeg".to_string();
                     }
                 }
-                // Keep decrypted thumbnails in memory for instant re-display.
+                // Keep decrypted thumbnails / full images in memory for instant
+                // re-display. Videos are excluded: they stream via ranges and a
+                // single body could blow the whole budget.
                 if is_thumb {
-                    self.thumb_cache.put(filename.to_string(), body.clone());
+                    self.thumb_cache.put(filename.to_string(), ct.clone(), body.clone());
+                } else if ct.starts_with("image/") {
+                    self.media_cache.put(filename.to_string(), ct.clone(), body.clone());
                 }
                 Ok(MediaResponse {
                     content_type: ct,
@@ -250,5 +330,43 @@ impl Account {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sniff_image;
+
+    fn ftyp(brand: &[u8]) -> Vec<u8> {
+        let mut v = vec![0, 0, 0, 0x18];
+        v.extend_from_slice(b"ftyp");
+        v.extend_from_slice(brand);
+        v.extend_from_slice(&[0u8; 8]);
+        v
+    }
+
+    #[test]
+    fn web_formats_are_served_verbatim() {
+        assert_eq!(sniff_image(&[0xff, 0xd8, 0xff, 0xe0]), ("image/jpeg", None));
+        assert_eq!(sniff_image(b"\x89PNG\r\n\x1a\n....."), ("image/png", None));
+        assert_eq!(sniff_image(b"GIF89a"), ("image/gif", None));
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8 ".to_vec();
+        webp.extend_from_slice(&[0u8; 8]);
+        assert_eq!(sniff_image(&webp), ("image/webp", None));
+        assert_eq!(sniff_image(b"BM\0\0\0\0"), ("image/bmp", None));
+        assert_eq!(sniff_image(&ftyp(b"avif")), ("image/avif", None));
+    }
+
+    #[test]
+    fn non_web_formats_request_transcode() {
+        assert_eq!(sniff_image(&ftyp(b"heic")), ("image/heic", Some("heic")));
+        assert_eq!(sniff_image(&ftyp(b"mif1")), ("image/heic", Some("heic")));
+        assert_eq!(sniff_image(&[0x49, 0x49, 0x2a, 0x00, 0x08]), ("image/tiff", Some("tiff")));
+    }
+
+    #[test]
+    fn unknown_falls_back_to_jpeg_label() {
+        assert_eq!(sniff_image(b"\x00\x01\x02\x03garbage"), ("image/jpeg", None));
+        assert_eq!(sniff_image(b""), ("image/jpeg", None));
     }
 }

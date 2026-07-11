@@ -4,19 +4,40 @@
 //! we only ever *download* them. After a sync we pull every missing thumbnail
 //! concurrently (thumbnails are small, so a high fan-out finishes quickly).
 
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::stream::{self, StreamExt};
+use stingle_crypto::file::FILE_HEADER_BEGINNING_LEN;
 use stingle_db::{FileSet, Sort};
 
 use crate::account::Account;
 use crate::error::Result;
 
+/// True if `path` holds no usable encrypted blob and must be (re)downloaded:
+/// absent, empty, or smaller than a complete `.sp` outer header
+/// (`FILE_HEADER_BEGINNING_LEN` = 39 bytes).
+///
+/// The size floor is what catches a **poisoned cache**: `sync/download` returns
+/// its `{"status":"nok"}` error envelope with HTTP 200, and a build predating the
+/// `is_sp_blob` download guard wrote those 16-byte bodies to disk in place of
+/// thumbnails. The old `len == 0` check treated them as present, so the bulk
+/// prefetch skipped them forever and the tiles stayed permanently broken. A real
+/// `.sp` can never be shorter than its own outer header, so anything below the
+/// floor is safe to discard and re-fetch. This is a stat-only check (no open) so
+/// it stays cheap across a 25k+ item library; the full "SP" magic is validated
+/// on the on-demand serving path (`sp_magic_ok` in `sync.rs`).
+fn blob_incomplete(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) => m.len() < FILE_HEADER_BEGINNING_LEN as u64,
+        Err(_) => true,
+    }
+}
+
 impl Account {
     /// Does this file's encrypted thumbnail still need downloading?
     fn thumb_missing(&self, filename: &str) -> bool {
-        let p = self.paths.thumb(filename);
-        !p.exists() || std::fs::metadata(&p).map(|m| m.len() == 0).unwrap_or(true)
+        blob_incomplete(&self.paths.thumb(filename))
     }
 
     /// Download one encrypted thumbnail blob to disk (no decryption).
@@ -86,8 +107,7 @@ impl Account {
 
     /// Is this file's encrypted original still missing from disk?
     fn original_missing(&self, filename: &str) -> bool {
-        let p = self.paths.original(filename);
-        !p.exists() || std::fs::metadata(&p).map(|m| m.len() == 0).unwrap_or(true)
+        blob_incomplete(&self.paths.original(filename))
     }
 
     /// Download every missing **original** (gallery, trash, all albums) with up
@@ -156,5 +176,39 @@ impl Account {
             .await;
 
         Ok(total)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{blob_incomplete, FILE_HEADER_BEGINNING_LEN};
+
+    #[test]
+    fn incomplete_detects_absent_empty_and_poisoned_blobs() {
+        let dir = std::env::temp_dir().join(format!("sp-prefetch-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Absent file.
+        let absent = dir.join("absent.sp");
+        assert!(blob_incomplete(&absent));
+
+        // Empty file.
+        let empty = dir.join("empty.sp");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(blob_incomplete(&empty));
+
+        // The exact server error body a pre-guard build cached in place of a
+        // thumbnail (16 bytes, HTTP 200) — must be treated as needing re-download.
+        let poison = dir.join("poison.sp");
+        std::fs::write(&poison, br#"{"status":"nok"}"#).unwrap();
+        assert!(blob_incomplete(&poison));
+
+        // A blob at least as large as a full `.sp` outer header is trusted at the
+        // planning stage (the on-demand path validates the "SP" magic).
+        let ok = dir.join("ok.sp");
+        std::fs::write(&ok, vec![0u8; FILE_HEADER_BEGINNING_LEN]).unwrap();
+        assert!(!blob_incomplete(&ok));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

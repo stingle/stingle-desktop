@@ -18,10 +18,10 @@ pub mod import;
 pub mod media;
 pub mod paths;
 pub mod prefetch;
+pub mod media_cache;
 pub mod sharing;
 pub mod sync;
 pub mod takeout;
-pub mod thumb_cache;
 pub mod thumbnail;
 mod util;
 

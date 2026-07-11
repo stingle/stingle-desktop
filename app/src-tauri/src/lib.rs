@@ -12,7 +12,7 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use serde::Serialize;
-use stingle_core::{Account, DbFile, FileSet, Sort};
+use stingle_core::{Account, DbAlbum, DbFile, FileSet, Sort};
 use tauri::{Emitter, Manager, State};
 use tokio::sync::Mutex;
 
@@ -141,18 +141,54 @@ struct FileDto {
     is_video: bool,
 }
 
-/// Build a `FileDto`, computing `is_video` from the row's stored header.
-fn file_dto(acc: &Account, set: FileSet, album_id: Option<&str>, f: DbFile) -> FileDto {
-    let is_video = acc.row_is_video(set, album_id, &f.headers);
-    FileDto {
-        filename: f.filename,
-        album_id: f.album_id,
-        date_created: f.date_created,
-        date_modified: f.date_modified,
-        is_local: f.is_local,
-        is_remote: f.is_remote,
-        is_video,
+/// Build `FileDto`s from listed rows. `is_video` comes from the DB column
+/// (derived once at ingest); rows that predate the column are decoded here and
+/// the result is written back in one batch, so each legacy row pays the header
+/// seal-open exactly once ever — never per listing.
+fn file_dtos(acc: &Account, set: FileSet, album_id: Option<&str>, rows: Vec<DbFile>) -> Vec<FileDto> {
+    let mut backfill: Vec<(String, bool)> = Vec::new();
+    let out = rows
+        .into_iter()
+        .map(|f| {
+            let is_video = match f.is_video {
+                Some(v) => v,
+                None => {
+                    let derived = acc.try_row_is_video(set, album_id, &f.headers);
+                    if let Some(v) = derived {
+                        backfill.push((f.filename.clone(), v));
+                    }
+                    // An undecodable header renders as a photo (same fallback
+                    // as before) but is NOT persisted, so it can heal later.
+                    derived.unwrap_or(false)
+                }
+            };
+            FileDto {
+                filename: f.filename,
+                album_id: f.album_id,
+                date_created: f.date_created,
+                date_modified: f.date_modified,
+                is_local: f.is_local,
+                is_remote: f.is_remote,
+                is_video,
+            }
+        })
+        .collect();
+    if !backfill.is_empty() {
+        let res = match (set, album_id) {
+            (FileSet::Album, Some(aid)) => {
+                let items: Vec<(String, String, bool)> = backfill
+                    .into_iter()
+                    .map(|(f, v)| (aid.to_string(), f, v))
+                    .collect();
+                acc.db.set_album_is_video_batch(&items)
+            }
+            _ => acc.db.set_is_video_batch(set, &backfill),
+        };
+        if let Err(err) = res {
+            tracing::warn!("is_video backfill failed: {err}");
+        }
     }
+    out
 }
 
 #[derive(Serialize)]
@@ -163,6 +199,33 @@ struct AlbumDto {
     is_shared: bool,
     cover: String,
     count: i64,
+    /// 4-char permission string `"1"+add+share+copy` (empty for un-shared albums).
+    permissions: String,
+}
+
+#[derive(Serialize)]
+struct ContactDto {
+    /// i64 stringified so JS never rounds a large user-id.
+    user_id: String,
+    email: String,
+    date_used: i64,
+}
+
+/// An album in the Sharing view: the album fields plus its resolved members.
+#[derive(Serialize)]
+struct SharedAlbumDto {
+    #[serde(flatten)]
+    album: AlbumDto,
+    members: Vec<MemberDto>,
+}
+
+#[derive(Serialize)]
+struct MemberDto {
+    user_id: String,
+    /// `None` when the member isn't in the local contacts table.
+    email: Option<String>,
+    /// True for the account viewing this list (the album owner, in practice).
+    is_owner: bool,
 }
 
 #[derive(Serialize)]
@@ -177,6 +240,9 @@ struct SyncResultDto {
     gallery: i64,
     trash: i64,
     albums: usize,
+    /// Remote updates applied by this pass; 0 = nothing changed locally, so
+    /// the frontend can skip reloading its lists.
+    changes: usize,
 }
 
 #[derive(Serialize)]
@@ -382,19 +448,26 @@ async fn sync(app: tauri::AppHandle, state: State<'_, AppState>) -> CmdResult<Sy
     let _sync_guard = state.sync_guard.lock().await;
     // Run the two sync phases directly (instead of full_sync) so we can surface
     // per-file upload progress to the UI between the metadata pull and prefetch.
-    if let Err(err) = acc.sync_cloud_to_local().await {
-        if err.is_logged_out() {
-            handle_session_expired(&app, &state).await;
+    let changes = match acc.sync_cloud_to_local().await {
+        Ok(n) => n,
+        Err(err) => {
+            if err.is_logged_out() {
+                handle_session_expired(&app, &state).await;
+            }
+            return Err(e(err));
         }
-        return Err(e(err));
-    }
+    };
     {
         let app_cb = app.clone();
         let upcb = move |done: usize, total: usize| {
             let _ = app_cb.emit("upload-progress", (done, total));
         };
         let r = acc.upload_to_cloud(Some(&upcb)).await;
-        let _ = app.emit("upload-done", ());
+        // Terminal event only when an upload row could be showing (something was
+        // attempted) — a no-op pass must not trigger a full frontend reload.
+        if !matches!(r, Ok(0)) {
+            let _ = app.emit("upload-done", ());
+        }
         if let Err(err) = r {
             if err.is_logged_out() {
                 handle_session_expired(&app, &state).await;
@@ -406,7 +479,11 @@ async fn sync(app: tauri::AppHandle, state: State<'_, AppState>) -> CmdResult<Sy
         gallery: acc.db.count_files(FileSet::Gallery).map_err(e)?,
         trash: acc.db.count_files(FileSet::Trash).map_err(e)?,
         albums: acc.db.list_albums(true).map_err(e)?.len(),
+        changes,
     };
+    if changes > 0 {
+        let _ = app.emit("library-changed", ());
+    }
 
     // Bulk-download every missing thumbnail in the background, highly
     // concurrent, emitting progress to the UI. When "sync everything" is on,
@@ -420,7 +497,9 @@ async fn sync(app: tauri::AppHandle, state: State<'_, AppState>) -> CmdResult<Sy
             let _ = app_cb.emit("thumbs-progress", (done, total));
         };
         let n = acc2.download_all_thumbs(64, Some(&cb)).await.unwrap_or(0);
-        let _ = app2.emit("thumbs-done", n);
+        if n > 0 {
+            let _ = app2.emit("thumbs-done", n);
+        }
 
         if sync_all {
             let app_cb2 = app2.clone();
@@ -428,7 +507,9 @@ async fn sync(app: tauri::AppHandle, state: State<'_, AppState>) -> CmdResult<Sy
                 let _ = app_cb2.emit("originals-progress", (done, total));
             };
             let m = acc2.download_all_originals(6, Some(&cb2)).await.unwrap_or(0);
-            let _ = app2.emit("originals-done", m);
+            if m > 0 {
+                let _ = app2.emit("originals-done", m);
+            }
         }
     });
 
@@ -444,7 +525,9 @@ async fn download_thumbs(app: tauri::AppHandle, state: State<'_, AppState>) -> C
         let _ = app_cb.emit("thumbs-progress", (done, total));
     };
     let n = acc.download_all_thumbs(64, Some(&cb)).await.map_err(e)?;
-    let _ = app.emit("thumbs-done", n);
+    if n > 0 {
+        let _ = app.emit("thumbs-done", n);
+    }
     Ok(n)
 }
 
@@ -455,25 +538,46 @@ async fn list_gallery(
     limit: i64,
 ) -> CmdResult<Vec<FileDto>> {
     let acc = state.current().await.ok_or("Not logged in")?;
-    Ok(acc
+    let rows = acc
         .db
         .list_files(FileSet::Gallery, Sort::Desc, Some(limit), offset)
-        .map_err(e)?
-        .into_iter()
-        .map(|f| file_dto(&acc, FileSet::Gallery, None, f))
-        .collect())
+        .map_err(e)?;
+    Ok(file_dtos(&acc, FileSet::Gallery, None, rows))
 }
 
 #[tauri::command]
 async fn list_trash(state: State<'_, AppState>) -> CmdResult<Vec<FileDto>> {
     let acc = state.current().await.ok_or("Not logged in")?;
-    Ok(acc
+    let rows = acc
         .db
         .list_files(FileSet::Trash, Sort::Desc, None, 0)
-        .map_err(e)?
-        .into_iter()
-        .map(|f| file_dto(&acc, FileSet::Trash, None, f))
-        .collect())
+        .map_err(e)?;
+    Ok(file_dtos(&acc, FileSet::Trash, None, rows))
+}
+
+/// Build an `AlbumDto` from a row + decrypted name, filling the cover fallback.
+fn album_dto(acc: &Account, a: DbAlbum, name: String) -> CmdResult<AlbumDto> {
+    let count = acc.db.count_album_files(&a.album_id).map_err(e)?;
+    // Use the album's chosen cover, else fall back to its newest photo.
+    let cover = if a.cover.is_empty() {
+        acc.db
+            .list_album_files(&a.album_id, Sort::Desc, Some(1), 0)
+            .map_err(e)?
+            .first()
+            .map(|f| f.filename.clone())
+            .unwrap_or_default()
+    } else {
+        a.cover.clone()
+    };
+    Ok(AlbumDto {
+        album_id: a.album_id,
+        name,
+        is_owner: a.is_owner,
+        is_shared: a.is_shared,
+        cover,
+        count,
+        permissions: a.permissions,
+    })
 }
 
 #[tauri::command]
@@ -481,25 +585,41 @@ async fn list_albums(state: State<'_, AppState>) -> CmdResult<Vec<AlbumDto>> {
     let acc = state.current().await.ok_or("Not logged in")?;
     let mut out = Vec::new();
     for (a, name) in acc.list_albums_with_names(false).map_err(e)? {
-        let count = acc.db.count_album_files(&a.album_id).map_err(e)?;
-        // Use the album's chosen cover, else fall back to its newest photo.
-        let cover = if a.cover.is_empty() {
-            acc.db
-                .list_album_files(&a.album_id, Sort::Desc, Some(1), 0)
-                .map_err(e)?
-                .first()
-                .map(|f| f.filename.clone())
-                .unwrap_or_default()
-        } else {
-            a.cover.clone()
-        };
-        out.push(AlbumDto {
-            album_id: a.album_id,
-            name,
-            is_owner: a.is_owner,
-            is_shared: a.is_shared,
-            cover,
-            count,
+        out.push(album_dto(&acc, a, name)?);
+    }
+    Ok(out)
+}
+
+/// Shared albums only (owned-and-shared + received), each with resolved members,
+/// most-recently-modified first. Hidden albums are included — a shared album
+/// auto-created hidden on mobile still belongs in the Sharing list.
+#[tauri::command]
+async fn list_shared_albums(state: State<'_, AppState>) -> CmdResult<Vec<SharedAlbumDto>> {
+    let acc = state.current().await.ok_or("Not logged in")?;
+    let me = acc.info.user_id.clone();
+    let mut shared: Vec<(DbAlbum, String)> = acc
+        .list_albums_with_names(true)
+        .map_err(e)?
+        .into_iter()
+        .filter(|(a, _)| a.is_shared)
+        .collect();
+    // Most recently updated first.
+    shared.sort_by_key(|(a, _)| std::cmp::Reverse(a.date_modified));
+    let mut out = Vec::new();
+    for (a, name) in shared {
+        let members = acc
+            .album_members(&a.album_id)
+            .map_err(e)?
+            .into_iter()
+            .map(|(uid, email)| MemberDto {
+                is_owner: uid.to_string() == me,
+                user_id: uid.to_string(),
+                email,
+            })
+            .collect();
+        out.push(SharedAlbumDto {
+            album: album_dto(&acc, a, name)?,
+            members,
         });
     }
     Ok(out)
@@ -511,13 +631,11 @@ async fn list_album_files(
     album_id: String,
 ) -> CmdResult<Vec<FileDto>> {
     let acc = state.current().await.ok_or("Not logged in")?;
-    Ok(acc
+    let rows = acc
         .db
         .list_album_files(&album_id, Sort::Desc, None, 0)
-        .map_err(e)?
-        .into_iter()
-        .map(|f| file_dto(&acc, FileSet::Album, Some(&album_id), f))
-        .collect())
+        .map_err(e)?;
+    Ok(file_dtos(&acc, FileSet::Album, Some(&album_id), rows))
 }
 
 #[tauri::command]
@@ -694,6 +812,28 @@ async fn is_video(
         .map_err(e)
 }
 
+/// Warm the on-disk encrypted cache for files the viewer is likely to show
+/// next (its neighbors). Download-only — no decrypt, no transcode — so it
+/// costs nothing but idle network lanes; already-local files return instantly.
+/// Fire-and-forget: spawns and returns immediately.
+#[tauri::command]
+async fn prefetch_media(
+    state: State<'_, AppState>,
+    set: i32,
+    filenames: Vec<String>,
+) -> CmdResult<()> {
+    let acc = state.current().await.ok_or("Not logged in")?;
+    let set = set_from_i32(set);
+    // Defensive cap: the viewer only ever asks for a couple of neighbors.
+    for filename in filenames.into_iter().take(4) {
+        let acc = acc.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = acc.ensure_encrypted(set, &filename, false).await;
+        });
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn recovery_phrase(state: State<'_, AppState>) -> CmdResult<String> {
     let guard = state.account.lock().await;
@@ -737,6 +877,37 @@ async fn share_album(
         .map_err(e)
 }
 
+/// Share loose files: auto-create a hidden album from `filenames` (in `set` /
+/// optional source `album_id`), then share it with `emails`. Returns the new
+/// album id. Source files stay put.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn share_new_album(
+    state: State<'_, AppState>,
+    set: i32,
+    album_id: Option<String>,
+    filenames: Vec<String>,
+    name: String,
+    emails: Vec<String>,
+    allow_add: bool,
+    allow_share: bool,
+    allow_copy: bool,
+) -> CmdResult<String> {
+    let acc = state.current().await.ok_or("Not logged in")?;
+    acc.share_new_album(
+        set_from_i32(set),
+        album_id.as_deref(),
+        &filenames,
+        &name,
+        &emails,
+        allow_add,
+        allow_share,
+        allow_copy,
+    )
+    .await
+    .map_err(e)
+}
+
 #[tauri::command]
 async fn unshare_album(state: State<'_, AppState>, album_id: String) -> CmdResult<()> {
     let guard = state.account.lock().await;
@@ -747,6 +918,73 @@ async fn unshare_album(state: State<'_, AppState>, album_id: String) -> CmdResul
 async fn leave_album(state: State<'_, AppState>, album_id: String) -> CmdResult<()> {
     let guard = state.account.lock().await;
     guard.as_ref().ok_or("Not logged in")?.leave_album(&album_id).await.map_err(e)
+}
+
+#[tauri::command]
+async fn list_contacts(state: State<'_, AppState>) -> CmdResult<Vec<ContactDto>> {
+    let acc = state.current().await.ok_or("Not logged in")?;
+    Ok(acc
+        .contacts()
+        .map_err(e)?
+        .into_iter()
+        .map(|c| ContactDto {
+            user_id: c.user_id.to_string(),
+            email: c.email,
+            date_used: c.date_used,
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn list_album_members(
+    state: State<'_, AppState>,
+    album_id: String,
+) -> CmdResult<Vec<MemberDto>> {
+    let acc = state.current().await.ok_or("Not logged in")?;
+    let me = acc.info.user_id.clone();
+    Ok(acc
+        .album_members(&album_id)
+        .map_err(e)?
+        .into_iter()
+        .map(|(uid, email)| MemberDto {
+            is_owner: uid.to_string() == me,
+            user_id: uid.to_string(),
+            email,
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn edit_album_perms(
+    state: State<'_, AppState>,
+    album_id: String,
+    allow_add: bool,
+    allow_share: bool,
+    allow_copy: bool,
+) -> CmdResult<()> {
+    let guard = state.account.lock().await;
+    guard
+        .as_ref()
+        .ok_or("Not logged in")?
+        .edit_album_perms(&album_id, allow_add, allow_share, allow_copy)
+        .await
+        .map_err(e)
+}
+
+#[tauri::command]
+async fn remove_album_member(
+    state: State<'_, AppState>,
+    album_id: String,
+    member_user_id: String,
+) -> CmdResult<()> {
+    let uid: i64 = member_user_id.parse().map_err(e)?;
+    let guard = state.account.lock().await;
+    guard
+        .as_ref()
+        .ok_or("Not logged in")?
+        .remove_album_member(&album_id, uid)
+        .await
+        .map_err(e)
 }
 
 #[tauri::command]
@@ -1235,6 +1473,10 @@ async fn start_sync_loop(app: tauri::AppHandle, state: &AppState) {
     }
     let app2 = app.clone();
     let handle = tauri::async_runtime::spawn(async move {
+        // The first pass always scans for missing originals (it may be resuming
+        // a backlog after the toggle flipped on); later passes only when the
+        // metadata sync actually changed something.
+        let mut first_pass = true;
         loop {
             if let Some(acc) = app2.state::<AppState>().current().await {
                 let app_up = app2.clone();
@@ -1242,12 +1484,20 @@ async fn start_sync_loop(app: tauri::AppHandle, state: &AppState) {
                     let _ = app_up.emit("upload-progress", (done, total));
                 };
                 let synced = acc.sync_cloud_to_local().await;
+                let changes = *synced.as_ref().ok().unwrap_or(&0);
                 let uploaded = if synced.is_ok() {
                     acc.upload_to_cloud(Some(&upcb)).await
                 } else {
-                    Ok(())
+                    Ok(0)
                 };
-                let _ = app2.emit("upload-done", ());
+                // Terminal/refresh events only when something actually happened —
+                // an idle no-op pass must not jolt the frontend into a full reload.
+                if !matches!(uploaded, Ok(0)) {
+                    let _ = app2.emit("upload-done", ());
+                }
+                if changes > 0 {
+                    let _ = app2.emit("library-changed", ());
+                }
                 if let Err(err) = synced.and(uploaded) {
                     if err.is_logged_out() {
                         // Token died: tear down the session and stop the loop so we
@@ -1264,12 +1514,17 @@ async fn start_sync_loop(app: tauri::AppHandle, state: &AppState) {
                         return;
                     }
                 }
-                let app_cb = app2.clone();
-                let cb = move |done: usize, total: usize| {
-                    let _ = app_cb.emit("originals-progress", (done, total));
-                };
-                let n = acc.download_all_originals(6, Some(&cb)).await.unwrap_or(0);
-                let _ = app2.emit("originals-done", n);
+                if first_pass || changes > 0 {
+                    first_pass = false;
+                    let app_cb = app2.clone();
+                    let cb = move |done: usize, total: usize| {
+                        let _ = app_cb.emit("originals-progress", (done, total));
+                    };
+                    let n = acc.download_all_originals(6, Some(&cb)).await.unwrap_or(0);
+                    if n > 0 {
+                        let _ = app2.emit("originals-done", n);
+                    }
+                }
             }
             tokio::time::sleep(std::time::Duration::from_secs(SYNC_EVERYTHING_INTERVAL_SECS)).await;
         }
@@ -1326,9 +1581,17 @@ async fn start_idle_sync_loop(app: tauri::AppHandle, state: &AppState) {
                 uploaded = if synced.is_ok() {
                     acc.upload_to_cloud(Some(&upcb)).await
                 } else {
-                    Ok(())
+                    Ok(0)
                 };
-                let _ = app2.emit("upload-done", ());
+                // No events for a no-op tick — the common every-N-minutes case
+                // must not make the frontend re-fetch and re-render its lists.
+                if !matches!(uploaded, Ok(0)) {
+                    let _ = app2.emit("upload-done", ());
+                }
+            }
+            let changes = *synced.as_ref().ok().unwrap_or(&0);
+            if changes > 0 {
+                let _ = app2.emit("library-changed", ());
             }
             if let Err(err) = synced.and(uploaded) {
                 if err.is_logged_out() {
@@ -1343,14 +1606,20 @@ async fn start_idle_sync_loop(app: tauri::AppHandle, state: &AppState) {
                 }
                 continue;
             }
-            // Prefetch any newly-arrived thumbnails (unguarded — a plain fetch,
-            // safe to overlap a manual sync's own prefetch).
-            let app_cb = app2.clone();
-            let cb = move |done: usize, total: usize| {
-                let _ = app_cb.emit("thumbs-progress", (done, total));
-            };
-            let n = acc.download_all_thumbs(64, Some(&cb)).await.unwrap_or(0);
-            let _ = app2.emit("thumbs-done", n);
+            // Prefetch any newly-arrived thumbnails — only when the metadata
+            // sync changed something. A no-change tick has no new thumbnails,
+            // and the scan itself stats every cached thumb file (tens of
+            // thousands of syscalls on a big library), so don't pay it idly.
+            if changes > 0 {
+                let app_cb = app2.clone();
+                let cb = move |done: usize, total: usize| {
+                    let _ = app_cb.emit("thumbs-progress", (done, total));
+                };
+                let n = acc.download_all_thumbs(64, Some(&cb)).await.unwrap_or(0);
+                if n > 0 {
+                    let _ = app2.emit("thumbs-done", n);
+                }
+            }
         }
     });
     *guard = Some(handle);
@@ -1447,8 +1716,10 @@ async fn start_watch_loop(app: tauri::AppHandle, state: &AppState) {
                         let upcb = move |done: usize, total: usize| {
                             let _ = app_up.emit("upload-progress", (done, total));
                         };
-                        let _ = acc.upload_to_cloud(Some(&upcb)).await;
-                        let _ = app2.emit("upload-done", ());
+                        let r = acc.upload_to_cloud(Some(&upcb)).await;
+                        if !matches!(r, Ok(0)) {
+                            let _ = app2.emit("upload-done", ());
+                        }
                     }
                 }
             }
@@ -1923,7 +2194,9 @@ pub fn run() {
             list_gallery,
             list_trash,
             list_albums,
+            list_shared_albums,
             list_album_files,
+            prefetch_media,
             import_paths,
             cancel_import,
             trash,
@@ -1942,8 +2215,13 @@ pub fn run() {
             is_video,
             recover,
             share_album,
+            share_new_album,
             unshare_album,
             leave_album,
+            list_contacts,
+            list_album_members,
+            edit_album_perms,
+            remove_album_member,
             get_cache_limit,
             set_cache_limit,
             cache_size,
