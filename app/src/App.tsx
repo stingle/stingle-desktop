@@ -107,11 +107,22 @@ function groupByDate(items: FileItem[]): DateGroup[] {
   return groups;
 }
 
+/** True while a native drag-OUT (library → other app) is in flight. If the user
+ *  releases the drag back over our OWN window ("let it go too soon"), Tauri
+ *  delivers a webview "drop" whose paths are the decrypted temp export files; the
+ *  drag-drop handler checks this flag to avoid re-importing them. Kept set until
+ *  shortly after the drag ends, because the drop event and the drag-end callback
+ *  resolve at roughly the same instant and the drop may arrive last. */
+let dragOutActive = false;
+let dragOutToken = 0;
+
 /** Start a native OS drag of one or more library items out to other apps
  *  (Explorer, Telegram, …). Files are decrypted to a temp folder for the drag
  *  and cleaned up when it ends. Returns immediately if the export fails. */
 async function nativeDragOut(set: number, albumId: string | null, filenames: string[]) {
   if (filenames.length === 0) return;
+  dragOutActive = true;
+  const token = ++dragOutToken;
   try {
     const exp = await api.exportForDrag(set, albumId, filenames);
     const cleanup = exp.icon ? [...exp.files, exp.icon] : exp.files;
@@ -120,6 +131,12 @@ async function nativeDragOut(set: number, albumId: string | null, filenames: str
       () => { api.cleanupDragExport(cleanup); }
     );
   } catch { /* drag export failed — ignore */ }
+  finally {
+    // Clear only after the trailing drop/leave event has reached the drag-drop
+    // listener. The token guard means only the most recent drag clears the flag,
+    // so back-to-back drags never expose a gap.
+    setTimeout(() => { if (token === dragOutToken) dragOutActive = false; }, 400);
+  }
 }
 
 /** Copy library items to the OS clipboard as real files (Explorer-style), so a
@@ -276,14 +293,10 @@ const PhotoGrid = React.memo(function PhotoGrid({ items, set, albumId, grouped, 
           const fn = st.items[tp.idx]?.filename;
           if (fn !== undefined) {
             // Drag the whole selection if this tile is part of it; otherwise drag
-            // just this tile (and make it the selection, like Explorer).
-            let files: string[];
-            if (st.sel.has(fn) && st.sel.size > 0) {
-              files = [...st.sel];
-            } else {
-              files = [fn];
-              setSel(new Set([fn]));
-            }
+            // just this tile WITHOUT selecting it. Dragging a photo out to another
+            // app must never disturb the selection — selection changes only via the
+            // checkbox / Ctrl / Shift / marquee.
+            const files = st.sel.has(fn) && st.sel.size > 0 ? [...st.sel] : [fn];
             nativeDragOut(set, albumId, files);
           }
         }
@@ -993,7 +1006,8 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
   const [originals, setOriginals] = useState<{ done: number; total: number } | null>(null);
   const [importing, setImporting] = useState<{ done: number; total: number } | null>(null);
   const [takeoutProg, setTakeoutProg] = useState<{ done: number; total: number } | null>(null);
-  // Set when auto-update is off and the backend reports an available update.
+  // Version of an available update (set regardless of the auto-update setting,
+  // so the sidebar always offers a one-click restart-and-apply).
   const [updateVer, setUpdateVer] = useState<string | null>(null);
   const [updating, setUpdating] = useState(false);
   const [appVer, setAppVer] = useState<string>("");
@@ -1006,9 +1020,14 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
     catch (err) { setUpdating(false); showToast("Update failed: " + err); }
   }, [showToast]);
 
-  // Auto-update off: the backend emits `update-available` at startup if a newer
-  // version exists, so the sidebar can offer a one-click install.
+  // The backend checks for updates at startup and every 30 min; when a newer
+  // version exists it stores the version and emits `update-available`, so the
+  // sidebar can offer a one-click restart-and-apply. Because the startup check
+  // can finish *before* this component (and its listener) has mounted — the
+  // check races login/unlock — the event alone would be missed. So we also poll
+  // the stored version once on mount: whichever of the two lands first wins.
   useEffect(() => {
+    api.pendingUpdate().then((v) => { if (v) setUpdateVer(v); }).catch(() => {});
     const un = listen<string>("update-available", (e) => setUpdateVer(e.payload));
     return () => { un.then((f) => f()); };
   }, []);
@@ -1133,6 +1152,10 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
     let cancelled = false;
     getCurrentWebview().onDragDropEvent((event) => {
       const p = event.payload as { type: string; paths?: string[] };
+      // A native drag-OUT released back over our own window delivers a "drop" of
+      // the decrypted temp export files. Ignore the whole gesture: those files are
+      // already in the library, and importing them would race cleanup and hang.
+      if (dragOutActive) { setDropActive(false); return; }
       if (p.type === "enter" || p.type === "over") setDropActive(true);
       else if (p.type === "leave") setDropActive(false);
       else if (p.type === "drop") {
@@ -2304,6 +2327,7 @@ function SettingsView({ session, setSession, showToast }: {
   const [startMin, setStartMin] = useState(false);
   const [minTray, setMinTray] = useState(false);
   const [autoUpdate, setAutoUpdate] = useState(true);
+  const [convertHeic, setConvertHeic] = useState(true);
   const [syncEvery, setSyncEvery] = useState(false);
   const [autoSync, setAutoSync] = useState(true);
   const [autoSyncMins, setAutoSyncMins] = useState(10);
@@ -2332,6 +2356,7 @@ function SettingsView({ session, setSession, showToast }: {
     api.getStartMinimized().then(setStartMin).catch(() => {});
     api.getMinimizeToTray().then(setMinTray).catch(() => {});
     api.getAutoUpdate().then(setAutoUpdate).catch(() => {});
+    api.getConvertHeicOnExport().then(setConvertHeic).catch(() => {});
     api.getAppVersion().then(setVersion).catch(() => {});
     api.getSyncEverything().then(setSyncEvery).catch(() => {});
     api.getAutoSync().then(setAutoSync).catch(() => {});
@@ -2390,6 +2415,10 @@ function SettingsView({ session, setSession, showToast }: {
   };
   const toggleAutoUpdate = async (v: boolean) => {
     try { await api.setAutoUpdate(v); setAutoUpdate(v); }
+    catch (e) { showToast("Failed: " + e); }
+  };
+  const toggleConvertHeic = async (v: boolean) => {
+    try { await api.setConvertHeicOnExport(v); setConvertHeic(v); }
     catch (e) { showToast("Failed: " + e); }
   };
   const checkForUpdate = async () => {
@@ -2563,6 +2592,16 @@ function SettingsView({ session, setSession, showToast }: {
               <span className="muted" style={{ display: "block", fontSize: 12 }}>
                 New versions are downloaded in the background and applied the next time you open the app.
                 When off, you'll be offered the update in the sidebar instead.
+              </span>
+            </span>
+          </label>
+          <label className="opt-row">
+            <input type="checkbox" checked={convertHeic} onChange={(e) => toggleConvertHeic(e.target.checked)} />
+            <span>
+              Convert HEIC to JPG on drag/copy
+              <span className="muted" style={{ display: "block", fontSize: 12 }}>
+                When you drag or copy photos out to other apps, HEIC images are converted to JPG first.
+                Many apps can't open HEIC — leave this on to avoid errors. Your stored photos are unchanged.
               </span>
             </span>
           </label>

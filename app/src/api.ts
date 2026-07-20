@@ -190,9 +190,15 @@ export const api = {
   // App updates
   getAutoUpdate: () => invoke<boolean>("get_auto_update"),
   setAutoUpdate: (enabled: boolean) => invoke("set_auto_update", { enabled }),
+  getConvertHeicOnExport: () => invoke<boolean>("get_convert_heic_on_export"),
+  setConvertHeicOnExport: (enabled: boolean) => invoke("set_convert_heic_on_export", { enabled }),
   getAppVersion: () => invoke<string>("get_app_version"),
   /** Manual check; resolves to the new version string, or null if up to date. */
   checkForUpdate: () => invoke<string | null>("check_for_update"),
+  /** Version already found by the background check loop (no network), or null.
+   *  Polled on mount so an update discovered before the `update-available`
+   *  listener existed still surfaces the restart-to-apply card. */
+  pendingUpdate: () => invoke<string | null>("pending_update"),
   /** Download + install the available update, then restart. Does not return. */
   installUpdate: () => invoke("install_update_now"),
   // Clipboard

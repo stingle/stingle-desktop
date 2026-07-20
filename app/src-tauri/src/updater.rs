@@ -69,7 +69,12 @@ async fn check_once(app: &AppHandle) {
     };
 
     // Surface the sidebar card regardless of the auto-update setting so the user
-    // can restart-and-apply on demand.
+    // can restart-and-apply on demand. Record the version in shared state first,
+    // then emit: the emit reaches an already-mounted UI, while the stored version
+    // is what a UI mounting *later* (this loop's first check races login/mount)
+    // reads back via the `pending_update` command. One of the two always lands.
+    tracing::info!("update available: {}", update.version);
+    *state.pending_update.lock().unwrap() = Some(update.version.clone());
     let _ = app.emit("update-available", update.version.clone());
 
     // With auto-update on, also download once and stage it so the quit handler

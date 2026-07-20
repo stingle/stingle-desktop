@@ -59,6 +59,12 @@ pub struct AppState {
     /// applied when the app quits. A plain `std::sync::Mutex` so the quit handler
     /// (sync context) can lock it without a runtime.
     staged_update: std::sync::Mutex<Option<updater::StagedUpdate>>,
+    /// Version string of an available update, set by the background check loop
+    /// as soon as one is found. The frontend polls this on mount (via the
+    /// `pending_update` command) so a newer version discovered *before* the UI's
+    /// `update-available` listener was ready — the loop's very first check races
+    /// the login/mount — still surfaces the restart-to-apply card.
+    pending_update: std::sync::Mutex<Option<String>>,
     /// Port + auth token of the loopback video server, set once at startup on
     /// Linux (WebKitGTK can't play custom-scheme media — see `media_server`).
     /// Stays unset on Windows/macOS where stingle:// videos work natively.
@@ -87,6 +93,7 @@ impl AppState {
             sync_guard: Arc::new(Mutex::new(())),
             watch_task: Mutex::new(None),
             staged_update: std::sync::Mutex::new(None),
+            pending_update: std::sync::Mutex::new(None),
             video_server: std::sync::OnceLock::new(),
         }
     }
@@ -651,19 +658,30 @@ async fn import_paths(
     } else {
         FileSet::Gallery
     };
-    // Expand folders up front so the progress bar has a real total, then import
-    // the flat list with live progress (and cooperative cancellation).
-    let inputs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    // Drop paths that are our OWN decrypted exports (a drag-OUT or clipboard copy
+    // released/pasted back onto the window): they're already in the library and
+    // cleanup is about to delete them, so importing would race that read and hang.
+    // Then expand folders up front so the progress bar has a real total, and
+    // import the flat list with live progress (and cooperative cancellation).
+    let inputs: Vec<PathBuf> = paths
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| !is_own_temp_export(p))
+        .collect();
     let files = acc.collect_import_paths(&inputs);
     let app_cb = app.clone();
     let cb = move |done: usize, total: usize| {
         let _ = app_cb.emit("import-progress", (done, total));
     };
-    let imported = acc
+    let result = acc
         .import_files_progress(&files, set, album_id.as_deref(), Some(&cb))
-        .await
-        .map_err(e)?;
+        .await;
+    // Emit `import-done` in EVERY case (success or error). The UI's "Importing"
+    // progress row is only cleared by this event (or a zero-total tick), so an
+    // import error would otherwise leave it stuck on screen — the "stalls
+    // forever" symptom when a drag-out is dropped back onto the window.
     let _ = app.emit("import-done", ());
+    let imported = result.map_err(e)?;
     Ok(imported)
 }
 
@@ -1083,6 +1101,7 @@ async fn copy_files_to_clipboard(
     filenames: Vec<String>,
 ) -> CmdResult<usize> {
     let acc = state.current().await.ok_or("Not logged in")?;
+    let convert_heic = state.config.lock().await.convert_heic_on_export_enabled();
     let s = set_from_i32(set);
     let dir = clipboard_temp_dir();
     // Drop the previous copy's decrypted files before writing new ones.
@@ -1091,14 +1110,12 @@ async fn copy_files_to_clipboard(
 
     let mut paths = Vec::new();
     for name in &filenames {
-        let plain = acc.get_decrypted(s, album_id.as_deref(), name, false).await.map_err(e)?;
-        let orig = acc
-            .original_name(s, album_id.as_deref(), name)
-            .unwrap_or_else(|_| name.clone());
-        // `orig` is header-derived (attacker-controllable) — reduce it to a safe
-        // bare filename so it can't escape the temp dir.
-        let out = unique_temp(&dir, &stingle_core::safe_filename(&orig));
-        std::fs::write(&out, &plain).map_err(e)?;
+        let (bytes, out_name) =
+            export_decrypted(&acc, s, album_id.as_deref(), name, convert_heic).await.map_err(e)?;
+        // `out_name` is header-derived (attacker-controllable) — reduce it to a
+        // safe bare filename so it can't escape the temp dir.
+        let out = unique_temp(&dir, &stingle_core::safe_filename(&out_name));
+        std::fs::write(&out, &bytes).map_err(e)?;
         paths.push(out);
     }
     clipboard_files::set_files(&paths)?;
@@ -1136,6 +1153,53 @@ async fn paste_from_clipboard(
     Ok(if n.is_some() { 1 } else { 0 })
 }
 
+/// Decrypt one library item for hand-off to another app (drag-out / clipboard).
+/// When `convert_heic` is on and the item is a HEIC/HEIF still, it is transcoded
+/// to JPEG — many apps can't read HEIC — and the output name's extension is
+/// switched to `.jpg`. Otherwise the original bytes and name are returned
+/// unchanged. A failed transcode falls back to the untouched original rather
+/// than failing the whole export. The returned name is header-derived and MUST
+/// still be passed through `safe_filename` by the caller before it becomes a path.
+async fn export_decrypted(
+    acc: &Account,
+    s: FileSet,
+    album_id: Option<&str>,
+    name: &str,
+    convert_heic: bool,
+) -> stingle_core::Result<(Vec<u8>, String)> {
+    let plain = acc.get_decrypted(s, album_id, name, false).await?;
+    let orig = acc
+        .original_name(s, album_id, name)
+        .unwrap_or_else(|_| name.to_string());
+    if convert_heic && stingle_core::heif::is_heif(&plain) {
+        let ext = std::path::Path::new(&orig)
+            .extension()
+            .and_then(|x| x.to_str())
+            .unwrap_or("heic")
+            .to_lowercase();
+        // The ffmpeg-backed transcode is blocking and can take a beat on a
+        // full-size photo — run it off the async runtime. On failure the
+        // original HEIC bytes come back out of the closure untouched.
+        let (bytes, converted) = tokio::task::spawn_blocking(move || {
+            match stingle_core::thumbnail::transcode_to_jpeg(&plain, &ext) {
+                Ok(jpg) => (jpg, true),
+                Err(_) => (plain, false),
+            }
+        })
+        .await
+        .map_err(|err| stingle_core::CoreError::Other(format!("transcode task failed: {err}")))?;
+        if converted {
+            let stem = std::path::Path::new(&orig)
+                .file_stem()
+                .and_then(|x| x.to_str())
+                .unwrap_or("image");
+            return Ok((bytes, format!("{stem}.jpg")));
+        }
+        return Ok((bytes, orig));
+    }
+    Ok((plain, orig))
+}
+
 // ----------------------------- drag-out export -----------------------------
 //
 // Dragging items OUT to other apps needs real file paths, so we decrypt to a
@@ -1157,6 +1221,25 @@ fn drag_temp_dir() -> PathBuf {
 /// `copy_files_to_clipboard`). Persists until the next copy / startup.
 fn clipboard_temp_dir() -> PathBuf {
     std::env::temp_dir().join("stingle-clip")
+}
+
+/// True if `path` lives inside one of our private temp dirs holding DECRYPTED
+/// exports (`stingle-drag` / `stingle-clip`). A drop or paste of these back onto
+/// our own window — e.g. releasing a drag-OUT too early — must never be
+/// re-imported: the files are already in the library and are about to be deleted
+/// by cleanup, which would otherwise race the import read and leave it hung.
+/// Slash/case-normalized so an OS-reported drop path still matches on Windows.
+fn is_own_temp_export(path: &std::path::Path) -> bool {
+    fn norm(p: &std::path::Path) -> String {
+        let s = p.to_string_lossy().replace('\\', "/");
+        if cfg!(windows) { s.to_lowercase() } else { s }
+    }
+    let target = norm(path);
+    [drag_temp_dir(), clipboard_temp_dir()].iter().any(|base| {
+        let mut prefix = norm(base);
+        prefix.push('/');
+        target.starts_with(&prefix)
+    })
 }
 
 /// Create `dir` (and parents) restricted to the current user (0700 on Unix).
@@ -1204,18 +1287,17 @@ async fn export_for_drag(
     filenames: Vec<String>,
 ) -> CmdResult<DragExportDto> {
     let acc = state.current().await.ok_or("Not logged in")?;
+    let convert_heic = state.config.lock().await.convert_heic_on_export_enabled();
     let s = set_from_i32(set);
     let dir = drag_temp_dir();
     create_private_dir(&dir).map_err(e)?;
 
     let mut files = Vec::new();
     for name in &filenames {
-        let plain = acc.get_decrypted(s, album_id.as_deref(), name, false).await.map_err(e)?;
-        let orig = acc
-            .original_name(s, album_id.as_deref(), name)
-            .unwrap_or_else(|_| name.clone());
-        let out = unique_temp(&dir, &stingle_core::safe_filename(&orig));
-        std::fs::write(&out, &plain).map_err(e)?;
+        let (bytes, out_name) =
+            export_decrypted(&acc, s, album_id.as_deref(), name, convert_heic).await.map_err(e)?;
+        let out = unique_temp(&dir, &stingle_core::safe_filename(&out_name));
+        std::fs::write(&out, &bytes).map_err(e)?;
         files.push(out.to_string_lossy().to_string());
     }
 
@@ -1268,6 +1350,18 @@ async fn set_start_minimized(state: State<'_, AppState>, enabled: bool) -> CmdRe
 }
 
 #[tauri::command]
+async fn get_convert_heic_on_export(state: State<'_, AppState>) -> CmdResult<bool> {
+    Ok(state.config.lock().await.convert_heic_on_export_enabled())
+}
+
+#[tauri::command]
+async fn set_convert_heic_on_export(state: State<'_, AppState>, enabled: bool) -> CmdResult<()> {
+    let mut cfg = state.config.lock().await;
+    cfg.convert_heic_on_export = Some(enabled);
+    cfg.save()
+}
+
+#[tauri::command]
 async fn get_auto_update(state: State<'_, AppState>) -> CmdResult<bool> {
     Ok(state.config.lock().await.auto_update.unwrap_or(true))
 }
@@ -1292,6 +1386,15 @@ fn video_server_base(state: State<'_, AppState>) -> Option<String> {
         .video_server
         .get()
         .map(|(port, token)| format!("http://127.0.0.1:{port}/{token}"))
+}
+
+/// Version of an update already discovered by the background check loop, or
+/// `None` if none is pending. Read-only (no network) — the frontend calls this
+/// on mount so an update found before its `update-available` listener existed
+/// still shows the restart-to-apply card. See `AppState::pending_update`.
+#[tauri::command]
+fn pending_update(state: State<'_, AppState>) -> Option<String> {
+    state.pending_update.lock().unwrap().clone()
 }
 
 /// Manual "check for updates now": returns the new version string if one is
@@ -2238,8 +2341,11 @@ pub fn run() {
             set_start_minimized,
             get_auto_update,
             set_auto_update,
+            get_convert_heic_on_export,
+            set_convert_heic_on_export,
             get_app_version,
             video_server_base,
+            pending_update,
             check_for_update,
             install_update_now,
             get_autostart,
