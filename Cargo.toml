@@ -30,11 +30,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Storage
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Media / platform
 image = "0.25"
-dirs = "5"
+dirs = "6"
 
 # Encoding / errors / logging
 base64 = "0.22"
