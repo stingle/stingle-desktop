@@ -1,0 +1,37 @@
+[package]
+name = "stingle-vfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Only the orchestration layer is needed for the platform-agnostic core:
+# `Account` (enumeration + decryption), and the re-exported db set/sort types.
+stingle-core = { path = "../stingle-core" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+# --- Windows driver adapter (opt-in via `mount-winfsp`) ---
+# The `system` feature is REQUIRED: at runtime it lets winfsp locate + load the
+# installed winfsp-x64.dll from the registry InstallDir (without it, init only
+# tries a bare LoadLibrary that fails → delay-load error 1285 at mount). Build
+# needs the WinFsp "developer files" (headers/lib) + libclang (bindgen).
+# `windows` is used for the SDDL security descriptor + file attributes.
+[target.'cfg(windows)'.dependencies]
+winfsp = { version = "0.13", optional = true, features = ["system", "windows-62"] }
+windows = { version = "0.62", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+] }
+# Per-user DriveIcons registry key so the mounted drive shows the app icon.
+windows-registry = { version = "0.6", optional = true }
+
+[features]
+default = []
+# Build the Windows WinFsp adapter. Requires WinFsp installed to *run* a mount.
+mount-winfsp = ["dep:winfsp", "dep:windows", "dep:windows-registry"]

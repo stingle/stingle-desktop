@@ -25,6 +25,7 @@ tauri-plugin-updater = "2"
 
 stingle-core = { path = "../../crates/stingle-core" }
 stingle-crypto = { path = "../../crates/stingle-crypto" }
+stingle-vfs = { path = "../../crates/stingle-vfs" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -55,3 +56,11 @@ security-framework = { version = "3", features = ["OSX_10_15"] }
 # Auto-unlock key in the freedesktop Secret Service (GNOME Keyring / KWallet).
 # Pure-Rust zbus transport — no system libdbus needed at build or run time.
 secret-service = { version = "5", features = ["rt-tokio-crypto-rust"] }
+
+[features]
+# Build the Windows WinFsp virtual-drive adapter into the app. OFF by default so
+# ordinary dev/CI builds need neither WinFsp nor libclang; the vfs_* commands
+# still exist but report "unsupported". Enable for Windows release builds:
+#   cargo build -p app --features vfs-winfsp
+# (requires WinFsp + developer files and libclang — see the project memory).
+vfs-winfsp = ["stingle-vfs/mount-winfsp"]

@@ -211,7 +211,33 @@ export const api = {
   exportForDrag: (set: number, albumId: string | null, filenames: string[]) =>
     invoke<{ files: string[]; icon: string }>("export_for_drag", { set, albumId, filenames }),
   cleanupDragExport: (paths: string[]) => invoke("cleanup_drag_export", { paths }),
+  // Virtual drive: mount the library read-only so any OS file dialog can browse it.
+  vfsStatus: () => invoke<VfsStatus>("vfs_status"),
+  /** Enable + mount; resolves to the mount point (e.g. "S:"). */
+  vfsEnable: () => invoke<string>("vfs_enable"),
+  vfsDisable: () => invoke<void>("vfs_disable"),
+  /** Change the drive letter; remounts if on. Resolves to the new mount point
+   *  when it was remounted, else null. */
+  vfsSetDriveLetter: (letter: string) => invoke<string | null>("vfs_set_drive_letter", { letter }),
 };
+
+/** Status of the read-only virtual drive (see `vfs_status`). */
+export interface VfsStatus {
+  /** This build includes a driver for the current platform. */
+  supported: boolean;
+  /** The OS driver (WinFsp) appears to be installed. */
+  driver_installed: boolean;
+  /** The user's saved preference. */
+  enabled: boolean;
+  /** A mount is currently live. */
+  mounted: boolean;
+  /** Where it's mounted (e.g. "S:"), when mounted. */
+  mount_point: string | null;
+  /** Effective drive letter (configured or default), a single letter. */
+  drive_letter: string;
+  /** Drive letters offered in the picker. */
+  available_letters: string[];
+}
 
 /** URL for a decrypted thumbnail/original served via the `stingle://` protocol. */
 export function mediaUrl(

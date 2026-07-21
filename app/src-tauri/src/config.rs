@@ -81,6 +81,15 @@ pub struct AppConfig {
     /// Folders watched for new media to auto-import (each with its own
     /// delete-after-import setting).
     pub watch_folders: Vec<WatchFolder>,
+    /// Mount the encrypted library as a read-only virtual drive so any OS
+    /// file-open dialog can browse into it. Off by default: it's opt-in because
+    /// browsability exposes decrypted files to the OS shell/indexer/AV (see the
+    /// enable-time warning). Only takes effect in builds with a driver.
+    pub virtual_drive_enabled: bool,
+    /// Preferred drive letter for the virtual drive (a single letter like "S").
+    /// `None` picks a default (first free, preferring S). A stable letter keeps
+    /// the Explorer sidebar entry pointing at the right place across sessions.
+    pub virtual_drive_letter: Option<String>,
     // NOTE: start-with-PC is read from the autostart plugin (its own source of
     // truth), so it is intentionally not duplicated here.
 }

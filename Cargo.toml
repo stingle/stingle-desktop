@@ -5,6 +5,7 @@ members = [
     "crates/stingle-api",
     "crates/stingle-db",
     "crates/stingle-core",
+    "crates/stingle-vfs",
     "app/src-tauri",
 ]
 

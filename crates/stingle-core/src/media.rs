@@ -2,10 +2,11 @@
 //! support for streaming video (decrypts only the requested chunks).
 
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use stingle_crypto::file;
 use stingle_db::FileSet;
+use zeroize::Zeroizing;
 
 use crate::account::Account;
 use crate::error::{CoreError, Result};
@@ -22,6 +23,57 @@ pub struct MediaResponse {
     pub body: Vec<u8>,
     /// `Some((start, end_inclusive))` for a partial (206) response.
     pub range: Option<(u64, u64)>,
+}
+
+/// Metadata decoded from a file's (already-local) `.sp` header — no blob read,
+/// no network. Returned by [`Account::row_header_meta`] to populate the virtual
+/// filesystem's directory listings and `stat` responses.
+#[derive(Debug, Clone)]
+pub struct HeaderMeta {
+    /// Original filename stored in the sealed header (may be empty).
+    pub original_filename: String,
+    /// Plaintext size of the media in bytes (what a decrypt yields).
+    pub data_size: u64,
+    pub is_video: bool,
+}
+
+/// A prepared handle for streaming decrypted byte ranges of one media file
+/// without repeating the per-read setup (DB lookup, header seal-open, blob
+/// download, outer-header scan). Built once by [`Account::open_media_stream`];
+/// the virtual filesystem caches it per file so windowed reads stay cheap.
+pub struct MediaStream {
+    /// Local encrypted blob (already ensured present).
+    path: PathBuf,
+    symmetric_key: Zeroizing<Vec<u8>>,
+    chunk_size: u32,
+    outer_header_len: u64,
+    /// Full plaintext size in bytes.
+    pub data_size: u64,
+}
+
+impl MediaStream {
+    /// Decrypt the inclusive byte range `[start, end]` from the local encrypted
+    /// blob, in memory (nothing persisted). Clamps to the file size and returns
+    /// empty at/after EOF. Cheap and repeatable — just a file open plus
+    /// `decrypt_range` over the already-cached blob.
+    pub fn read(&self, start: u64, end: u64) -> Result<Vec<u8>> {
+        if self.data_size == 0 || start >= self.data_size {
+            return Ok(Vec::new());
+        }
+        let end = end.min(self.data_size - 1);
+        if end < start {
+            return Ok(Vec::new());
+        }
+        let mut f = std::fs::File::open(&self.path)?;
+        Ok(file::decrypt_range(
+            &mut f,
+            self.outer_header_len,
+            &self.symmetric_key,
+            self.chunk_size,
+            start,
+            end,
+        )?)
+    }
 }
 
 /// Image types the webview (Chromium/WebView2) can't natively render, so we
@@ -160,6 +212,60 @@ impl Account {
             Ok(header.file_type == stingle_crypto::constants::FILE_TYPE_VIDEO)
         })()
         .ok()
+    }
+
+    /// Header metadata (original filename, plaintext size, video flag) decoded
+    /// from a file's stored `headers` string in a single in-memory seal-open —
+    /// no blob read, no network, the same path [`Self::try_row_is_video`] uses.
+    /// Powers the virtual filesystem's directory listing / `stat` without ever
+    /// touching the encrypted blob. `headers` is the DB `headers` column.
+    pub fn row_header_meta(
+        &self,
+        set: FileSet,
+        album_id: Option<&str>,
+        headers: &str,
+    ) -> Result<HeaderMeta> {
+        let part = headers_part(headers, false)?;
+        let kp = self.keypair_for(set, album_id)?;
+        let header = file::read_header(&mut Cursor::new(&part), &kp.public_key, &kp.secret_key)?;
+        Ok(HeaderMeta {
+            original_filename: header.filename,
+            data_size: header.data_size,
+            is_video: header.file_type == stingle_crypto::constants::FILE_TYPE_VIDEO,
+        })
+    }
+
+    /// Prepare a [`MediaStream`] for a file: ensure the encrypted blob is local
+    /// (downloading once if needed), decode its header, and scan the outer
+    /// header length. This is the expensive per-file setup, done ONCE so
+    /// subsequent range reads are just a file open + `decrypt_range`. Reuses the
+    /// same on-disk encrypted cache (`originals/`) and key path as
+    /// [`Self::media_response`], so already-downloaded files never re-fetch.
+    pub async fn open_media_stream(
+        &self,
+        set: FileSet,
+        album_id: Option<&str>,
+        filename: &str,
+    ) -> Result<MediaStream> {
+        let headers = self.headers_for(set, album_id, filename)?;
+        let part = headers_part(&headers, false)?;
+        let kp = self.keypair_for(set, album_id)?;
+        let header = file::read_header(&mut Cursor::new(&part), &kp.public_key, &kp.secret_key)?;
+        let path = self.ensure_encrypted(set, filename, false).await?;
+        let p = path.clone();
+        let outer_header_len = tokio::task::spawn_blocking(move || -> Result<u64> {
+            let mut f = std::fs::File::open(&p)?;
+            Ok(file::outer_header_len(&mut f)?)
+        })
+        .await
+        .map_err(|err| CoreError::Other(format!("outer-header task failed: {err}")))??;
+        Ok(MediaStream {
+            path,
+            symmetric_key: header.symmetric_key,
+            chunk_size: header.chunk_size,
+            outer_header_len,
+            data_size: header.data_size,
+        })
     }
 
     /// Produce a decrypted media response for the UI/protocol handler.

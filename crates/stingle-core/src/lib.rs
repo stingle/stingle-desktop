@@ -27,6 +27,7 @@ mod util;
 
 pub use account::{Account, AccountInfo};
 pub use error::{CoreError, Result};
+pub use media::{HeaderMeta, MediaResponse, MediaStream};
 pub use sync::Space;
 pub use takeout::{safe_filename, TakeoutStats};
 

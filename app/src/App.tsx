@@ -4,7 +4,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import {
   api, mediaUrl, videoUrl, pickFiles, pickFolder, parsePermissions,
-  Session, FileItem, Album, SharedAlbum, Contact, AlbumMember, LocalAccount, WatchFolder,
+  Session, FileItem, Album, SharedAlbum, Contact, AlbumMember, LocalAccount, WatchFolder, VfsStatus,
   SET_GALLERY, SET_TRASH, SET_ALBUM, BLANK_COVER,
 } from "./api";
 import logoUrl from "./assets/stingle-logo.png";
@@ -2348,6 +2348,49 @@ function SettingsView({ session, setSession, showToast }: {
   const [version, setVersion] = useState("");
   const [checkingUpdate, setCheckingUpdate] = useState(false);
 
+  // Virtual drive (read-only OS mount of the library)
+  const [vfs, setVfs] = useState<VfsStatus | null>(null);
+  const [vfsWarn, setVfsWarn] = useState(false);
+  const [vfsBusy, setVfsBusy] = useState(false);
+  const refreshVfs = () => { api.vfsStatus().then(setVfs).catch(() => {}); };
+  const doEnableVfs = async () => {
+    setVfsWarn(false);
+    setVfsBusy(true);
+    try {
+      const mp = await api.vfsEnable();
+      showToast(`Virtual drive mounted at ${mp}`);
+    } catch (err) {
+      showToast("Couldn't mount the drive: " + err);
+    } finally {
+      setVfsBusy(false);
+      refreshVfs();
+    }
+  };
+  const doDisableVfs = async () => {
+    setVfsBusy(true);
+    try {
+      await api.vfsDisable();
+      showToast("Virtual drive turned off");
+    } catch (err) {
+      showToast("Couldn't unmount: " + err);
+    } finally {
+      setVfsBusy(false);
+      refreshVfs();
+    }
+  };
+  const changeDriveLetter = async (letter: string) => {
+    setVfsBusy(true);
+    try {
+      const mp = await api.vfsSetDriveLetter(letter);
+      showToast(mp ? `Virtual drive moved to ${mp}` : `Drive letter set to ${letter}:`);
+    } catch (err) {
+      showToast("Couldn't change drive letter: " + err);
+    } finally {
+      setVfsBusy(false);
+      refreshVfs();
+    }
+  };
+
   const refreshCache = () => { api.cacheSize().then((b) => setCacheSizeMB(b / 1048576)); };
   useEffect(() => {
     api.getCacheLimit().then((b) => setCacheLimit(String(Math.round(b / 1048576))));
@@ -2365,6 +2408,7 @@ function SettingsView({ session, setSession, showToast }: {
     api.secureStoreStatus().then(setSecureStore).catch(() => {});
     api.getStoragePath().then(setStoragePath).catch(() => {});
     api.getWatchFolders().then(setWatchFolders).catch(() => {});
+    refreshVfs();
   }, []);
 
   // Progress bar while the storage folder is being moved.
@@ -2753,6 +2797,67 @@ function SettingsView({ session, setSession, showToast }: {
           <p className="muted" style={{ fontSize: 13 }}>Download and decrypt your entire library to a folder.</p>
           <button onClick={doTakeout}>Export library…</button>
         </div>
+
+        <div className="settings-section">
+          <h3>Virtual drive</h3>
+          <p className="muted" style={{ fontSize: 13 }}>
+            Mount your library as a read-only drive so you can pick photos and videos straight from any
+            app's file dialog — for example, uploading to a website. Files are decrypted on the fly, in
+            memory; Stingle never writes them to disk unencrypted.
+          </p>
+          {vfs && !vfs.supported && (
+            <p className="muted" style={{ fontSize: 13 }}>Not available in this build.</p>
+          )}
+          {vfs && vfs.supported && !vfs.driver_installed && (
+            <p className="muted" style={{ fontSize: 13 }}>
+              Requires the WinFsp driver (winfsp.dev). Install it, then restart Stingle.
+            </p>
+          )}
+          {vfs && vfs.supported && vfs.driver_installed && (
+            <>
+              <div className="row" style={{ gap: 10, alignItems: "center", marginBottom: 8 }}>
+                <label htmlFor="vfs-letter">Drive letter:</label>
+                <select id="vfs-letter" value={vfs.drive_letter} disabled={vfsBusy}
+                  onChange={(e) => changeDriveLetter(e.target.value)}>
+                  {vfs.available_letters.map((l) => (
+                    <option key={l} value={l}>{l}:</option>
+                  ))}
+                </select>
+                <span className="muted" style={{ fontSize: 12 }}>
+                  It also appears as “Stingle” in the Explorer sidebar.
+                </span>
+              </div>
+              {vfs.mounted ? (
+                <div className="row" style={{ gap: 10, alignItems: "center" }}>
+                  <span>Mounted at <b>{vfs.mount_point}</b></span>
+                  <button onClick={doDisableVfs} disabled={vfsBusy}>Turn off</button>
+                </div>
+              ) : (
+                <button onClick={() => setVfsWarn(true)} disabled={vfsBusy}>Turn on virtual drive…</button>
+              )}
+            </>
+          )}
+        </div>
+
+        {vfsWarn && (
+          <ConfirmDialog
+            title="Turn on the virtual drive?"
+            message={
+              <span>
+                While the drive is on, your decrypted photos and videos become browsable by other
+                programs on this computer. That means the OS may cache thumbnails of them, a search
+                indexer may read them, and antivirus or whatever app you upload to can read the files.
+                Stingle itself never writes them to disk unencrypted. Turn this on only on a computer you
+                trust, and turn it off when you're done.
+              </span>
+            }
+            actions={[
+              { label: "Turn on", onClick: doEnableVfs, variant: "primary" },
+              { label: "Cancel", onClick: () => setVfsWarn(false) },
+            ]}
+            onClose={() => setVfsWarn(false)}
+          />
+        )}
         </>}
 
         {tab === "about" && <>

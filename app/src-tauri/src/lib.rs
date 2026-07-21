@@ -69,6 +69,10 @@ pub struct AppState {
     /// Linux (WebKitGTK can't play custom-scheme media — see `media_server`).
     /// Stays unset on Windows/macOS where stingle:// videos work natively.
     video_server: std::sync::OnceLock<(u16, String)>,
+    /// The live virtual-drive mount (mount point + handle), or `None` when the
+    /// drive is off/unmounted. Dropping the handle tears down the OS driver.
+    /// Only ever `Some` in builds with a driver feature (e.g. `vfs-winfsp`).
+    vfs: Mutex<Option<(String, stingle_vfs::VfsMount)>>,
 }
 
 impl AppState {
@@ -95,6 +99,7 @@ impl AppState {
             staged_update: std::sync::Mutex::new(None),
             pending_update: std::sync::Mutex::new(None),
             video_server: std::sync::OnceLock::new(),
+            vfs: Mutex::new(None),
         }
     }
 
@@ -366,6 +371,7 @@ async fn login(
     let dto = session_dto(&acc);
     *state.account.lock().await = Some(Arc::new(acc));
     remember_last_account(&state, &key).await;
+    maybe_automount_vfs(&state).await;
     Ok(dto)
 }
 
@@ -380,6 +386,7 @@ async fn resume(
     let dto = session_dto(&acc);
     *state.account.lock().await = Some(Arc::new(acc));
     remember_last_account(&state, &account_key).await;
+    maybe_automount_vfs(&state).await;
     Ok(dto)
 }
 
@@ -402,12 +409,14 @@ async fn session(state: State<'_, AppState>) -> CmdResult<SessionDto> {
 
 #[tauri::command]
 async fn lock(state: State<'_, AppState>) -> CmdResult<()> {
+    unmount_vfs(&state).await;
     *state.account.lock().await = None;
     Ok(())
 }
 
 #[tauri::command]
 async fn logout(state: State<'_, AppState>, wipe: bool) -> CmdResult<()> {
+    unmount_vfs(&state).await;
     if let Some(acc) = state.account.lock().await.take() {
         let account_key = stingle_core::paths::account_key(&acc.info.server_url, &acc.info.email);
         acc.logout(wipe).await.map_err(e)?;
@@ -441,6 +450,7 @@ async fn logout(state: State<'_, AppState>, wipe: bool) -> CmdResult<()> {
 /// just reuse the dead token).
 async fn handle_session_expired(app: &tauri::AppHandle, state: &AppState) {
     stop_sync_loop(state).await;
+    unmount_vfs(state).await;
     if let Some(acc) = state.account.lock().await.take() {
         acc.request_stop_originals(); // halt any in-flight bulk download
     }
@@ -1322,6 +1332,218 @@ fn cleanup_drag_export(paths: Vec<String>) -> CmdResult<()> {
     Ok(())
 }
 
+// ----------------------------- virtual drive (VFS) -----------------------------
+
+/// Epoch-millisecond timestamp used for synthesized directory mtimes.
+fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Whether this build includes a virtual-filesystem driver for the platform.
+fn vfs_supported() -> bool {
+    cfg!(all(windows, feature = "vfs-winfsp"))
+}
+
+/// Best-effort check that the WinFsp runtime driver is installed.
+#[cfg(windows)]
+fn vfs_driver_installed() -> bool {
+    [
+        r"C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll",
+        r"C:\Program Files\WinFsp\bin\winfsp-x64.dll",
+    ]
+    .iter()
+    .any(|p| std::path::Path::new(p).exists())
+}
+#[cfg(not(windows))]
+fn vfs_driver_installed() -> bool {
+    false
+}
+
+/// Whether a drive letter is currently unused (Windows).
+#[cfg(windows)]
+fn letter_is_free(c: char) -> bool {
+    !std::path::Path::new(&format!("{c}:\\")).exists()
+}
+#[cfg(not(windows))]
+fn letter_is_free(_c: char) -> bool {
+    false
+}
+
+/// Default drive letter when the user hasn't picked one: prefer `S:`, else the
+/// first free letter `D..=Z`.
+fn default_drive_letter() -> char {
+    #[cfg(windows)]
+    {
+        if letter_is_free('S') {
+            return 'S';
+        }
+        if let Some(c) = ('D'..='Z').find(|&c| letter_is_free(c)) {
+            return c;
+        }
+    }
+    'S'
+}
+
+/// Normalize a user-supplied string to a single uppercase A–Z drive letter.
+fn normalize_letter(s: &str) -> Option<char> {
+    let c = s.trim().chars().next()?.to_ascii_uppercase();
+    c.is_ascii_alphabetic().then_some(c)
+}
+
+/// The effective drive letter: the configured one (validated) or the default.
+async fn effective_drive_letter(state: &AppState) -> char {
+    let configured = state.config.lock().await.virtual_drive_letter.clone();
+    configured
+        .as_deref()
+        .and_then(normalize_letter)
+        .unwrap_or_else(default_drive_letter)
+}
+
+/// Letters offered in the settings dropdown: currently-free letters plus the
+/// active selection (so the mounted letter still appears). Windows only.
+fn available_drive_letters(current: char) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        ('D'..='Z')
+            .filter(|&c| c == current || letter_is_free(c))
+            .map(|c| c.to_string())
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = current;
+        Vec::new()
+    }
+}
+
+/// Build the virtual filesystem from the current account and mount it, storing
+/// the live handle in `AppState`. Returns the mount point. Enumeration + mount
+/// run on a blocking task (25K header seal-opens are CPU-bound).
+async fn mount_vfs(state: &AppState) -> Result<String, String> {
+    let acc = state.current().await.ok_or("Not logged in")?;
+    // Already mounted: report the existing mount point.
+    if let Some((mp, _)) = state.vfs.lock().await.as_ref() {
+        return Ok(mp.clone());
+    }
+    let include_trash = false;
+    let mount_point = format!("{}:", effective_drive_letter(state).await);
+    let handle = tokio::runtime::Handle::current();
+    let cfg = stingle_vfs::MountConfig {
+        mount_point: mount_point.clone(),
+        include_trash,
+    };
+    let now_ms = now_epoch_ms();
+    let mount = tokio::task::spawn_blocking(move || {
+        let vfs = stingle_vfs::Vfs::from_account(acc, handle, now_ms, include_trash);
+        stingle_vfs::VfsMount::mount(vfs, &cfg)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(|err| err.to_string())?;
+    *state.vfs.lock().await = Some((mount_point.clone(), mount));
+    Ok(mount_point)
+}
+
+/// Unmount the virtual drive if mounted. Dropping the handle tears down the OS
+/// driver; done on a blocking task since teardown can block briefly.
+async fn unmount_vfs(state: &AppState) {
+    let mount = state.vfs.lock().await.take();
+    if let Some(m) = mount {
+        let _ = tokio::task::spawn_blocking(move || drop(m)).await;
+    }
+}
+
+/// If the drive is enabled (and supported) but not mounted, mount it. Called
+/// after login/resume so the persisted preference is honored. Best-effort.
+async fn maybe_automount_vfs(state: &AppState) {
+    let enabled = state.config.lock().await.virtual_drive_enabled;
+    if enabled && vfs_supported() {
+        if let Err(err) = mount_vfs(state).await {
+            tracing::warn!("virtual drive automount failed: {err}");
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct VfsStatusDto {
+    /// This build has a driver for the current platform.
+    supported: bool,
+    /// The OS driver (WinFsp) appears to be installed.
+    driver_installed: bool,
+    /// The user's persisted preference.
+    enabled: bool,
+    /// A mount is currently live.
+    mounted: bool,
+    /// The mount point (e.g. `"S:"`) when mounted.
+    mount_point: Option<String>,
+    /// The effective drive letter (configured or default), a single letter.
+    drive_letter: String,
+    /// Drive letters offered in the settings dropdown.
+    available_letters: Vec<String>,
+}
+
+#[tauri::command]
+async fn vfs_status(state: State<'_, AppState>) -> CmdResult<VfsStatusDto> {
+    let enabled = state.config.lock().await.virtual_drive_enabled;
+    let mount_point = state.vfs.lock().await.as_ref().map(|(mp, _)| mp.clone());
+    let letter = effective_drive_letter(&state).await;
+    Ok(VfsStatusDto {
+        supported: vfs_supported(),
+        driver_installed: vfs_driver_installed(),
+        enabled,
+        mounted: mount_point.is_some(),
+        mount_point,
+        drive_letter: letter.to_string(),
+        available_letters: available_drive_letters(letter),
+    })
+}
+
+/// Change the preferred drive letter. Persists it and, if the drive is mounted,
+/// remounts at the new letter. Returns the new mount point when remounted.
+#[tauri::command]
+async fn vfs_set_drive_letter(
+    state: State<'_, AppState>,
+    letter: String,
+) -> CmdResult<Option<String>> {
+    let letter = normalize_letter(&letter).ok_or("Invalid drive letter")?;
+    {
+        let mut cfg = state.config.lock().await;
+        cfg.virtual_drive_letter = Some(letter.to_string());
+        let _ = cfg.save();
+    }
+    if state.vfs.lock().await.is_some() {
+        unmount_vfs(&state).await;
+        return Ok(Some(mount_vfs(&state).await?));
+    }
+    Ok(None)
+}
+
+/// Enable + mount the virtual drive. Persists the preference on success.
+#[tauri::command]
+async fn vfs_enable(state: State<'_, AppState>) -> CmdResult<String> {
+    if !vfs_supported() {
+        return Err("The virtual drive isn't available in this build.".into());
+    }
+    let mount_point = mount_vfs(&state).await?;
+    let mut cfg = state.config.lock().await;
+    cfg.virtual_drive_enabled = true;
+    let _ = cfg.save();
+    Ok(mount_point)
+}
+
+/// Unmount + disable the virtual drive. Persists the preference.
+#[tauri::command]
+async fn vfs_disable(state: State<'_, AppState>) -> CmdResult<()> {
+    unmount_vfs(&state).await;
+    let mut cfg = state.config.lock().await;
+    cfg.virtual_drive_enabled = false;
+    let _ = cfg.save();
+    Ok(())
+}
+
 // ----------------------------- app settings -----------------------------
 
 #[tauri::command]
@@ -1563,6 +1785,7 @@ async fn try_auto_unlock(state: State<'_, AppState>) -> CmdResult<SessionDto> {
     let dto = session_dto(&acc);
     *state.account.lock().await = Some(Arc::new(acc));
     remember_last_account(&state, &blob.account_key).await;
+    maybe_automount_vfs(&state).await;
     Ok(dto)
 }
 
@@ -2371,6 +2594,10 @@ pub fn run() {
             paste_from_clipboard,
             export_for_drag,
             cleanup_drag_export,
+            vfs_status,
+            vfs_enable,
+            vfs_disable,
+            vfs_set_drive_letter,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
