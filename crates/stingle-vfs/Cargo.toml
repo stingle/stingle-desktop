@@ -31,7 +31,17 @@ windows = { version = "0.62", optional = true, features = [
 # Per-user DriveIcons registry key so the mounted drive shows the app icon.
 windows-registry = { version = "0.6", optional = true }
 
+# --- Unix driver adapter (opt-in via `mount-fuse`) ---
+# `fuser` links libfuse (pkg-config) at build time and mounts via the FUSE
+# runtime at run time — Linux `fuse3`, macOS macFUSE/FUSE-T. No libclang needed.
+[target.'cfg(unix)'.dependencies]
+fuser = { version = "0.14", optional = true }
+libc = { version = "0.2", optional = true }
+
 [features]
 default = []
 # Build the Windows WinFsp adapter. Requires WinFsp installed to *run* a mount.
 mount-winfsp = ["dep:winfsp", "dep:windows", "dep:windows-registry"]
+# Build the Unix FUSE adapter (Linux + macOS). Needs libfuse dev files to build
+# and the FUSE runtime to run.
+mount-fuse = ["dep:fuser", "dep:libc"]

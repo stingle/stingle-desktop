@@ -1,0 +1,85 @@
+name: Build (no release)
+
+# Build the desktop bundles on all three OSes WITHOUT publishing a GitHub
+# Release. Run it by hand from the Actions tab, or just open a PR — either way
+# download the installers from the run's "Artifacts" section. (Same as
+# release.yml but with no `tagName`, so tauri-action only builds — never
+# creates a release.)
+on:
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            features: vfs-winfsp
+          - platform: ubuntu-22.04
+            features: vfs-fuse
+          - platform: macos-latest
+            features: vfs-fuse
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Base tauri deps + libfuse (build) + fuse3 (runtime dep for the .deb).
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libgtk-3-dev \
+            libfuse3-dev fuse3 pkg-config
+
+      # macFUSE provides libfuse to LINK against. The kext won't load in CI (needs
+      # user approval), but building only needs the headers/lib, which this
+      # installs. If this step ever fails on the runner, drop `--features vfs-fuse`
+      # from the macOS job to still get a (driver-less) build.
+      - name: Install macOS FUSE (build-time libfuse)
+        if: matrix.platform == 'macos-latest'
+        run: brew install --cask macfuse
+
+      # The vfs-winfsp build needs WinFsp WITH developer files (headers/lib, via
+      # ADDLOCAL=ALL) and libclang (bindgen).
+      - name: Install Windows dependencies (WinFsp dev + LLVM)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          choco install llvm -y --no-progress
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          curl.exe -L -o winfsp.msi https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+          Start-Process msiexec -Wait -ArgumentList '/i','winfsp.msi','/qn','ADDLOCAL=ALL'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "app/src-tauri -> target"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: Install frontend dependencies
+        run: npm --prefix app ci
+
+      # No `tagName` => tauri-action builds but creates NO release.
+      - name: Build (no release)
+        uses: tauri-apps/tauri-action@v1
+        with:
+          projectPath: app
+          args: "--features ${{ matrix.features }}"
+
+      # Installers land under <target>/release/bundle. The cargo workspace root
+      # is the repo root, so target/ is there; the second glob is a safety net.
+      - name: Upload bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: stingle-${{ matrix.platform }}
+          path: |
+            target/release/bundle/**
+            app/src-tauri/target/release/bundle/**
+          if-no-files-found: warn

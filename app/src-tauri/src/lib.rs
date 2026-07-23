@@ -1344,10 +1344,10 @@ fn now_epoch_ms() -> i64 {
 
 /// Whether this build includes a virtual-filesystem driver for the platform.
 fn vfs_supported() -> bool {
-    cfg!(all(windows, feature = "vfs-winfsp"))
+    cfg!(all(windows, feature = "vfs-winfsp")) || cfg!(all(unix, feature = "vfs-fuse"))
 }
 
-/// Best-effort check that the WinFsp runtime driver is installed.
+/// Best-effort check that the OS filesystem driver runtime is installed.
 #[cfg(windows)]
 fn vfs_driver_installed() -> bool {
     [
@@ -1357,34 +1357,37 @@ fn vfs_driver_installed() -> bool {
     .iter()
     .any(|p| std::path::Path::new(p).exists())
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn vfs_driver_installed() -> bool {
+    std::path::Path::new("/dev/fuse").exists()
+}
+#[cfg(target_os = "macos")]
+fn vfs_driver_installed() -> bool {
+    // macFUSE, or FUSE-T's userspace runtime.
+    std::path::Path::new("/Library/Filesystems/macfuse.fs").exists()
+        || std::path::Path::new("/usr/local/lib/libfuse-t.dylib").exists()
+}
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn vfs_driver_installed() -> bool {
     false
 }
 
-/// Whether a drive letter is currently unused (Windows).
-#[cfg(windows)]
-fn letter_is_free(c: char) -> bool {
-    !std::path::Path::new(&format!("{c}:\\")).exists()
-}
-#[cfg(not(windows))]
-fn letter_is_free(_c: char) -> bool {
-    false
-}
-
-/// Default drive letter when the user hasn't picked one: prefer `S:`, else the
-/// first free letter `D..=Z`.
-fn default_drive_letter() -> char {
+/// The mount point for this platform: a drive spec like `"S:"` on Windows, a
+/// directory path on Unix.
+async fn vfs_mount_point(state: &AppState) -> String {
     #[cfg(windows)]
     {
-        if letter_is_free('S') {
-            return 'S';
-        }
-        if let Some(c) = ('D'..='Z').find(|&c| letter_is_free(c)) {
-            return c;
-        }
+        format!("{}:", effective_drive_letter(state).await)
     }
-    'S'
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        dirs::home_dir()
+            .map(|h| h.join("Stingle"))
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/Stingle"))
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 /// Normalize a user-supplied string to a single uppercase A–Z drive letter.
@@ -1393,7 +1396,26 @@ fn normalize_letter(s: &str) -> Option<char> {
     c.is_ascii_alphabetic().then_some(c)
 }
 
+// ---- Windows drive-letter selection (the mount point is a letter there) ----
+
+/// Whether a drive letter is currently unused.
+#[cfg(windows)]
+fn letter_is_free(c: char) -> bool {
+    !std::path::Path::new(&format!("{c}:\\")).exists()
+}
+
+/// Default drive letter when the user hasn't picked one: prefer `S:`, else the
+/// first free letter `D..=Z`.
+#[cfg(windows)]
+fn default_drive_letter() -> char {
+    if letter_is_free('S') {
+        return 'S';
+    }
+    ('D'..='Z').find(|&c| letter_is_free(c)).unwrap_or('S')
+}
+
 /// The effective drive letter: the configured one (validated) or the default.
+#[cfg(windows)]
 async fn effective_drive_letter(state: &AppState) -> char {
     let configured = state.config.lock().await.virtual_drive_letter.clone();
     configured
@@ -1403,20 +1425,13 @@ async fn effective_drive_letter(state: &AppState) -> char {
 }
 
 /// Letters offered in the settings dropdown: currently-free letters plus the
-/// active selection (so the mounted letter still appears). Windows only.
+/// active selection (so the mounted letter still appears).
+#[cfg(windows)]
 fn available_drive_letters(current: char) -> Vec<String> {
-    #[cfg(windows)]
-    {
-        ('D'..='Z')
-            .filter(|&c| c == current || letter_is_free(c))
-            .map(|c| c.to_string())
-            .collect()
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = current;
-        Vec::new()
-    }
+    ('D'..='Z')
+        .filter(|&c| c == current || letter_is_free(c))
+        .map(|c| c.to_string())
+        .collect()
 }
 
 /// Build the virtual filesystem from the current account and mount it, storing
@@ -1429,7 +1444,7 @@ async fn mount_vfs(state: &AppState) -> Result<String, String> {
         return Ok(mp.clone());
     }
     let include_trash = false;
-    let mount_point = format!("{}:", effective_drive_letter(state).await);
+    let mount_point = vfs_mount_point(state).await;
     let handle = tokio::runtime::Handle::current();
     let cfg = stingle_vfs::MountConfig {
         mount_point: mount_point.clone(),
@@ -1489,15 +1504,22 @@ struct VfsStatusDto {
 async fn vfs_status(state: State<'_, AppState>) -> CmdResult<VfsStatusDto> {
     let enabled = state.config.lock().await.virtual_drive_enabled;
     let mount_point = state.vfs.lock().await.as_ref().map(|(mp, _)| mp.clone());
-    let letter = effective_drive_letter(&state).await;
+    // The drive-letter picker is a Windows concept; Unix mounts at a directory.
+    #[cfg(windows)]
+    let (drive_letter, available_letters) = {
+        let l = effective_drive_letter(&state).await;
+        (l.to_string(), available_drive_letters(l))
+    };
+    #[cfg(not(windows))]
+    let (drive_letter, available_letters) = (String::new(), Vec::<String>::new());
     Ok(VfsStatusDto {
         supported: vfs_supported(),
         driver_installed: vfs_driver_installed(),
         enabled,
         mounted: mount_point.is_some(),
         mount_point,
-        drive_letter: letter.to_string(),
-        available_letters: available_drive_letters(letter),
+        drive_letter,
+        available_letters,
     })
 }
 
@@ -1519,6 +1541,49 @@ async fn vfs_set_drive_letter(
         return Ok(Some(mount_vfs(&state).await?));
     }
     Ok(None)
+}
+
+/// Launch the bundled filesystem-driver installer. Windows runs the WinFsp MSI
+/// (passive, self-elevating); macOS opens the macFUSE pkg for the guided
+/// approval flow; Linux directs the user to the `fuse3` package. The installer
+/// binaries are shipped as bundle resources (see `resources/README.md`); if one
+/// isn't present this reports that rather than failing silently.
+#[tauri::command]
+async fn vfs_install_driver(app: tauri::AppHandle) -> CmdResult<()> {
+    use tauri::Manager;
+    let res_dir = app.path().resource_dir().map_err(|err| err.to_string())?;
+    #[cfg(windows)]
+    {
+        let msi = res_dir.join("resources").join("winfsp.msi");
+        if !msi.exists() {
+            return Err("The WinFsp installer isn't bundled in this build.".into());
+        }
+        std::process::Command::new("msiexec")
+            .arg("/i")
+            .arg(&msi)
+            .arg("/passive")
+            .arg("/norestart")
+            .spawn()
+            .map_err(|err| format!("Couldn't launch the installer: {err}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let pkg = res_dir.join("resources").join("macfuse.pkg");
+        if !pkg.exists() {
+            return Err("The macFUSE installer isn't bundled in this build.".into());
+        }
+        std::process::Command::new("open")
+            .arg(&pkg)
+            .spawn()
+            .map_err(|err| format!("Couldn't launch the installer: {err}"))?;
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = res_dir;
+        Err("On Linux, install the 'fuse3' package with your package manager.".into())
+    }
 }
 
 /// Enable + mount the virtual drive. Persists the preference on success.
@@ -2598,6 +2663,7 @@ pub fn run() {
             vfs_enable,
             vfs_disable,
             vfs_set_drive_letter,
+            vfs_install_driver,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

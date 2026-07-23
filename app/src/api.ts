@@ -219,6 +219,8 @@ export const api = {
   /** Change the drive letter; remounts if on. Resolves to the new mount point
    *  when it was remounted, else null. */
   vfsSetDriveLetter: (letter: string) => invoke<string | null>("vfs_set_drive_letter", { letter }),
+  /** Launch the bundled driver installer (WinFsp / macFUSE). */
+  vfsInstallDriver: () => invoke<void>("vfs_install_driver"),
 };
 
 /** Status of the read-only virtual drive (see `vfs_status`). */

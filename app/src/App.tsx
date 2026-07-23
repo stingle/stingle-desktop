@@ -2390,6 +2390,18 @@ function SettingsView({ session, setSession, showToast }: {
       refreshVfs();
     }
   };
+  const installDriver = async () => {
+    setVfsBusy(true);
+    try {
+      await api.vfsInstallDriver();
+      showToast("Launching the driver installer…");
+    } catch (err) {
+      showToast("" + err);
+    } finally {
+      setVfsBusy(false);
+      setTimeout(refreshVfs, 1500);
+    }
+  };
 
   const refreshCache = () => { api.cacheSize().then((b) => setCacheSizeMB(b / 1048576)); };
   useEffect(() => {
@@ -2809,24 +2821,31 @@ function SettingsView({ session, setSession, showToast }: {
             <p className="muted" style={{ fontSize: 13 }}>Not available in this build.</p>
           )}
           {vfs && vfs.supported && !vfs.driver_installed && (
-            <p className="muted" style={{ fontSize: 13 }}>
-              Requires the WinFsp driver (winfsp.dev). Install it, then restart Stingle.
-            </p>
+            <div>
+              <p className="muted" style={{ fontSize: 13 }}>
+                The virtual drive needs a small system driver, which is included with Stingle. Install it,
+                then restart Stingle. On macOS you'll also approve it in System Settings → Privacy &amp;
+                Security and reboot once.
+              </p>
+              <button onClick={installDriver} disabled={vfsBusy}>Install driver…</button>
+            </div>
           )}
           {vfs && vfs.supported && vfs.driver_installed && (
             <>
-              <div className="row" style={{ gap: 10, alignItems: "center", marginBottom: 8 }}>
-                <label htmlFor="vfs-letter">Drive letter:</label>
-                <select id="vfs-letter" value={vfs.drive_letter} disabled={vfsBusy}
-                  onChange={(e) => changeDriveLetter(e.target.value)}>
-                  {vfs.available_letters.map((l) => (
-                    <option key={l} value={l}>{l}:</option>
-                  ))}
-                </select>
-                <span className="muted" style={{ fontSize: 12 }}>
-                  It also appears as “Stingle” in the Explorer sidebar.
-                </span>
-              </div>
+              {vfs.available_letters.length > 0 && (
+                <div className="row" style={{ gap: 10, alignItems: "center", marginBottom: 8 }}>
+                  <label htmlFor="vfs-letter">Drive letter:</label>
+                  <select id="vfs-letter" value={vfs.drive_letter} disabled={vfsBusy}
+                    onChange={(e) => changeDriveLetter(e.target.value)}>
+                    {vfs.available_letters.map((l) => (
+                      <option key={l} value={l}>{l}:</option>
+                    ))}
+                  </select>
+                  <span className="muted" style={{ fontSize: 12 }}>
+                    It also appears as “Stingle” in the Explorer sidebar.
+                  </span>
+                </div>
+              )}
               {vfs.mounted ? (
                 <div className="row" style={{ gap: 10, alignItems: "center" }}>
                   <span>Mounted at <b>{vfs.mount_point}</b></span>
