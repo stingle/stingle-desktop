@@ -66,12 +66,20 @@ jobs:
       - name: Install frontend dependencies
         run: npm --prefix app ci
 
-      # No `tagName` => tauri-action builds but creates NO release.
+      # Unsigned test build: the bundle config maps embedded.provisionprofile
+      # into the .app (materialized from a secret in release.yml). Drop an empty
+      # placeholder so the copy succeeds; it's inert in an unsigned build.
+      - name: Placeholder provisioning profile (macOS)
+        if: matrix.platform == 'macos-latest'
+        run: touch app/src-tauri/embedded.provisionprofile
+
+      # No `tagName` => tauri-action builds but creates NO release. The extra
+      # --config disables updater artifacts so the build needs no signing key.
       - name: Build (no release)
         uses: tauri-apps/tauri-action@v1
         with:
           projectPath: app
-          args: "--features ${{ matrix.features }}"
+          args: "--features ${{ matrix.features }} --config src-tauri/tauri.ci-build.conf.json"
 
       # Installers land under <target>/release/bundle. The cargo workspace root
       # is the repo root, so target/ is there; the second glob is a safety net.
