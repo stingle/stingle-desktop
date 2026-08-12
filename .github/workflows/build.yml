@@ -15,10 +15,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # NSIS only: the MSI bundler downloads the WiX toolset at build time,
+          # which is an extra failure mode ("io: Peer disconnected") for no gain
+          # here - one installer is enough for a test build.
           - platform: windows-latest
             features: vfs-winfsp
             rust-targets: ""
-            extra-args: ""
+            extra-args: "--bundles nsis"
           - platform: ubuntu-22.04
             features: vfs-fuse
             rust-targets: ""
