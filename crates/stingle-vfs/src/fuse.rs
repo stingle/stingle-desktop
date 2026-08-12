@@ -195,6 +195,9 @@ impl FuseMount {
         let gid = unsafe { libc::getgid() } as u32;
         let fs = StingleFuse { vfs, uid, gid };
 
+        // `mut` only on macOS, which appends below — declaring it unconditionally
+        // warns on Linux.
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut options = vec![
             MountOption::RO,
             MountOption::FSName("Stingle".to_string()),

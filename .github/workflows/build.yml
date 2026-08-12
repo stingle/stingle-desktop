@@ -15,9 +15,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # NSIS only: the MSI bundler downloads the WiX toolset at build time,
-          # which is an extra failure mode ("io: Peer disconnected") for no gain
-          # here - one installer is enough for a test build.
+          # ONE bundle per platform, chosen to avoid every bundler that fetches a
+          # tool at bundle time - those downloads are the main source of red
+          # builds here ("io: Peer disconnected"), and they add nothing to a test
+          # build. MSI pulls the WiX toolset; AppImage pulls AppRun/linuxdeploy.
+          # NSIS and deb need no downloads; dmg is kept over a bare .app because
+          # artifact upload does not preserve the executable bit, so a zipped
+          # .app would not launch.
           - platform: windows-latest
             features: vfs-winfsp
             rust-targets: ""
@@ -25,14 +29,14 @@ jobs:
           - platform: ubuntu-22.04
             features: vfs-fuse
             rust-targets: ""
-            extra-args: ""
+            extra-args: "--bundles deb"
           # `macos-latest` runners are Apple Silicon, so a plain build is
           # arm64-ONLY and won't launch on an Intel Mac. Build a universal
           # binary like release.yml does.
           - platform: macos-latest
             features: vfs-fuse
             rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
-            extra-args: "--target universal-apple-darwin"
+            extra-args: "--target universal-apple-darwin --bundles dmg"
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v7
@@ -98,13 +102,31 @@ jobs:
         if: matrix.platform == 'macos-latest'
         run: touch app/src-tauri/embedded.provisionprofile
 
-      # No `tagName` => tauri-action builds but creates NO release. The extra
-      # --config disables updater artifacts so the build needs no signing key.
+      # Call the Tauri CLI directly rather than through tauri-action: with no
+      # `tagName` the action only shells out to this same command, and doing it
+      # ourselves lets us RETRY. Bundling still fetches things (Rust crates, the
+      # CLI's own helpers), and a single transient network error was failing the
+      # whole run. Retries are cheap - the compile is cached, so a second attempt
+      # re-runs only the bundling step.
+      # The extra --config disables updater artifacts, so no signing key is needed.
       - name: Build (no release)
-        uses: tauri-apps/tauri-action@v1
-        with:
-          projectPath: app
-          args: "--features ${{ matrix.features }} --config src-tauri/tauri.ci-build.conf.json ${{ matrix.extra-args }}"
+        working-directory: app
+        shell: bash
+        run: |
+          set -uo pipefail
+          args="--features ${{ matrix.features }} --config src-tauri/tauri.ci-build.conf.json ${{ matrix.extra-args }}"
+          for attempt in 1 2 3; do
+            echo "::group::build attempt $attempt"
+            if npm run tauri build -- $args; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::Build attempt $attempt failed; retrying in 15s"
+            sleep 15
+          done
+          echo "::error::Build failed after 3 attempts"
+          exit 1
 
       # Installers land under <target>/release/bundle. The cargo workspace root
       # is the repo root, so target/ is there; a `--target` build nests under
