@@ -228,6 +228,10 @@ export const api = {
   vfsSetDriveLetter: (letter: string) => invoke<string | null>("vfs_set_drive_letter", { letter }),
   /** Launch the bundled driver installer (WinFsp / macFUSE). */
   vfsInstallDriver: () => invoke<void>("vfs_install_driver"),
+  /** Open a fixed setup destination: the driver's download page, or (macOS) the
+   *  Privacy & Security pane where a blocked system extension is allowed. */
+  vfsDriverHelp: (target: "download" | "security") =>
+    invoke<void>("vfs_driver_help", { target }),
 };
 
 /** One `label: value` row in the media-info panel. */
@@ -266,6 +270,8 @@ export interface VfsStatus {
   drive_letter: string;
   /** Drive letters offered in the picker. */
   available_letters: string[];
+  /** Which platform's setup steps to show. */
+  os: "macos" | "windows" | "linux";
 }
 
 /** URL for a decrypted thumbnail/original served via the `stingle://` protocol. */

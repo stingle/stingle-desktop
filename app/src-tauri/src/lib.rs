@@ -1444,6 +1444,36 @@ fn vfs_driver_installed() -> bool {
     false
 }
 
+/// Add platform guidance to a raw driver mount failure. The driver's own message
+/// ("Unsupported macOS Version", a WinFsp status code) rarely tells the user what
+/// to actually do, and merely *finding* the driver installed doesn't mean it can
+/// load — macFUSE kexts are tied to the macOS version they were built for.
+fn mount_error_hint(err: String) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        format!(
+            "{err}\n\nIf macFUSE reported an unsupported macOS version, its kernel \
+             extension is older than your macOS. Install the latest macFUSE from \
+             macfuse.io, allow it in System Settings > Privacy & Security, then \
+             restart your Mac."
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        format!("{err}\n\nMake sure the 'fuse3' package is installed and /dev/fuse exists.")
+    }
+    #[cfg(windows)]
+    {
+        format!(
+            "{err}\n\nMake sure WinFsp is installed and the chosen drive letter is free."
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        err
+    }
+}
+
 /// The mount point for this platform: a drive spec like `"S:"` on Windows, a
 /// directory path on Unix.
 async fn vfs_mount_point(state: &AppState) -> String {
@@ -1529,7 +1559,7 @@ async fn mount_vfs(state: &AppState) -> Result<String, String> {
     })
     .await
     .map_err(|err| err.to_string())?
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| mount_error_hint(err.to_string()))?;
     *state.vfs.lock().await = Some((mount_point.clone(), mount));
     Ok(mount_point)
 }
@@ -1570,6 +1600,9 @@ struct VfsStatusDto {
     drive_letter: String,
     /// Drive letters offered in the settings dropdown.
     available_letters: Vec<String>,
+    /// `"macos"` / `"windows"` / `"linux"` — lets the setup panel show the right
+    /// steps without the frontend guessing from the user agent.
+    os: String,
 }
 
 #[tauri::command]
@@ -1592,6 +1625,14 @@ async fn vfs_status(state: State<'_, AppState>) -> CmdResult<VfsStatusDto> {
         mount_point,
         drive_letter,
         available_letters,
+        os: if cfg!(target_os = "macos") {
+            "macos"
+        } else if cfg!(windows) {
+            "windows"
+        } else {
+            "linux"
+        }
+        .to_string(),
     })
 }
 
@@ -1613,6 +1654,35 @@ async fn vfs_set_drive_letter(
         return Ok(Some(mount_vfs(&state).await?));
     }
     Ok(None)
+}
+
+/// Open one of the fixed destinations the driver-setup panel links to.
+///
+/// Deliberately NOT an "open this URL" command: the webview picks a target by
+/// name and the URL is chosen here, so a compromised page can't make the OS open
+/// something arbitrary.
+#[tauri::command]
+fn vfs_driver_help(app: tauri::AppHandle, target: String) -> CmdResult<()> {
+    match target.as_str() {
+        "download" => {
+            let url = if cfg!(target_os = "macos") {
+                "https://macfuse.io"
+            } else {
+                "https://winfsp.dev/rel/"
+            };
+            use tauri_plugin_opener::OpenerExt;
+            app.opener().open_url(url, None::<&str>).map_err(e)
+        }
+        // Jump straight to the pane where a blocked system extension is allowed.
+        // Uses `open` directly: this is an Apple URL scheme, not a web link.
+        #[cfg(target_os = "macos")]
+        "security" => std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?General")
+            .spawn()
+            .map(|_| ())
+            .map_err(|err| format!("Couldn't open System Settings: {err}")),
+        _ => Err("unknown help target".into()),
+    }
 }
 
 /// Launch the bundled filesystem-driver installer. Windows runs the WinFsp MSI
@@ -2781,6 +2851,7 @@ pub fn run() {
             vfs_disable,
             vfs_set_drive_letter,
             vfs_install_driver,
+            vfs_driver_help,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

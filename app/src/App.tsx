@@ -2425,6 +2425,8 @@ function SettingsView({ session, setSession, showToast }: {
   const [vfs, setVfs] = useState<VfsStatus | null>(null);
   const [vfsWarn, setVfsWarn] = useState(false);
   const [vfsBusy, setVfsBusy] = useState(false);
+  const [vfsSetup, setVfsSetup] = useState(false);
+  const [vfsError, setVfsError] = useState<string | null>(null);
   const refreshVfs = () => { api.vfsStatus().then(setVfs).catch(() => {}); };
   const doEnableVfs = async () => {
     setVfsWarn(false);
@@ -2433,7 +2435,11 @@ function SettingsView({ session, setSession, showToast }: {
       const mp = await api.vfsEnable();
       showToast(`Virtual drive mounted at ${mp}`);
     } catch (err) {
-      showToast("Couldn't mount the drive: " + err);
+      // A failed mount is almost always a driver problem (missing, blocked, or
+      // too old for this OS). Don't leave the user at a dead-end toast — open
+      // the setup steps with the failure shown at the top.
+      setVfsError(String(err));
+      setVfsSetup(true);
     } finally {
       setVfsBusy(false);
       refreshVfs();
@@ -2911,11 +2917,11 @@ function SettingsView({ session, setSession, showToast }: {
           {vfs && vfs.supported && !vfs.driver_installed && (
             <div>
               <p className="muted" style={{ fontSize: 13 }}>
-                The virtual drive needs a small system driver, which is included with Stingle. Install it,
-                then restart Stingle. On macOS you'll also approve it in System Settings → Privacy &amp;
-                Security and reboot once.
+                The virtual drive needs a small system component. It's a one-time setup.
               </p>
-              <button onClick={installDriver} disabled={vfsBusy}>Install driver…</button>
+              <button onClick={() => { setVfsError(null); setVfsSetup(true); }} disabled={vfsBusy}>
+                Set up…
+              </button>
             </div>
           )}
           {vfs && vfs.supported && vfs.driver_installed && (
@@ -2945,6 +2951,16 @@ function SettingsView({ session, setSession, showToast }: {
             </>
           )}
         </div>
+
+        {vfsSetup && vfs && (
+          <DriverSetupDialog
+            os={vfs.os}
+            error={vfsError}
+            canInstall={vfs.os !== "linux"}
+            onInstall={installDriver}
+            onClose={() => { setVfsSetup(false); setVfsError(null); refreshVfs(); }}
+          />
+        )}
 
         {vfsWarn && (
           <ConfirmDialog
@@ -3079,6 +3095,87 @@ function MoveDialog({ fromSet, fromAlbum, count, onPick, onClose }: {
         {shared.length > 0 && <><div className="move-section">Shared albums</div><div className="move-grid">{shared.map(Card)}</div></>}
       </div>
     </div>
+  );
+}
+
+/** Step-by-step driver setup for the virtual drive.
+ *
+ *  Shown when the driver is missing OR when a mount fails — the drivers' own
+ *  errors ("Unsupported macOS Version") say what's wrong but never what to do,
+ *  and on macOS the fix spans a download, a system-settings approval and a
+ *  reboot. Every step that can be automated is a button. */
+function DriverSetupDialog({ os, error, canInstall, onInstall, onClose }: {
+  os: "macos" | "windows" | "linux";
+  /** The failed mount's message, when we got here from a failure. */
+  error: string | null;
+  /** True when an installer is bundled with the app (see resources/README.md). */
+  canInstall: boolean;
+  onInstall: () => void;
+  onClose: () => void;
+}) {
+  const open = (t: "download" | "security") => { api.vfsDriverHelp(t).catch(() => {}); };
+  const steps: React.ReactNode[] = [];
+  if (os === "macos") {
+    steps.push(
+      <>
+        <b>Install macFUSE.</b> It lets apps provide a drive to macOS. If it's already
+        installed but Stingle says it's unsupported, it predates your macOS and needs updating.
+        <div className="row" style={{ gap: 8, marginTop: 6 }}>
+          {canInstall && <button onClick={onInstall}>Install included copy</button>}
+          <button onClick={() => open("download")}>Download macFUSE…</button>
+        </div>
+      </>,
+      <>
+        <b>Allow it.</b> macOS blocks new system extensions until you approve them, under
+        Privacy &amp; Security.
+        <div className="row" style={{ gap: 8, marginTop: 6 }}>
+          <button onClick={() => open("security")}>Open Privacy &amp; Security</button>
+        </div>
+      </>,
+      <><b>Restart your Mac.</b> A newly approved extension only loads after a reboot.</>,
+      <><b>Come back here</b> and turn the virtual drive on.</>,
+    );
+  } else if (os === "windows") {
+    steps.push(
+      <>
+        <b>Install WinFsp.</b> It lets apps provide a drive to Windows.
+        <div className="row" style={{ gap: 8, marginTop: 6 }}>
+          {canInstall && <button onClick={onInstall}>Install included copy</button>}
+          <button onClick={() => open("download")}>Download WinFsp…</button>
+        </div>
+      </>,
+      <><b>Restart Stingle</b>, then turn the virtual drive on.</>,
+    );
+  } else {
+    steps.push(
+      <>
+        <b>Install FUSE.</b> Most distributions ship it as <code>fuse3</code>:
+        <div className="muted" style={{ marginTop: 4 }}><code>sudo apt install fuse3</code></div>
+      </>,
+      <><b>Restart Stingle</b>, then turn the virtual drive on.</>,
+    );
+  }
+  return (
+    <ConfirmDialog
+      title="Set up the virtual drive"
+      message={
+        <div style={{ textAlign: "left" }}>
+          {error && (
+            <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
+              The drive couldn't start: {error.split("\n")[0]}
+            </p>
+          )}
+          <p style={{ marginTop: 0 }}>
+            The virtual drive needs a small system component. This is a one-time setup.
+          </p>
+          <ol style={{ paddingLeft: 20, margin: 0, display: "grid", gap: 12 }}>
+            {steps.map((s, i) => <li key={i}>{s}</li>)}
+          </ol>
+        </div>
+      }
+      actions={[{ label: "Done", onClick: onClose }]}
+      onClose={onClose}
+    />
   );
 }
 
