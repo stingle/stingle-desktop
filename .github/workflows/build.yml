@@ -49,7 +49,18 @@ jobs:
       # from the macOS job to still get a (driver-less) build.
       - name: Install macOS FUSE (build-time libfuse)
         if: matrix.platform == 'macos-latest'
-        run: brew install --cask macfuse
+        run: |
+          brew install --cask macfuse
+          # The universal build compiles an x86_64 slice on an arm64 runner, which
+          # pkg-config-rs treats as cross-compilation and refuses outright, even
+          # though macOS system libraries (macFUSE included) are universal, so the
+          # x86_64 half is right there in the same dylib. Opt in explicitly.
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
+          # Diagnostic: prove the installed lib really is fat. If a slice is
+          # missing, the failure below is a linker error, not a pkg-config one.
+          for lib in /usr/local/lib/libfuse.2.dylib /usr/local/lib/libfuse.dylib; do
+            [ -e "$lib" ] && lipo -info "$lib" || true
+          done
 
       # The vfs-winfsp build needs WinFsp WITH developer files (headers/lib, via
       # ADDLOCAL=ALL) and libclang (bindgen).
