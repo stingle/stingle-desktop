@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Save (decrypt + export) a gallery photo to a folder.
     let out = tmp.join("saved");
-    let n = acc.save_files(FileSet::Gallery, None, &[fn2.clone()], &out).await?;
+    let n = acc.save_files(FileSet::Gallery, None, &[fn2.clone()], &out, false, None).await?;
     assert_eq!(n, 1);
     let saved: Vec<_> = std::fs::read_dir(&out)?.flatten().collect();
     assert_eq!(saved.len(), 1, "one file exported");

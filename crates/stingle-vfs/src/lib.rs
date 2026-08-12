@@ -32,6 +32,9 @@ mod tree;
 #[cfg(all(windows, feature = "mount-winfsp"))]
 mod winfsp;
 
+#[cfg(all(unix, feature = "mount-fuse"))]
+mod fuse;
+
 pub use ops::{AccountSource, MediaSource, Vfs};
 pub use tree::{Attr, Dirent, Entry, Leaf, Section, Tree, ROOT_INO};
 
@@ -78,19 +81,31 @@ impl std::error::Error for MountError {}
 pub struct VfsMount {
     #[cfg(all(windows, feature = "mount-winfsp"))]
     _inner: winfsp::WinFspMount,
+    #[cfg(all(unix, feature = "mount-fuse"))]
+    _inner: fuse::FuseMount,
 }
 
 impl VfsMount {
     /// Mount `vfs` read-only per `cfg`. Returns [`MountError::Unsupported`] when
-    /// this build has no driver for the current platform.
+    /// this build has no driver for the current platform. Exactly one of the
+    /// three cfg arms below is compiled for any target/feature combination.
     pub fn mount(vfs: Vfs, cfg: &MountConfig) -> Result<Self, MountError> {
         #[cfg(all(windows, feature = "mount-winfsp"))]
         {
-            let inner = winfsp::WinFspMount::mount(vfs, &cfg.mount_point)
-                .map_err(|e| MountError::Driver(format!("{e:?}")))?;
-            Ok(VfsMount { _inner: inner })
+            winfsp::WinFspMount::mount(vfs, &cfg.mount_point)
+                .map(|inner| VfsMount { _inner: inner })
+                .map_err(|e| MountError::Driver(format!("{e:?}")))
         }
-        #[cfg(not(all(windows, feature = "mount-winfsp")))]
+        #[cfg(all(unix, feature = "mount-fuse"))]
+        {
+            fuse::FuseMount::mount(vfs, &cfg.mount_point)
+                .map(|inner| VfsMount { _inner: inner })
+                .map_err(|e| MountError::Driver(e.to_string()))
+        }
+        #[cfg(not(any(
+            all(windows, feature = "mount-winfsp"),
+            all(unix, feature = "mount-fuse")
+        )))]
         {
             let _ = (vfs, cfg);
             Err(MountError::Unsupported)

@@ -1,21 +1,22 @@
-//! End-to-end WinFsp mount round-trip, no account required.
+//! End-to-end mount round-trip, no account required. Cross-platform.
 //!
-//! Mounts a synthetic tree backed by an in-memory mock byte source at a free
-//! drive letter, then browses + reads it back through the OS (`std::fs`) and
-//! asserts the bytes match. Exercises the real WinFsp adapter: mount, security,
-//! open, read_directory, read, get_file_info.
+//! Mounts a synthetic tree backed by an in-memory mock byte source, then
+//! browses + reads it back through the OS (`std::fs`) and asserts the bytes
+//! match. Exercises the real driver adapter end to end.
 //!
-//! Run: `cargo run -p stingle-vfs --example roundtrip --features mount-winfsp`
-//! (Windows + WinFsp installed; LIBCLANG_PATH set for the winfsp-sys build.)
+//! Windows: `cargo run -p stingle-vfs --example roundtrip --features mount-winfsp`
+//! Linux/macOS: `cargo run -p stingle-vfs --example roundtrip --features mount-fuse`
+//! (needs the platform FUSE/WinFsp runtime installed; on Windows also
+//! LIBCLANG_PATH for the winfsp-sys build.)
 
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use stingle_vfs::{Entry, Leaf, MediaSource, MountConfig, Section, Tree, Vfs, VfsMount};
 use stingle_core::FileSet;
+use stingle_vfs::{Entry, Leaf, MediaSource, MountConfig, Section, Tree, Vfs, VfsMount};
 
 /// In-memory byte source keyed by encrypted filename.
 struct MockSource {
@@ -52,12 +53,24 @@ fn gallery_entry(enc: &str, name: &str, size: u64, date_ms: i64) -> Entry {
     }
 }
 
-fn first_free_drive() -> Option<char> {
-    ('E'..='Z').find(|&c| !Path::new(&format!("{c}:\\")).exists())
+/// The mount-point argument for `MountConfig` and the root path to read back.
+/// Windows uses a free drive letter; Unix uses a temp directory.
+fn pick_mount() -> (String, PathBuf) {
+    #[cfg(windows)]
+    {
+        let d = ('E'..='Z')
+            .find(|&c| !std::path::Path::new(&format!("{c}:\\")).exists())
+            .expect("no free drive letter");
+        (format!("{d}:"), PathBuf::from(format!("{d}:\\")))
+    }
+    #[cfg(unix)]
+    {
+        let dir = std::env::temp_dir().join("stingle-vfs-roundtrip");
+        (dir.to_string_lossy().into_owned(), dir)
+    }
 }
 
 fn main() {
-    // Two files in the same 1970-01 bucket; deterministic content.
     let small: Vec<u8> = (0..5_000u32).map(|i| (i % 251) as u8).collect();
     let big: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
 
@@ -75,9 +88,8 @@ fn main() {
     );
     let vfs = Vfs::new(tree, source);
 
-    let drive = first_free_drive().expect("no free drive letter");
-    let mount_point = format!("{drive}:");
-    println!("Mounting synthetic Stingle tree at {mount_point}\\ ...");
+    let (mount_point, root_path) = pick_mount();
+    println!("Mounting synthetic Stingle tree at {mount_point} ...");
 
     let cfg = MountConfig {
         mount_point: mount_point.clone(),
@@ -92,9 +104,9 @@ fn main() {
     };
 
     // Give the volume a moment to appear.
-    let root = format!("{drive}:\\");
+    let bucket = root_path.join("Gallery").join("1970").join("1970-01");
     for _ in 0..50 {
-        if Path::new(&root).exists() {
+        if bucket.exists() {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -108,8 +120,6 @@ fn main() {
         }
     };
 
-    // Directory structure.
-    let bucket = format!("{drive}:\\Gallery\\1970\\1970-01");
     let listing: Vec<String> = std::fs::read_dir(&bucket)
         .map(|rd| {
             rd.filter_map(|e| e.ok())
@@ -117,23 +127,22 @@ fn main() {
                 .collect()
         })
         .unwrap_or_default();
-    println!("Listing of {bucket}: {listing:?}");
+    println!("Listing of {}: {listing:?}", bucket.display());
     check("Gallery/1970/1970-01 lists small.bin", listing.iter().any(|n| n == "small.bin"));
     check("Gallery/1970/1970-01 lists big.bin", listing.iter().any(|n| n == "big.bin"));
 
-    // File sizes (get_file_info).
-    let small_meta = std::fs::metadata(format!("{bucket}\\small.bin"));
+    let small_path = bucket.join("small.bin");
+    let big_path = bucket.join("big.bin");
+
     check(
         "small.bin size == 5000",
-        small_meta.as_ref().map(|m| m.len()).unwrap_or(0) == small.len() as u64,
+        std::fs::metadata(&small_path).map(|m| m.len()).unwrap_or(0) == small.len() as u64,
     );
-
-    // Byte-exact reads (open + read + EOF).
-    match std::fs::read(format!("{bucket}\\small.bin")) {
+    match std::fs::read(&small_path) {
         Ok(got) => check("small.bin bytes match", got == small),
         Err(e) => check(&format!("small.bin read error: {e}"), false),
     }
-    match std::fs::read(format!("{bucket}\\big.bin")) {
+    match std::fs::read(&big_path) {
         Ok(got) => check(
             "big.bin bytes match (multi-window read)",
             got.len() == big.len() && got == big,
@@ -141,7 +150,6 @@ fn main() {
         Err(e) => check(&format!("big.bin read error: {e}"), false),
     }
 
-    // Cleanup: drop the mount before exit.
     drop(_mount);
     std::thread::sleep(Duration::from_millis(300));
 

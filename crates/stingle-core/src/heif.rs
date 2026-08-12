@@ -398,6 +398,33 @@ fn find_ispe(buf: &[u8], meta: &Meta, item_id: u32) -> Option<(u32, u32)> {
     None
 }
 
+/// Extract the raw TIFF/EXIF payload from a HEIF/HEIC container, if it has one.
+///
+/// HEIC keeps EXIF in its own `Exif` metadata item rather than inline like JPEG,
+/// so a generic EXIF reader can't find it. This returns the TIFF blob (past the
+/// `exif_tiff_header_offset` prefix) ready to hand to an EXIF parser — used by
+/// the media-info panel. Item selection matches [`find_exif_orientation`]:
+/// prefer the item describing the primary image, else an unlinked one.
+pub fn extract_exif_tiff(buf: &[u8]) -> Option<Vec<u8>> {
+    let meta = parse_meta(buf).ok()?;
+    let primary = meta.primary_id?;
+    let mut exif_ids: Vec<u32> = meta
+        .item_types
+        .iter()
+        .filter(|(_, t)| *t == b"Exif")
+        .map(|(&id, _)| id)
+        .collect();
+    exif_ids.sort_unstable();
+    let chosen = exif_ids
+        .iter()
+        .find(|id| meta.cdsc.get(id).is_some_and(|refs| refs.contains(&primary)))
+        .or_else(|| exif_ids.iter().find(|id| !meta.cdsc.contains_key(id)))?;
+    let data = item_data(buf, &meta, *chosen).ok()?;
+    // ISO 23008-12 A.2.1: 4-byte exif_tiff_header_offset, then the payload.
+    let hdr_off = u32::from_be_bytes(data.get(..4)?.try_into().ok()?) as usize;
+    Some(data.get(4usize.checked_add(hdr_off)?..)?.to_vec())
+}
+
 /// EXIF `Orientation` of the Exif metadata item describing `item_id`, if any.
 ///
 /// An Exif item is linked to the image it describes by a `cdsc` reference;

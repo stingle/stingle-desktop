@@ -17,14 +17,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The `vfs-*` features build the virtual-drive adapter into the app, and
+          # the extra bundle config ships the driver installer inside the
+          # installer so first-run setup needs no download (Linux gets FUSE from
+          # its own package manager, hence no config there).
           - platform: macos-latest      # universal: Intel + Apple Silicon
-            args: "--target universal-apple-darwin --config src-tauri/tauri.bundle-ffmpeg.conf.json"
+            args: "--target universal-apple-darwin --features vfs-fuse --config src-tauri/tauri.bundle-ffmpeg.conf.json --config src-tauri/tauri.bundle-macfuse.conf.json"
             rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
           - platform: ubuntu-22.04
-            args: "--config src-tauri/tauri.bundle-ffmpeg.conf.json"
+            args: "--features vfs-fuse --config src-tauri/tauri.bundle-ffmpeg.conf.json"
             rust-targets: ""
           - platform: windows-latest
-            args: "--config src-tauri/tauri.bundle-ffmpeg.conf.json"
+            args: "--features vfs-winfsp --config src-tauri/tauri.bundle-ffmpeg.conf.json --config src-tauri/tauri.bundle-winfsp.conf.json"
             rust-targets: ""
 
     runs-on: ${{ matrix.platform }}
@@ -36,7 +40,42 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
-            librsvg2-dev patchelf libgtk-3-dev
+            librsvg2-dev patchelf libgtk-3-dev \
+            libfuse3-dev fuse3 pkg-config
+
+      # --- virtual drive (vfs-*) build + bundling dependencies ---------------
+      # macFUSE provides the libfuse we link against, and the .pkg we ship inside
+      # the app so first-run setup doesn't send the user to a website. Taken from
+      # the cask itself so the bundled installer always matches what we linked.
+      - name: Install macFUSE and stage its installer (macOS)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install --cask macfuse
+          # x86_64-on-arm64 is a cross-compile as far as pkg-config-rs is
+          # concerned, even though macOS system libraries are universal.
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
+          mkdir -p app/src-tauri/resources
+          brew fetch --cask macfuse >/dev/null
+          dmg=$(brew --cache --cask macfuse)
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint /tmp/macfuse-mnt
+          pkg=$(find /tmp/macfuse-mnt -maxdepth 1 -name '*.pkg' | head -1)
+          cp "$pkg" app/src-tauri/resources/macfuse.pkg
+          hdiutil detach /tmp/macfuse-mnt
+
+      # WinFsp with developer files (ADDLOCAL=ALL) to build against, libclang for
+      # the winfsp-sys bindgen step, and the same signed MSI staged for bundling.
+      - name: Install WinFsp and stage its installer (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          choco install llvm -y --no-progress
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          curl.exe -L -o winfsp.msi https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+          Start-Process msiexec -Wait -ArgumentList '/i','winfsp.msi','/qn','ADDLOCAL=ALL'
+          New-Item -ItemType Directory -Force app\src-tauri\resources | Out-Null
+          Copy-Item winfsp.msi app\src-tauri\resources\winfsp.msi
 
       - uses: dtolnay/rust-toolchain@stable
         with:

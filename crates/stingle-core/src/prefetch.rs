@@ -83,6 +83,10 @@ impl Account {
             .for_each_concurrent(concurrency.max(1), |(set, filename)| {
                 let done = &done;
                 async move {
+                    // Stand aside while the user is saving / dragging out /
+                    // uploading. Checked BEFORE taking any permit so a paused
+                    // item holds no download lane.
+                    self.await_foreground_idle().await;
                     // Hold a bulk permit so this prefetch never occupies every
                     // download lane — on-demand thumbnail requests stay snappy.
                     let _bulk = match self.bulk_sem.acquire().await {
@@ -158,6 +162,12 @@ impl Account {
                     if self.stop_originals.load(Ordering::Relaxed) {
                         return;
                     }
+                    // Stand aside while the user is saving / dragging out /
+                    // uploading — originals are large, so a background backlog
+                    // would otherwise eat the bandwidth they're waiting on.
+                    // Checked BEFORE taking any permit so a paused item holds no
+                    // download lane.
+                    self.await_foreground_idle().await;
                     // Reserve download lanes for on-demand requests (see bulk_sem).
                     let _bulk = match self.bulk_sem.acquire().await {
                         Ok(p) => p,

@@ -64,3 +64,7 @@ secret-service = { version = "5", features = ["rt-tokio-crypto-rust"] }
 #   cargo build -p app --features vfs-winfsp
 # (requires WinFsp + developer files and libclang — see the project memory).
 vfs-winfsp = ["stingle-vfs/mount-winfsp"]
+# Build the Unix FUSE virtual-drive adapter (Linux + macOS). Enable for
+# Linux/macOS builds: `npm run tauri dev -- --features vfs-fuse`. Needs libfuse
+# dev files to build and the FUSE runtime (fuse3 / macFUSE) to run.
+vfs-fuse = ["stingle-vfs/mount-fuse"]

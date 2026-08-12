@@ -34,6 +34,10 @@ impl Account {
     ) -> Result<TakeoutStats> {
         let mut stats = TakeoutStats::default();
 
+        // The user is waiting on this export; pause the bulk cache prefetch so
+        // it isn't competing for bandwidth with the downloads takeout needs.
+        let _fg = self.begin_foreground();
+
         // Fresh start: clear any stale cancellation from a previous run.
         self.stop_takeout.store(false, Ordering::Relaxed);
 

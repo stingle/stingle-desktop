@@ -5,6 +5,7 @@ import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import {
   api, mediaUrl, videoUrl, pickFiles, pickFolder, parsePermissions,
   Session, FileItem, Album, SharedAlbum, Contact, AlbumMember, LocalAccount, WatchFolder, VfsStatus,
+  MediaInfo, InfoField,
   SET_GALLERY, SET_TRASH, SET_ALBUM, BLANK_COVER,
 } from "./api";
 import logoUrl from "./assets/stingle-logo.png";
@@ -116,6 +117,43 @@ function groupByDate(items: FileItem[]): DateGroup[] {
 let dragOutActive = false;
 let dragOutToken = 0;
 
+type DragExport = { files: string[]; icon: string };
+
+/** A speculative drag export kicked off on mouse-DOWN. The OS drag can't start
+ *  until every file is decrypted to disk (which may also download the original
+ *  and run an ffmpeg HEIC transcode), so waiting for the 6px drag threshold puts
+ *  all of that on the user's critical path — the drag appears to hang. Starting
+ *  at press overlaps that work with the gesture itself. Consumed by
+ *  `nativeDragOut`; discarded (temp files deleted) if the press was just a click. */
+let dragPrefetch: { key: string; promise: Promise<DragExport | null> } | null = null;
+
+const dragKey = (set: number, albumId: string | null, filenames: string[]) =>
+  JSON.stringify([set, albumId, filenames]);
+
+function prefetchDragExport(set: number, albumId: string | null, filenames: string[]) {
+  if (filenames.length === 0) return;
+  const key = dragKey(set, albumId, filenames);
+  if (dragPrefetch?.key === key) return; // already warming this exact selection
+  discardDragPrefetch();
+  dragPrefetch = {
+    key,
+    promise: api.exportForDrag(set, albumId, filenames).catch(() => null),
+  };
+}
+
+/** Drop a prefetch that won't be used, deleting whatever it decrypted so
+ *  plaintext never lingers in the temp dir after a plain click. */
+function discardDragPrefetch() {
+  const p = dragPrefetch;
+  dragPrefetch = null;
+  if (!p) return;
+  p.promise
+    .then((exp) => {
+      if (exp) api.cleanupDragExport(exp.icon ? [...exp.files, exp.icon] : exp.files);
+    })
+    .catch(() => {});
+}
+
 /** Start a native OS drag of one or more library items out to other apps
  *  (Explorer, Telegram, …). Files are decrypted to a temp folder for the drag
  *  and cleaned up when it ends. Returns immediately if the export fails. */
@@ -124,7 +162,19 @@ async function nativeDragOut(set: number, albumId: string | null, filenames: str
   dragOutActive = true;
   const token = ++dragOutToken;
   try {
-    const exp = await api.exportForDrag(set, albumId, filenames);
+    // Reuse the export already warming from the press, if it's for this exact
+    // selection; otherwise start one now.
+    const key = dragKey(set, albumId, filenames);
+    let exp: DragExport | null;
+    if (dragPrefetch?.key === key) {
+      const pending = dragPrefetch;
+      dragPrefetch = null; // hand off ownership: no longer discardable
+      exp = await pending.promise;
+    } else {
+      discardDragPrefetch();
+      exp = await api.exportForDrag(set, albumId, filenames);
+    }
+    if (!exp) return;
     const cleanup = exp.icon ? [...exp.files, exp.icon] : exp.files;
     await startDrag(
       { item: exp.files, icon: exp.icon, mode: "copy" },
@@ -322,6 +372,9 @@ const PhotoGrid = React.memo(function PhotoGrid({ items, set, albumId, grouped, 
       // A press on a thumbnail that never moved = a click → open or toggle.
       const tp = tilePress.current;
       if (tp && !tp.started) {
+        // No drag happened, so the export warmed on press is unused — bin it
+        // (and the plaintext it wrote) rather than leaving it around.
+        discardDragPrefetch();
         const st = stateRef.current;
         const fn = st.items[tp.idx]?.filename;
         if (fn !== undefined) {
@@ -408,6 +461,13 @@ const PhotoGrid = React.memo(function PhotoGrid({ items, set, albumId, grouped, 
       // Marquee is deliberately NOT started here — only from empty space.
       tilePress.current = { x: e.clientX, y: e.clientY, idx, started: false };
       anchorRef.current = idx;
+      // Warm the drag export now (same selection logic as `onMove` below) so the
+      // decrypt overlaps the gesture instead of stalling the drag. Discarded on
+      // a plain click.
+      const fn = items[idx]?.filename;
+      if (fn !== undefined) {
+        prefetchDragExport(set, albumId, sel.has(fn) && sel.size > 0 ? [...sel] : [fn]);
+      }
     } else {
       // Press on empty space: begin a marquee; if it doesn't move it's a no-op.
       drag.current = { x: e.clientX, y: e.clientY, base: new Set() };
@@ -962,17 +1022,18 @@ function PhaseRow({ icon, label, value, onCancel }: {
 
 // Consolidated sync status: a calm "Up to date" when idle, or an animated header
 // plus one progress row per active phase (upload / thumbnails / cache).
-function SyncPanel({ syncing, upload, thumbs, originals, importing, takeout, onCancelImport, onCancelTakeout }: {
+function SyncPanel({ syncing, upload, thumbs, originals, importing, takeout, saving, onCancelImport, onCancelTakeout, onCancelSave }: {
   syncing: boolean; upload: Progress; thumbs: Progress; originals: Progress;
-  importing: Progress; takeout: Progress;
-  onCancelImport: () => void; onCancelTakeout: () => void;
+  importing: Progress; takeout: Progress; saving: Progress;
+  onCancelImport: () => void; onCancelTakeout: () => void; onCancelSave: () => void;
 }) {
   const up = upload && upload.total > 0 ? upload : null;
   const th = thumbs && thumbs.total > 0 ? thumbs : null;
   const or = originals && originals.total > 0 ? originals : null;
   const im = importing && importing.total > 0 ? importing : null;
   const tk = takeout && takeout.total > 0 ? takeout : null;
-  const active = syncing || !!up || !!th || !!or || !!im || !!tk;
+  const sv = saving && saving.total > 0 ? saving : null;
+  const active = syncing || !!up || !!th || !!or || !!im || !!tk || !!sv;
 
   return (
     <div className="sync-panel">
@@ -988,6 +1049,7 @@ function SyncPanel({ syncing, upload, thumbs, originals, importing, takeout, onC
       {th && <PhaseRow icon="⤓" label="Thumbnails" value={th} />}
       {or && <PhaseRow icon="⤓" label="Cache" value={or} />}
       {tk && <PhaseRow icon="↧" label="Takeout" value={tk} onCancel={onCancelTakeout} />}
+      {sv && <PhaseRow icon="⤓" label="Saving" value={sv} onCancel={onCancelSave} />}
     </div>
   );
 }
@@ -1006,6 +1068,7 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
   const [originals, setOriginals] = useState<{ done: number; total: number } | null>(null);
   const [importing, setImporting] = useState<{ done: number; total: number } | null>(null);
   const [takeoutProg, setTakeoutProg] = useState<{ done: number; total: number } | null>(null);
+  const [saveProg, setSaveProg] = useState<{ done: number; total: number } | null>(null);
   // Version of an available update (set regardless of the auto-update setting,
   // so the sidebar always offers a one-click restart-and-apply).
   const [updateVer, setUpdateVer] = useState<string | null>(null);
@@ -1102,6 +1165,10 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
       setTakeoutProg((prev) => (e.payload[1] > 0 ? merge(prev, e.payload[0], e.payload[1]) : null))
     );
     const u8 = listen("takeout-done", () => setTakeoutProg(null));
+    const u8b = listen<[number, number]>("save-progress", (e) =>
+      setSaveProg((prev) => (e.payload[1] > 0 ? merge(prev, e.payload[0], e.payload[1]) : null))
+    );
+    const u8c = listen("save-done", () => setSaveProg(null));
     // Any sync pass (manual, idle, background) that actually changed the local
     // library. The per-phase *-done events above are now only emitted when
     // their phase did work, so this is the reload signal for delete-only or
@@ -1112,6 +1179,7 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
       u0.then((f) => f()); u0b.then((f) => f());
       u1.then((f) => f()); u2.then((f) => f()); u3.then((f) => f()); u4.then((f) => f());
       u5.then((f) => f()); u6.then((f) => f()); u7.then((f) => f()); u8.then((f) => f());
+      u8b.then((f) => f()); u8c.then((f) => f());
       u9.then((f) => f());
     };
   }, []);
@@ -1136,6 +1204,10 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
   const cancelImport = useCallback(async () => {
     await api.cancelImport();
     showToast("Cancelling import…");
+  }, [showToast]);
+  const cancelSave = useCallback(async () => {
+    await api.cancelSave();
+    showToast("Cancelling save…");
   }, [showToast]);
 
   useEffect(() => {
@@ -1231,8 +1303,8 @@ function Main({ session, setSession, refreshSession, showToast, toast }: {
         )}
         <SyncPanel
           syncing={syncing} upload={upload} thumbs={thumbs} originals={originals}
-          importing={importing} takeout={takeoutProg}
-          onCancelImport={cancelImport} onCancelTakeout={cancelTakeout}
+          importing={importing} takeout={takeoutProg} saving={saveProg}
+          onCancelImport={cancelImport} onCancelTakeout={cancelTakeout} onCancelSave={cancelSave}
         />
         <div className="side-div" />
         <div className="acct">{session.email}</div>
@@ -2328,6 +2400,7 @@ function SettingsView({ session, setSession, showToast }: {
   const [minTray, setMinTray] = useState(false);
   const [autoUpdate, setAutoUpdate] = useState(true);
   const [convertHeic, setConvertHeic] = useState(true);
+  const [convertHeicSave, setConvertHeicSave] = useState(true);
   const [syncEvery, setSyncEvery] = useState(false);
   const [autoSync, setAutoSync] = useState(true);
   const [autoSyncMins, setAutoSyncMins] = useState(10);
@@ -2352,6 +2425,8 @@ function SettingsView({ session, setSession, showToast }: {
   const [vfs, setVfs] = useState<VfsStatus | null>(null);
   const [vfsWarn, setVfsWarn] = useState(false);
   const [vfsBusy, setVfsBusy] = useState(false);
+  const [vfsSetup, setVfsSetup] = useState(false);
+  const [vfsError, setVfsError] = useState<string | null>(null);
   const refreshVfs = () => { api.vfsStatus().then(setVfs).catch(() => {}); };
   const doEnableVfs = async () => {
     setVfsWarn(false);
@@ -2360,7 +2435,11 @@ function SettingsView({ session, setSession, showToast }: {
       const mp = await api.vfsEnable();
       showToast(`Virtual drive mounted at ${mp}`);
     } catch (err) {
-      showToast("Couldn't mount the drive: " + err);
+      // A failed mount is almost always a driver problem (missing, blocked, or
+      // too old for this OS). Don't leave the user at a dead-end toast — open
+      // the setup steps with the failure shown at the top.
+      setVfsError(String(err));
+      setVfsSetup(true);
     } finally {
       setVfsBusy(false);
       refreshVfs();
@@ -2390,6 +2469,18 @@ function SettingsView({ session, setSession, showToast }: {
       refreshVfs();
     }
   };
+  const installDriver = async () => {
+    setVfsBusy(true);
+    try {
+      await api.vfsInstallDriver();
+      showToast("Launching the driver installer…");
+    } catch (err) {
+      showToast("" + err);
+    } finally {
+      setVfsBusy(false);
+      setTimeout(refreshVfs, 1500);
+    }
+  };
 
   const refreshCache = () => { api.cacheSize().then((b) => setCacheSizeMB(b / 1048576)); };
   useEffect(() => {
@@ -2400,6 +2491,7 @@ function SettingsView({ session, setSession, showToast }: {
     api.getMinimizeToTray().then(setMinTray).catch(() => {});
     api.getAutoUpdate().then(setAutoUpdate).catch(() => {});
     api.getConvertHeicOnExport().then(setConvertHeic).catch(() => {});
+    api.getConvertHeicOnSave().then(setConvertHeicSave).catch(() => {});
     api.getAppVersion().then(setVersion).catch(() => {});
     api.getSyncEverything().then(setSyncEvery).catch(() => {});
     api.getAutoSync().then(setAutoSync).catch(() => {});
@@ -2463,6 +2555,10 @@ function SettingsView({ session, setSession, showToast }: {
   };
   const toggleConvertHeic = async (v: boolean) => {
     try { await api.setConvertHeicOnExport(v); setConvertHeic(v); }
+    catch (e) { showToast("Failed: " + e); }
+  };
+  const toggleConvertHeicSave = async (v: boolean) => {
+    try { await api.setConvertHeicOnSave(v); setConvertHeicSave(v); }
     catch (e) { showToast("Failed: " + e); }
   };
   const checkForUpdate = async () => {
@@ -2650,6 +2746,16 @@ function SettingsView({ session, setSession, showToast }: {
             </span>
           </label>
           <label className="opt-row">
+            <input type="checkbox" checked={convertHeicSave} onChange={(e) => toggleConvertHeicSave(e.target.checked)} />
+            <span>
+              Convert HEIC to JPG when saving
+              <span className="muted" style={{ display: "block", fontSize: 12 }}>
+                When you save photos to a folder, HEIC images are converted to JPG first. Turn this off to
+                save the untouched original — better for archiving. Your stored photos are unchanged.
+              </span>
+            </span>
+          </label>
+          <label className="opt-row">
             <input type="checkbox" checked={autoUnlock} onChange={(e) => onAutoUnlockToggle(e.target.checked)} />
             <span>
               Unlock automatically on startup
@@ -2809,24 +2915,31 @@ function SettingsView({ session, setSession, showToast }: {
             <p className="muted" style={{ fontSize: 13 }}>Not available in this build.</p>
           )}
           {vfs && vfs.supported && !vfs.driver_installed && (
-            <p className="muted" style={{ fontSize: 13 }}>
-              Requires the WinFsp driver (winfsp.dev). Install it, then restart Stingle.
-            </p>
+            <div>
+              <p className="muted" style={{ fontSize: 13 }}>
+                The virtual drive needs a small system component. It's a one-time setup.
+              </p>
+              <button onClick={() => { setVfsError(null); setVfsSetup(true); }} disabled={vfsBusy}>
+                Set up…
+              </button>
+            </div>
           )}
           {vfs && vfs.supported && vfs.driver_installed && (
             <>
-              <div className="row" style={{ gap: 10, alignItems: "center", marginBottom: 8 }}>
-                <label htmlFor="vfs-letter">Drive letter:</label>
-                <select id="vfs-letter" value={vfs.drive_letter} disabled={vfsBusy}
-                  onChange={(e) => changeDriveLetter(e.target.value)}>
-                  {vfs.available_letters.map((l) => (
-                    <option key={l} value={l}>{l}:</option>
-                  ))}
-                </select>
-                <span className="muted" style={{ fontSize: 12 }}>
-                  It also appears as “Stingle” in the Explorer sidebar.
-                </span>
-              </div>
+              {vfs.available_letters.length > 0 && (
+                <div className="row" style={{ gap: 10, alignItems: "center", marginBottom: 8 }}>
+                  <label htmlFor="vfs-letter">Drive letter:</label>
+                  <select id="vfs-letter" value={vfs.drive_letter} disabled={vfsBusy}
+                    onChange={(e) => changeDriveLetter(e.target.value)}>
+                    {vfs.available_letters.map((l) => (
+                      <option key={l} value={l}>{l}:</option>
+                    ))}
+                  </select>
+                  <span className="muted" style={{ fontSize: 12 }}>
+                    It also appears as “Stingle” in the Explorer sidebar.
+                  </span>
+                </div>
+              )}
               {vfs.mounted ? (
                 <div className="row" style={{ gap: 10, alignItems: "center" }}>
                   <span>Mounted at <b>{vfs.mount_point}</b></span>
@@ -2838,6 +2951,16 @@ function SettingsView({ session, setSession, showToast }: {
             </>
           )}
         </div>
+
+        {vfsSetup && vfs && (
+          <DriverSetupDialog
+            os={vfs.os}
+            error={vfsError}
+            canInstall={vfs.installer_bundled}
+            onInstall={installDriver}
+            onClose={() => { setVfsSetup(false); setVfsError(null); refreshVfs(); }}
+          />
+        )}
 
         {vfsWarn && (
           <ConfirmDialog
@@ -2975,6 +3098,134 @@ function MoveDialog({ fromSet, fromAlbum, count, onPick, onClose }: {
   );
 }
 
+/** Step-by-step driver setup for the virtual drive.
+ *
+ *  Shown when the driver is missing OR when a mount fails — the drivers' own
+ *  errors ("Unsupported macOS Version") say what's wrong but never what to do,
+ *  and on macOS the fix spans a download, a system-settings approval and a
+ *  reboot. Every step that can be automated is a button. */
+function DriverSetupDialog({ os, error, canInstall, onInstall, onClose }: {
+  os: "macos" | "windows" | "linux";
+  /** The failed mount's message, when we got here from a failure. */
+  error: string | null;
+  /** True when an installer is bundled with the app (see resources/README.md). */
+  canInstall: boolean;
+  onInstall: () => void;
+  onClose: () => void;
+}) {
+  const open = (t: "download" | "security") => { api.vfsDriverHelp(t).catch(() => {}); };
+  const steps: React.ReactNode[] = [];
+  if (os === "macos") {
+    steps.push(
+      <>
+        <b>Install macFUSE.</b> It lets apps provide a drive to macOS. If it's already
+        installed but Stingle says it's unsupported, it predates your macOS and needs updating.
+        <div className="row" style={{ gap: 8, marginTop: 6 }}>
+          {canInstall && <button onClick={onInstall}>Install included copy</button>}
+          <button onClick={() => open("download")}>Download macFUSE…</button>
+        </div>
+      </>,
+      <>
+        <b>Allow it.</b> macOS blocks new system extensions until you approve them, under
+        Privacy &amp; Security.
+        <div className="row" style={{ gap: 8, marginTop: 6 }}>
+          <button onClick={() => open("security")}>Open Privacy &amp; Security</button>
+        </div>
+      </>,
+      <><b>Restart your Mac.</b> A newly approved extension only loads after a reboot.</>,
+      <><b>Come back here</b> and turn the virtual drive on.</>,
+    );
+  } else if (os === "windows") {
+    steps.push(
+      <>
+        <b>Install WinFsp.</b> It lets apps provide a drive to Windows.
+        <div className="row" style={{ gap: 8, marginTop: 6 }}>
+          {canInstall && <button onClick={onInstall}>Install included copy</button>}
+          <button onClick={() => open("download")}>Download WinFsp…</button>
+        </div>
+      </>,
+      <><b>Restart Stingle</b>, then turn the virtual drive on.</>,
+    );
+  } else {
+    steps.push(
+      <>
+        <b>Install FUSE.</b> Most distributions ship it as <code>fuse3</code>:
+        <div className="muted" style={{ marginTop: 4 }}><code>sudo apt install fuse3</code></div>
+      </>,
+      <><b>Restart Stingle</b>, then turn the virtual drive on.</>,
+    );
+  }
+  return (
+    <ConfirmDialog
+      title="Set up the virtual drive"
+      message={
+        <div style={{ textAlign: "left" }}>
+          {error && (
+            <div className="muted" style={{ fontSize: 12, marginTop: 0 }}>
+              The drive couldn't start:
+              {/* Show the driver's message in full — truncating it hides the one
+                  line that says what actually went wrong. */}
+              <pre style={{
+                whiteSpace: "pre-wrap", wordBreak: "break-word", margin: "4px 0 0",
+                fontSize: 11, maxHeight: 120, overflowY: "auto",
+              }}>{error}</pre>
+            </div>
+          )}
+          <p style={{ marginTop: 0 }}>
+            The virtual drive needs a small system component. This is a one-time setup.
+          </p>
+          <ol style={{ paddingLeft: 20, margin: 0, display: "grid", gap: 12 }}>
+            {steps.map((s, i) => <li key={i}>{s}</li>)}
+          </ol>
+        </div>
+      }
+      actions={[{ label: "Done", onClick: onClose }]}
+      onClose={onClose}
+    />
+  );
+}
+
+/** Side panel listing everything known about the item open in the viewer. */
+function InfoPanel({ info, error, onClose }: {
+  info: MediaInfo | null; error: string | null; onClose: () => void;
+}) {
+  // Timestamps arrive as epoch ms (kind === "epoch_ms") so they can be shown in
+  // the viewer's own locale and timezone rather than the backend's.
+  const render = (f: InfoField) => {
+    if (f.kind !== "epoch_ms") return f.value;
+    const n = Number(f.value);
+    return Number.isFinite(n) && n > 0 ? new Date(n).toLocaleString() : "—";
+  };
+  return (
+    <div className="info-panel" onClick={(e) => e.stopPropagation()}>
+      <div className="info-head">
+        <span>Info</span>
+        <button className="info-close" onClick={onClose} title="Close">✕</button>
+      </div>
+      <div className="info-body">
+        {error && <div className="muted">Couldn't load info: {error}</div>}
+        {!error && !info && <div className="muted">Loading…</div>}
+        {info?.sections.length === 0 && <div className="muted">No metadata available.</div>}
+        {info?.sections.map((s) => (
+          <div className="info-section" key={s.title}>
+            <h4>{s.title}</h4>
+            <table>
+              <tbody>
+                {s.fields.map((f, n) => (
+                  <tr key={`${f.label}-${n}`}>
+                    <td className="info-label">{f.label}</td>
+                    <td className="info-value">{render(f)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 type ConfirmAction = { label: string; onClick: () => void; variant?: "primary" | "danger" };
 
 // A small reusable confirmation modal supporting up to a few labeled actions.
@@ -3014,11 +3265,17 @@ function ConfirmDialog({ title, message, actions, onClose }: {
 type FileCaps = { canCopy: boolean; canDelete: boolean; canShare: boolean };
 const FULL_CAPS: FileCaps = { canCopy: true, canDelete: true, canShare: true };
 
-function ActionButtons({ set, albumId, filenames, onDone, showToast, onTrashed, caps = FULL_CAPS }: {
+function ActionButtons({ set, albumId, filenames, onDone, showToast, onTrashed, caps = FULL_CAPS,
+  onInfo, infoActive }: {
   set: number; albumId: string | null; filenames: string[];
   onDone: () => void; showToast: (m: string) => void;
   onTrashed?: (filenames: string[]) => void;
   caps?: FileCaps;
+  /** Supplied only by the single-item viewer: adds an Info button between Move
+   *  and Delete. Omitted by the grid's multi-select bars, where per-file info
+   *  has no meaning. */
+  onInfo?: () => void;
+  infoActive?: boolean;
 }) {
   const [moving, setMoving] = useState(false);
   const [sharing, setSharing] = useState(false);
@@ -3026,9 +3283,18 @@ function ActionButtons({ set, albumId, filenames, onDone, showToast, onTrashed, 
   const save = async () => {
     const dir = await pickFolder();
     if (!dir) return;
-    showToast("Saving…");
-    const n = await api.saveFiles(set, albumId, filenames, dir);
-    showToast(`Saved ${n} file${n === 1 ? "" : "s"}`);
+    // Progress (and cancel) show in the sidebar panel while this runs.
+    try {
+      const n = await api.saveFiles(set, albumId, filenames, dir);
+      const stopped = n < filenames.length;
+      showToast(
+        stopped
+          ? `Save cancelled — ${n} of ${filenames.length} saved`
+          : `Saved ${n} file${n === 1 ? "" : "s"}`
+      );
+    } catch (e) {
+      showToast("Save failed: " + e);
+    }
   };
   const del = async () => {
     setConfirmDelete(false);
@@ -3051,6 +3317,10 @@ function ActionButtons({ set, albumId, filenames, onDone, showToast, onTrashed, 
       {caps.canShare && <button onClick={() => setSharing(true)}>👥 Share</button>}
       {caps.canCopy && <button onClick={save}>⤓ Save</button>}
       {caps.canCopy && <button onClick={() => setMoving(true)}>→ Move</button>}
+      {onInfo && (
+        <button onClick={onInfo} className={infoActive ? "primary" : ""}
+          title="File info (EXIF, camera, location)">ⓘ Info</button>
+      )}
       {caps.canDelete && <button onClick={() => setConfirmDelete(true)}>🗑️ Delete</button>}
       {moving && <MoveDialog fromSet={set} fromAlbum={albumId} count={filenames.length} onPick={move} onClose={() => setMoving(false)} />}
       {sharing && (
@@ -3084,7 +3354,24 @@ function Viewer({ items, index, set, albumId, onClose, onChanged, showToast, onT
 }) {
   const [i, setI] = useState(index);
   const vidPress = useRef<{ x: number; y: number } | null>(null);
+  const [info, setInfo] = useState<MediaInfo | null>(null);
+  const [infoOpen, setInfoOpen] = useState(false);
+  const [infoErr, setInfoErr] = useState<string | null>(null);
   const f = items[i];
+
+  // Load info lazily, and re-load when navigating to another item while the
+  // panel is open. Reading EXIF needs the decrypted bytes, so this is only ever
+  // done on demand — never as part of opening the viewer.
+  useEffect(() => {
+    if (!infoOpen || !f) return;
+    let cancelled = false;
+    setInfo(null);
+    setInfoErr(null);
+    api.mediaInfo(set, albumId, f.filename)
+      .then((r) => { if (!cancelled) setInfo(r); })
+      .catch((err) => { if (!cancelled) setInfoErr(String(err)); });
+    return () => { cancelled = true; };
+  }, [infoOpen, f?.filename, set, albumId]);
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -3133,8 +3420,12 @@ function Viewer({ items, index, set, albumId, onClose, onChanged, showToast, onT
       <div className="viewer-actions" onClick={stop}>
         <ActionButtons set={set} albumId={albumId} filenames={[f.filename]}
           caps={caps} onTrashed={onTrashed}
+          onInfo={() => setInfoOpen((v) => !v)} infoActive={infoOpen}
           onDone={() => { onChanged(); onClose(); }} showToast={showToast} />
       </div>
+      {infoOpen && (
+        <InfoPanel info={info} error={infoErr} onClose={() => setInfoOpen(false)} />
+      )}
       {i > 0 && <button className="nav-btn prev" onClick={(e) => { e.stopPropagation(); setI(i - 1); }}>‹</button>}
       {isVid ? <video src={videoUrl(set, f.filename, albumId)} controls autoPlay onClick={stop}
             onMouseDown={(e) => {
