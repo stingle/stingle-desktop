@@ -22,3 +22,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# CI-fetched payloads bundled into installers (never committed)
+app/src-tauri/binaries/
+app/src-tauri/resources/*.msi
+app/src-tauri/resources/*.pkg
+app/src-tauri/embedded.provisionprofile

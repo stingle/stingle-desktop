@@ -25,7 +25,7 @@ jobs:
           - platform: windows-latest
             features: vfs-winfsp
             rust-targets: ""
-            extra-args: "--bundles nsis"
+            extra-args: "--bundles nsis --config src-tauri/tauri.bundle-winfsp.conf.json"
           - platform: ubuntu-22.04
             features: vfs-fuse
             rust-targets: ""
@@ -36,7 +36,7 @@ jobs:
           - platform: macos-latest
             features: vfs-fuse
             rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
-            extra-args: "--target universal-apple-darwin --bundles dmg"
+            extra-args: "--target universal-apple-darwin --bundles dmg --config src-tauri/tauri.bundle-macfuse.conf.json"
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v7
@@ -69,6 +69,27 @@ jobs:
             [ -e "$lib" ] && lipo -info "$lib" || true
           done
 
+      # Ship the macFUSE installer inside the app so "Set up the virtual drive"
+      # can install it without sending the user to a website. Taken from the cask
+      # we just installed rather than a hardcoded URL, so the bundled installer
+      # always matches the version this build linked against. macFUSE ships a
+      # .dmg wrapping the .pkg, so extract the .pkg (`open`ing it goes straight
+      # to the installer instead of mounting a disk image first).
+      - name: Bundle the macFUSE installer (macOS)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/src-tauri/resources
+          brew fetch --cask macfuse >/dev/null
+          dmg=$(brew --cache --cask macfuse)
+          echo "macFUSE download: $dmg"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint /tmp/macfuse-mnt
+          pkg=$(find /tmp/macfuse-mnt -maxdepth 1 -name '*.pkg' | head -1)
+          cp "$pkg" app/src-tauri/resources/macfuse.pkg
+          hdiutil detach /tmp/macfuse-mnt
+          ls -la app/src-tauri/resources/
+
       # The vfs-winfsp build needs WinFsp WITH developer files (headers/lib, via
       # ADDLOCAL=ALL) and libclang (bindgen).
       - name: Install Windows dependencies (WinFsp dev + LLVM)
@@ -79,6 +100,10 @@ jobs:
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
           curl.exe -L -o winfsp.msi https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
           Start-Process msiexec -Wait -ArgumentList '/i','winfsp.msi','/qn','ADDLOCAL=ALL'
+          # Ship the same MSI inside the app so "Set up the virtual drive" can
+          # install the driver without sending the user to a website.
+          New-Item -ItemType Directory -Force app\src-tauri\resources | Out-Null
+          Copy-Item winfsp.msi app\src-tauri\resources\winfsp.msi
 
       - uses: dtolnay/rust-toolchain@stable
         with:

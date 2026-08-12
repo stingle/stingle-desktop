@@ -2956,7 +2956,7 @@ function SettingsView({ session, setSession, showToast }: {
           <DriverSetupDialog
             os={vfs.os}
             error={vfsError}
-            canInstall={vfs.os !== "linux"}
+            canInstall={vfs.installer_bundled}
             onInstall={installDriver}
             onClose={() => { setVfsSetup(false); setVfsError(null); refreshVfs(); }}
           />
@@ -3161,9 +3161,15 @@ function DriverSetupDialog({ os, error, canInstall, onInstall, onClose }: {
       message={
         <div style={{ textAlign: "left" }}>
           {error && (
-            <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
-              The drive couldn't start: {error.split("\n")[0]}
-            </p>
+            <div className="muted" style={{ fontSize: 12, marginTop: 0 }}>
+              The drive couldn't start:
+              {/* Show the driver's message in full — truncating it hides the one
+                  line that says what actually went wrong. */}
+              <pre style={{
+                whiteSpace: "pre-wrap", wordBreak: "break-word", margin: "4px 0 0",
+                fontSize: 11, maxHeight: 120, overflowY: "auto",
+              }}>{error}</pre>
+            </div>
           )}
           <p style={{ marginTop: 0 }}>
             The virtual drive needs a small system component. This is a one-time setup.

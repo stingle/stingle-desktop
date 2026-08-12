@@ -272,6 +272,8 @@ export interface VfsStatus {
   available_letters: string[];
   /** Which platform's setup steps to show. */
   os: "macos" | "windows" | "linux";
+  /** True only when a driver installer really is shipped inside this build. */
+  installer_bundled: boolean;
 }
 
 /** URL for a decrypted thumbnail/original served via the `stingle://` protocol. */

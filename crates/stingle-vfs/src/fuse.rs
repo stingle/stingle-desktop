@@ -195,20 +195,28 @@ impl FuseMount {
         let gid = unsafe { libc::getgid() } as u32;
         let fs = StingleFuse { vfs, uid, gid };
 
-        // `mut` only on macOS, which appends below — declaring it unconditionally
-        // warns on Linux.
-        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        // Mount options are NOT portable: `auto_unmount` is implemented by
+        // libfuse's `fusermount3` helper, which macFUSE does not have, and macFUSE
+        // rejects the mount outright when handed an option it doesn't understand.
+        // So each platform gets only what it actually supports.
         let mut options = vec![
             MountOption::RO,
             MountOption::FSName("Stingle".to_string()),
             // Enforce our 0444/0555 modes in the kernel.
             MountOption::DefaultPermissions,
-            // Unmount if this process dies unexpectedly.
-            MountOption::AutoUnmount,
         ];
-        // macFUSE shows this as the Finder volume name.
+        #[cfg(target_os = "linux")]
+        {
+            // Unmount if this process dies unexpectedly (fusermount3-backed).
+            options.push(MountOption::AutoUnmount);
+        }
         #[cfg(target_os = "macos")]
-        options.push(MountOption::CUSTOM("volname=Stingle".to_string()));
+        {
+            // Finder volume name, and "local" so it appears under Locations
+            // rather than as a network share.
+            options.push(MountOption::CUSTOM("volname=Stingle".to_string()));
+            options.push(MountOption::CUSTOM("local".to_string()));
+        }
 
         let session = fuser::spawn_mount2(fs, &path, &options)?;
         Ok(FuseMount {

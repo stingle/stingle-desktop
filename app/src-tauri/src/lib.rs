@@ -1603,10 +1603,31 @@ struct VfsStatusDto {
     /// `"macos"` / `"windows"` / `"linux"` — lets the setup panel show the right
     /// steps without the frontend guessing from the user agent.
     os: String,
+    /// Whether a driver installer is actually shipped inside this build (see
+    /// `resources/README.md`). False in plain dev/CI builds, so the setup panel
+    /// must not offer an "install the included copy" button that can only fail.
+    installer_bundled: bool,
+}
+
+/// Path of the bundled driver installer for this platform, if the build has one.
+fn bundled_driver_installer(app: &tauri::AppHandle) -> Option<PathBuf> {
+    use tauri::Manager;
+    let name = if cfg!(windows) {
+        "winfsp.msi"
+    } else if cfg!(target_os = "macos") {
+        "macfuse.pkg"
+    } else {
+        return None; // Linux uses the distro's package manager.
+    };
+    let p = app.path().resource_dir().ok()?.join("resources").join(name);
+    p.exists().then_some(p)
 }
 
 #[tauri::command]
-async fn vfs_status(state: State<'_, AppState>) -> CmdResult<VfsStatusDto> {
+async fn vfs_status(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> CmdResult<VfsStatusDto> {
     let enabled = state.config.lock().await.virtual_drive_enabled;
     let mount_point = state.vfs.lock().await.as_ref().map(|(mp, _)| mp.clone());
     // The drive-letter picker is a Windows concept; Unix mounts at a directory.
@@ -1633,6 +1654,7 @@ async fn vfs_status(state: State<'_, AppState>) -> CmdResult<VfsStatusDto> {
             "linux"
         }
         .to_string(),
+        installer_bundled: bundled_driver_installer(&app).is_some(),
     })
 }
 
@@ -1692,40 +1714,23 @@ fn vfs_driver_help(app: tauri::AppHandle, target: String) -> CmdResult<()> {
 /// isn't present this reports that rather than failing silently.
 #[tauri::command]
 async fn vfs_install_driver(app: tauri::AppHandle) -> CmdResult<()> {
-    use tauri::Manager;
-    let res_dir = app.path().resource_dir().map_err(|err| err.to_string())?;
+    let installer = bundled_driver_installer(&app)
+        .ok_or("No driver installer is bundled in this build.")?;
     #[cfg(windows)]
-    {
-        let msi = res_dir.join("resources").join("winfsp.msi");
-        if !msi.exists() {
-            return Err("The WinFsp installer isn't bundled in this build.".into());
-        }
-        std::process::Command::new("msiexec")
-            .arg("/i")
-            .arg(&msi)
-            .arg("/passive")
-            .arg("/norestart")
-            .spawn()
-            .map_err(|err| format!("Couldn't launch the installer: {err}"))?;
-        Ok(())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let pkg = res_dir.join("resources").join("macfuse.pkg");
-        if !pkg.exists() {
-            return Err("The macFUSE installer isn't bundled in this build.".into());
-        }
-        std::process::Command::new("open")
-            .arg(&pkg)
-            .spawn()
-            .map_err(|err| format!("Couldn't launch the installer: {err}"))?;
-        Ok(())
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let _ = res_dir;
-        Err("On Linux, install the 'fuse3' package with your package manager.".into())
-    }
+    let mut cmd = {
+        let mut c = std::process::Command::new("msiexec");
+        c.arg("/i").arg(&installer).arg("/passive").arg("/norestart");
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(&installer);
+        c
+    };
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|err| format!("Couldn't launch the installer: {err}"))
 }
 
 /// Enable + mount the virtual drive. Persists the preference on success.
