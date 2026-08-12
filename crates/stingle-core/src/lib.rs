@@ -15,6 +15,7 @@ pub mod error;
 pub mod fileops;
 pub mod heif;
 pub mod import;
+pub mod info;
 pub mod media;
 pub mod paths;
 pub mod prefetch;
@@ -27,6 +28,7 @@ mod util;
 
 pub use account::{Account, AccountInfo};
 pub use error::{CoreError, Result};
+pub use info::{InfoField, InfoSection, MediaInfo};
 pub use media::{HeaderMeta, MediaResponse, MediaStream};
 pub use sync::Space;
 pub use takeout::{safe_filename, TakeoutStats};

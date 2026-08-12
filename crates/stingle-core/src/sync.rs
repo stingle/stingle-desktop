@@ -329,6 +329,10 @@ impl Account {
         &self,
         progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
     ) -> Result<usize> {
+        // Uploading is the user's own data going out; pause the bulk cache
+        // prefetch so it isn't competing for the same (often much smaller)
+        // upstream bandwidth.
+        let _fg = self.begin_foreground();
         // Build the full work list first so `total` is known before we start.
         let mut work: Vec<(FileSet, DbFile)> = Vec::new();
         for set in [FileSet::Gallery, FileSet::Trash] {

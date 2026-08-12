@@ -128,6 +128,14 @@ pub struct Account {
     pub(crate) stop_originals: std::sync::atomic::AtomicBool,
     /// Cooperative cancellation flag for an in-flight Takeout (decrypt & export).
     pub(crate) stop_takeout: std::sync::atomic::AtomicBool,
+    /// Cooperative cancellation flag for an in-flight "Save" (decrypt selected
+    /// files to a folder).
+    pub(crate) stop_save: std::sync::atomic::AtomicBool,
+    /// Number of user-initiated foreground operations in flight (save, drag-out,
+    /// clipboard copy, upload, takeout). Bulk cache prefetch pauses while this is
+    /// non-zero so the work the user is actually waiting on gets the whole
+    /// connection budget instead of queueing behind a 25k-file backlog.
+    pub(crate) foreground: tokio::sync::watch::Sender<usize>,
     /// Cooperative cancellation flag for an in-flight manual import pass.
     pub(crate) stop_import: std::sync::atomic::AtomicBool,
 }
@@ -227,6 +235,8 @@ impl Account {
             last_cache_check_ms: std::sync::atomic::AtomicI64::new(0),
             stop_originals: std::sync::atomic::AtomicBool::new(false),
             stop_takeout: std::sync::atomic::AtomicBool::new(false),
+            stop_save: std::sync::atomic::AtomicBool::new(false),
+            foreground: tokio::sync::watch::channel(0usize).0,
             stop_import: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -307,6 +317,8 @@ impl Account {
             last_cache_check_ms: std::sync::atomic::AtomicI64::new(0),
             stop_originals: std::sync::atomic::AtomicBool::new(false),
             stop_takeout: std::sync::atomic::AtomicBool::new(false),
+            stop_save: std::sync::atomic::AtomicBool::new(false),
+            foreground: tokio::sync::watch::channel(0usize).0,
             stop_import: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -342,6 +354,8 @@ impl Account {
             last_cache_check_ms: std::sync::atomic::AtomicI64::new(0),
             stop_originals: std::sync::atomic::AtomicBool::new(false),
             stop_takeout: std::sync::atomic::AtomicBool::new(false),
+            stop_save: std::sync::atomic::AtomicBool::new(false),
+            foreground: tokio::sync::watch::channel(0usize).0,
             stop_import: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -395,6 +409,51 @@ impl Account {
         self.stop_takeout
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
+
+    /// Ask an in-flight "Save" (decrypt selected files to a folder) to stop as
+    /// soon as it can. Files already written stay on disk.
+    pub fn request_stop_save(&self) {
+        self.stop_save
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Mark a user-initiated operation as running for as long as the returned
+    /// guard is held. Bulk cache prefetch pauses meanwhile, so a save, drag-out,
+    /// clipboard copy or upload isn't competing with a background backlog for
+    /// bandwidth. Nesting is fine — it's a counter.
+    pub fn begin_foreground(&self) -> ForegroundGuard<'_> {
+        self.foreground.send_modify(|n| *n += 1);
+        ForegroundGuard { tx: &self.foreground }
+    }
+
+    /// Wait until no foreground operation is running. Used by the bulk passes
+    /// between items, so a pause takes effect within one download rather than
+    /// after the whole backlog.
+    pub(crate) async fn await_foreground_idle(&self) {
+        let mut rx = self.foreground.subscribe();
+        // `borrow_and_update` marks the current value seen, so the `changed()`
+        // below can't miss a decrement that lands between the two calls.
+        while *rx.borrow_and_update() > 0 {
+            if rx.changed().await.is_err() {
+                break; // sender gone (account dropped) — don't stall the pass
+            }
+        }
+    }
+}
+
+/// Held for the duration of a user-initiated operation; see
+/// [`Account::begin_foreground`]. Bulk prefetch stays paused until it drops.
+pub struct ForegroundGuard<'a> {
+    tx: &'a tokio::sync::watch::Sender<usize>,
+}
+
+impl Drop for ForegroundGuard<'_> {
+    fn drop(&mut self) {
+        self.tx.send_modify(|n| *n = n.saturating_sub(1));
+    }
+}
+
+impl Account {
 
     /// Ask an in-flight manual import to stop as soon as it can.
     pub fn request_stop_import(&self) {

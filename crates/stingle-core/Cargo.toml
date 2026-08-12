@@ -23,5 +23,7 @@ dirs.workspace = true
 zeroize.workspace = true
 ffmpeg-sidecar = "2"
 futures = "0.3"
+# EXIF parsing for the media-info panel (read-only; never re-encodes).
+kamadak-exif = "0.6"
 
 [dev-dependencies]

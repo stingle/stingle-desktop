@@ -151,6 +151,11 @@ export const api = {
   // File actions
   saveFiles: (set: number, albumId: string | null, filenames: string[], destDir: string) =>
     invoke<number>("save_files", { set, albumId, filenames, destDir }),
+  /** Ask an in-flight save to stop; files already written stay on disk. */
+  cancelSave: () => invoke<void>("cancel_save"),
+  /** Structured metadata (file, storage, image, EXIF) for the info panel. */
+  mediaInfo: (set: number, albumId: string | null, filename: string) =>
+    invoke<MediaInfo>("media_info", { set, albumId, filename }),
   moveToAlbum: (set: number, albumId: string | null, filenames: string[], toAlbum: string, isMoving: boolean) =>
     invoke("move_to_album", { set, albumId, filenames, toAlbum, isMoving }),
   moveToGallery: (albumId: string, filenames: string[], isMoving: boolean) =>
@@ -192,6 +197,8 @@ export const api = {
   setAutoUpdate: (enabled: boolean) => invoke("set_auto_update", { enabled }),
   getConvertHeicOnExport: () => invoke<boolean>("get_convert_heic_on_export"),
   setConvertHeicOnExport: (enabled: boolean) => invoke("set_convert_heic_on_export", { enabled }),
+  getConvertHeicOnSave: () => invoke<boolean>("get_convert_heic_on_save"),
+  setConvertHeicOnSave: (enabled: boolean) => invoke("set_convert_heic_on_save", { enabled }),
   getAppVersion: () => invoke<string>("get_app_version"),
   /** Manual check; resolves to the new version string, or null if up to date. */
   checkForUpdate: () => invoke<string | null>("check_for_update"),
@@ -222,6 +229,26 @@ export const api = {
   /** Launch the bundled driver installer (WinFsp / macFUSE). */
   vfsInstallDriver: () => invoke<void>("vfs_install_driver"),
 };
+
+/** One `label: value` row in the media-info panel. */
+export interface InfoField {
+  label: string;
+  value: string;
+  /** `"epoch_ms"` means `value` is a timestamp to render in the local locale;
+   *  absent means the value is display-ready text. */
+  kind?: string;
+}
+
+/** A titled group of info rows (File, Storage, Camera, Location, …). */
+export interface InfoSection {
+  title: string;
+  fields: InfoField[];
+}
+
+/** Everything known about one item, ready to render. */
+export interface MediaInfo {
+  sections: InfoSection[];
+}
 
 /** Status of the read-only virtual drive (see `vfs_status`). */
 export interface VfsStatus {

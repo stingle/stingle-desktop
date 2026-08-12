@@ -32,6 +32,18 @@ const SYNC_EVERYTHING_INTERVAL_SECS: u64 = 300;
 /// Interval between watch-folder scans.
 const WATCH_INTERVAL_SECS: u64 = 15;
 
+/// Concurrent requests used by the bulk "download all originals" cache pass.
+/// Originals are whole photos/videos, so this was long left at a very
+/// conservative 6 — which made caching a large library crawl, since the account
+/// already allows 48 bulk / 56 total download lanes (and the HTTP pool keeps 64
+/// idle connections). Kept under `MAX_BULK_DOWNLOADS` so on-demand requests
+/// still have reserved lanes, and the pass now yields entirely while the user is
+/// saving / dragging out / uploading.
+const ORIGINALS_CONCURRENCY: usize = 32;
+
+/// Concurrent requests for the bulk thumbnail prefetch (small files).
+const THUMBS_CONCURRENCY: usize = 64;
+
 pub struct AppState {
     /// Directory holding the per-account folders; mutable because the storage
     /// location is a setting. Account dirs live directly under it.
@@ -339,6 +351,7 @@ async fn forget_account(state: State<'_, AppState>, account_key: String) -> CmdR
 
 #[tauri::command]
 async fn register(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     server_url: String,
     email: String,
@@ -353,11 +366,14 @@ async fn register(
     let dto = session_dto(&acc);
     *state.account.lock().await = Some(Arc::new(acc));
     remember_last_account(&state, &key).await;
+    maybe_automount_vfs(&state).await;
+    start_background_loops(app, &state).await;
     Ok(dto)
 }
 
 #[tauri::command]
 async fn login(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     server_url: String,
     email: String,
@@ -372,11 +388,13 @@ async fn login(
     *state.account.lock().await = Some(Arc::new(acc));
     remember_last_account(&state, &key).await;
     maybe_automount_vfs(&state).await;
+    start_background_loops(app, &state).await;
     Ok(dto)
 }
 
 #[tauri::command]
 async fn resume(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_key: String,
     password: String,
@@ -387,6 +405,7 @@ async fn resume(
     *state.account.lock().await = Some(Arc::new(acc));
     remember_last_account(&state, &account_key).await;
     maybe_automount_vfs(&state).await;
+    start_background_loops(app, &state).await;
     Ok(dto)
 }
 
@@ -513,7 +532,7 @@ async fn sync(app: tauri::AppHandle, state: State<'_, AppState>) -> CmdResult<Sy
         let cb = move |done: usize, total: usize| {
             let _ = app_cb.emit("thumbs-progress", (done, total));
         };
-        let n = acc2.download_all_thumbs(64, Some(&cb)).await.unwrap_or(0);
+        let n = acc2.download_all_thumbs(THUMBS_CONCURRENCY, Some(&cb)).await.unwrap_or(0);
         if n > 0 {
             let _ = app2.emit("thumbs-done", n);
         }
@@ -523,7 +542,7 @@ async fn sync(app: tauri::AppHandle, state: State<'_, AppState>) -> CmdResult<Sy
             let cb2 = move |done: usize, total: usize| {
                 let _ = app_cb2.emit("originals-progress", (done, total));
             };
-            let m = acc2.download_all_originals(6, Some(&cb2)).await.unwrap_or(0);
+            let m = acc2.download_all_originals(ORIGINALS_CONCURRENCY, Some(&cb2)).await.unwrap_or(0);
             if m > 0 {
                 let _ = app2.emit("originals-done", m);
             }
@@ -541,7 +560,7 @@ async fn download_thumbs(app: tauri::AppHandle, state: State<'_, AppState>) -> C
     let cb = move |done: usize, total: usize| {
         let _ = app_cb.emit("thumbs-progress", (done, total));
     };
-    let n = acc.download_all_thumbs(64, Some(&cb)).await.map_err(e)?;
+    let n = acc.download_all_thumbs(THUMBS_CONCURRENCY, Some(&cb)).await.map_err(e)?;
     if n > 0 {
         let _ = app.emit("thumbs-done", n);
     }
@@ -870,6 +889,7 @@ async fn recovery_phrase(state: State<'_, AppState>) -> CmdResult<String> {
 
 #[tauri::command]
 async fn recover(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     server_url: String,
     email: String,
@@ -884,6 +904,8 @@ async fn recover(
     let dto = session_dto(&acc);
     *state.account.lock().await = Some(Arc::new(acc));
     remember_last_account(&state, &key).await;
+    maybe_automount_vfs(&state).await;
+    start_background_loops(app, &state).await;
     Ok(dto)
 }
 
@@ -1037,6 +1059,7 @@ async fn clear_cache(state: State<'_, AppState>) -> CmdResult<()> {
 
 #[tauri::command]
 async fn save_files(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     set: i32,
     album_id: Option<String>,
@@ -1044,9 +1067,46 @@ async fn save_files(
     dest_dir: String,
 ) -> CmdResult<usize> {
     let acc = state.current().await.ok_or("Not logged in")?;
-    acc.save_files(set_from_i32(set), album_id.as_deref(), &filenames, &PathBuf::from(dest_dir))
+    let convert_heic = state.config.lock().await.convert_heic_on_save_enabled();
+    let app_cb = app.clone();
+    let cb = move |done: usize, total: usize| {
+        let _ = app_cb.emit("save-progress", (done, total));
+    };
+    let n = acc
+        .save_files(
+            set_from_i32(set),
+            album_id.as_deref(),
+            &filenames,
+            &PathBuf::from(dest_dir),
+            convert_heic,
+            Some(&cb),
+        )
+        .await
+        .map_err(e);
+    let _ = app.emit("save-done", ());
+    n
+}
+
+/// Structured metadata for the viewer's info panel (file, storage, image, EXIF).
+#[tauri::command]
+async fn media_info(
+    state: State<'_, AppState>,
+    set: i32,
+    album_id: Option<String>,
+    filename: String,
+) -> CmdResult<stingle_core::MediaInfo> {
+    let acc = state.current().await.ok_or("Not logged in")?;
+    acc.media_info(set_from_i32(set), album_id.as_deref(), &filename)
         .await
         .map_err(e)
+}
+
+#[tauri::command]
+async fn cancel_save(state: State<'_, AppState>) -> CmdResult<()> {
+    if let Some(acc) = state.current().await {
+        acc.request_stop_save();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1121,7 +1181,7 @@ async fn copy_files_to_clipboard(
     let mut paths = Vec::new();
     for name in &filenames {
         let (bytes, out_name) =
-            export_decrypted(&acc, s, album_id.as_deref(), name, convert_heic).await.map_err(e)?;
+            acc.export_decrypted(s, album_id.as_deref(), name, convert_heic).await.map_err(e)?;
         // `out_name` is header-derived (attacker-controllable) — reduce it to a
         // safe bare filename so it can't escape the temp dir.
         let out = unique_temp(&dir, &stingle_core::safe_filename(&out_name));
@@ -1170,45 +1230,8 @@ async fn paste_from_clipboard(
 /// unchanged. A failed transcode falls back to the untouched original rather
 /// than failing the whole export. The returned name is header-derived and MUST
 /// still be passed through `safe_filename` by the caller before it becomes a path.
-async fn export_decrypted(
-    acc: &Account,
-    s: FileSet,
-    album_id: Option<&str>,
-    name: &str,
-    convert_heic: bool,
-) -> stingle_core::Result<(Vec<u8>, String)> {
-    let plain = acc.get_decrypted(s, album_id, name, false).await?;
-    let orig = acc
-        .original_name(s, album_id, name)
-        .unwrap_or_else(|_| name.to_string());
-    if convert_heic && stingle_core::heif::is_heif(&plain) {
-        let ext = std::path::Path::new(&orig)
-            .extension()
-            .and_then(|x| x.to_str())
-            .unwrap_or("heic")
-            .to_lowercase();
-        // The ffmpeg-backed transcode is blocking and can take a beat on a
-        // full-size photo — run it off the async runtime. On failure the
-        // original HEIC bytes come back out of the closure untouched.
-        let (bytes, converted) = tokio::task::spawn_blocking(move || {
-            match stingle_core::thumbnail::transcode_to_jpeg(&plain, &ext) {
-                Ok(jpg) => (jpg, true),
-                Err(_) => (plain, false),
-            }
-        })
-        .await
-        .map_err(|err| stingle_core::CoreError::Other(format!("transcode task failed: {err}")))?;
-        if converted {
-            let stem = std::path::Path::new(&orig)
-                .file_stem()
-                .and_then(|x| x.to_str())
-                .unwrap_or("image");
-            return Ok((bytes, format!("{stem}.jpg")));
-        }
-        return Ok((bytes, orig));
-    }
-    Ok((plain, orig))
-}
+// The decrypt-and-optionally-transcode helper lives in stingle-core as
+// `Account::export_decrypted`, shared by save, drag-out, and the clipboard.
 
 // ----------------------------- drag-out export -----------------------------
 //
@@ -1302,32 +1325,81 @@ async fn export_for_drag(
     let dir = drag_temp_dir();
     create_private_dir(&dir).map_err(e)?;
 
-    let mut files = Vec::new();
-    for name in &filenames {
-        let (bytes, out_name) =
-            export_decrypted(&acc, s, album_id.as_deref(), name, convert_heic).await.map_err(e)?;
-        let out = unique_temp(&dir, &stingle_core::safe_filename(&out_name));
-        std::fs::write(&out, &bytes).map_err(e)?;
-        files.push(out.to_string_lossy().to_string());
+    // The OS drag can't begin until every file is on disk, so this is squarely on
+    // the user's critical path: decrypt the selection CONCURRENTLY (each item may
+    // download the original and/or run an ffmpeg HEIC transcode — serialized,
+    // that's seconds of dead time before the drag even starts). Bounded so a
+    // large multi-select can't hold every plaintext in memory at once.
+    const MAX_CONCURRENT: usize = 6;
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
+
+    // Each item gets its own numbered subdirectory. `unique_temp` is
+    // check-then-use, which would race under concurrency (two items resolving to
+    // the same path, one clobbering the other and handing the drop target the
+    // wrong bytes); a per-item directory removes the shared namespace entirely
+    // while keeping the real filename the drop target sees.
+    let mut tasks = tokio::task::JoinSet::new();
+    for (i, name) in filenames.iter().cloned().enumerate() {
+        let acc = acc.clone();
+        let album = album_id.clone();
+        let dir = dir.clone();
+        let sem = sem.clone();
+        tasks.spawn(async move {
+            let _permit = sem.acquire().await.map_err(|err| err.to_string())?;
+            let (bytes, out_name) = acc
+                .export_decrypted(s, album.as_deref(), &name, convert_heic)
+                .await
+                .map_err(|err| err.to_string())?;
+            let sub = dir.join(i.to_string());
+            create_private_dir(&sub).map_err(|err| err.to_string())?;
+            let out = sub.join(stingle_core::safe_filename(&out_name));
+            std::fs::write(&out, &bytes).map_err(|err| err.to_string())?;
+            Ok::<(usize, String), String>((i, out.to_string_lossy().to_string()))
+        });
     }
 
-    // Drag preview icon: the first item's (jpeg) thumbnail.
-    let icon = match acc.get_decrypted(s, album_id.as_deref(), &filenames[0], true).await {
-        Ok(thumb) => {
-            let p = unique_temp(&dir, "drag-icon.jpg");
-            let _ = std::fs::write(&p, &thumb);
-            p.to_string_lossy().to_string()
-        }
-        Err(_) => String::new(),
+    // Drag preview icon: the first item's (jpeg) thumbnail, fetched alongside the
+    // originals rather than after them. Usually an in-memory thumb-cache hit.
+    let icon_task = {
+        let acc = acc.clone();
+        let album = album_id.clone();
+        let first = filenames[0].clone();
+        let dir = dir.clone();
+        tokio::spawn(async move {
+            let thumb = acc.get_decrypted(s, album.as_deref(), &first, true).await.ok()?;
+            let p = dir.join("drag-icon.jpg");
+            std::fs::write(&p, &thumb).ok()?;
+            Some(p.to_string_lossy().to_string())
+        })
     };
 
+    // Preserve the caller's order — the drop target lists files in array order.
+    let mut done: Vec<(usize, String)> = Vec::with_capacity(filenames.len());
+    while let Some(joined) = tasks.join_next().await {
+        let res = joined.map_err(|err| format!("drag export task failed: {err}"))?;
+        done.push(res?);
+    }
+    done.sort_by_key(|(i, _)| *i);
+    let files = done.into_iter().map(|(_, p)| p).collect();
+
+    let icon = icon_task.await.ok().flatten().unwrap_or_default();
     Ok(DragExportDto { files, icon })
 }
 
 #[tauri::command]
 fn cleanup_drag_export(paths: Vec<String>) -> CmdResult<()> {
+    let root = drag_temp_dir();
     for p in paths {
-        let _ = std::fs::remove_file(p);
+        let p = PathBuf::from(p);
+        let _ = std::fs::remove_file(&p);
+        // Each item lives in its own numbered subdir (see `export_for_drag`);
+        // drop it once emptied. `remove_dir` is non-recursive and fails harmlessly
+        // if it isn't empty, and the root guard keeps this inside our temp dir.
+        if let Some(parent) = p.parent() {
+            if parent != root && parent.starts_with(&root) {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
     }
     Ok(())
 }
@@ -1649,6 +1721,18 @@ async fn set_convert_heic_on_export(state: State<'_, AppState>, enabled: bool) -
 }
 
 #[tauri::command]
+async fn get_convert_heic_on_save(state: State<'_, AppState>) -> CmdResult<bool> {
+    Ok(state.config.lock().await.convert_heic_on_save_enabled())
+}
+
+#[tauri::command]
+async fn set_convert_heic_on_save(state: State<'_, AppState>, enabled: bool) -> CmdResult<()> {
+    let mut cfg = state.config.lock().await;
+    cfg.convert_heic_on_save = Some(enabled);
+    cfg.save()
+}
+
+#[tauri::command]
 async fn get_auto_update(state: State<'_, AppState>) -> CmdResult<bool> {
     Ok(state.config.lock().await.auto_update.unwrap_or(true))
 }
@@ -1826,7 +1910,10 @@ async fn disable_auto_unlock(state: State<'_, AppState>) -> CmdResult<()> {
 
 /// Attempt to unlock the saved account using the stored key (prompts biometric).
 #[tauri::command]
-async fn try_auto_unlock(state: State<'_, AppState>) -> CmdResult<SessionDto> {
+async fn try_auto_unlock(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> CmdResult<SessionDto> {
     // Already unlocked (e.g. a duplicate call raced in) — don't prompt again.
     if let Some(acc) = state.current().await {
         return Ok(session_dto(&acc));
@@ -1851,6 +1938,7 @@ async fn try_auto_unlock(state: State<'_, AppState>) -> CmdResult<SessionDto> {
     *state.account.lock().await = Some(Arc::new(acc));
     remember_last_account(&state, &blob.account_key).await;
     maybe_automount_vfs(&state).await;
+    start_background_loops(app, &state).await;
     Ok(dto)
 }
 
@@ -1864,10 +1952,6 @@ async fn start_sync_loop(app: tauri::AppHandle, state: &AppState) {
     }
     let app2 = app.clone();
     let handle = tauri::async_runtime::spawn(async move {
-        // The first pass always scans for missing originals (it may be resuming
-        // a backlog after the toggle flipped on); later passes only when the
-        // metadata sync actually changed something.
-        let mut first_pass = true;
         loop {
             if let Some(acc) = app2.state::<AppState>().current().await {
                 let app_up = app2.clone();
@@ -1905,22 +1989,51 @@ async fn start_sync_loop(app: tauri::AppHandle, state: &AppState) {
                         return;
                     }
                 }
-                if first_pass || changes > 0 {
-                    first_pass = false;
-                    let app_cb = app2.clone();
-                    let cb = move |done: usize, total: usize| {
-                        let _ = app_cb.emit("originals-progress", (done, total));
-                    };
-                    let n = acc.download_all_originals(6, Some(&cb)).await.unwrap_or(0);
-                    if n > 0 {
-                        let _ = app2.emit("originals-done", n);
-                    }
+                // Reconcile the originals cache on EVERY pass, not just when this
+                // loop's own metadata pull reported changes. That change count is
+                // not a reliable signal: a manual Sync or the import-triggered
+                // sync can consume the new metadata first, leaving this loop to
+                // see zero and skip the download — so freshly-synced photos would
+                // sit uncached until something else happened to trigger a pass.
+                // Scanning unconditionally also self-heals a backlog left by a
+                // partly-failed pass or a quit mid-download. `download_all_originals`
+                // returns immediately once nothing is missing, and this loop
+                // already does a network metadata sync each tick, so the extra
+                // local scan is not the expensive part.
+                let app_cb = app2.clone();
+                let cb = move |done: usize, total: usize| {
+                    let _ = app_cb.emit("originals-progress", (done, total));
+                };
+                let n = acc.download_all_originals(ORIGINALS_CONCURRENCY, Some(&cb)).await.unwrap_or(0);
+                if n > 0 {
+                    let _ = app2.emit("originals-done", n);
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(SYNC_EVERYTHING_INTERVAL_SECS)).await;
         }
     });
     *guard = Some(handle);
+}
+
+/// (Re)start the background loops that need a live session, per config.
+///
+/// Both starts are no-ops when the loop is already running, so this is safe to
+/// call on every unlock — and it is what brings the loops back after a session
+/// expiry. `handle_session_expired` aborts them when the token dies; without
+/// this, a later re-unlock left "sync everything" and watch folders silently
+/// dead for the rest of the app run, so nothing synced until the user pressed
+/// Sync by hand.
+async fn start_background_loops(app: tauri::AppHandle, state: &AppState) {
+    let (sync_on, has_watch) = {
+        let cfg = state.config.lock().await;
+        (cfg.sync_everything, !cfg.watch_folders.is_empty())
+    };
+    if sync_on {
+        start_sync_loop(app.clone(), state).await;
+    }
+    if has_watch {
+        start_watch_loop(app, state).await;
+    }
 }
 
 /// Stop the background sync loop if running.
@@ -2006,7 +2119,7 @@ async fn start_idle_sync_loop(app: tauri::AppHandle, state: &AppState) {
                 let cb = move |done: usize, total: usize| {
                     let _ = app_cb.emit("thumbs-progress", (done, total));
                 };
-                let n = acc.download_all_thumbs(64, Some(&cb)).await.unwrap_or(0);
+                let n = acc.download_all_thumbs(THUMBS_CONCURRENCY, Some(&cb)).await.unwrap_or(0);
                 if n > 0 {
                     let _ = app2.emit("thumbs-done", n);
                 }
@@ -2618,6 +2731,8 @@ pub fn run() {
             cache_size,
             clear_cache,
             save_files,
+            cancel_save,
+            media_info,
             move_to_album,
             move_to_gallery,
             trash_ctx,
@@ -2631,6 +2746,8 @@ pub fn run() {
             set_auto_update,
             get_convert_heic_on_export,
             set_convert_heic_on_export,
+            get_convert_heic_on_save,
+            set_convert_heic_on_save,
             get_app_version,
             video_server_base,
             pending_update,

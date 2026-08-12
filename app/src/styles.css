@@ -235,6 +235,31 @@ a { color: var(--accent2); cursor: pointer; }
 .viewer .prev { left: 16px; } .viewer .next { right: 16px; }
 .viewer .name { position: absolute; bottom: 16px; left: 0; right: 0; text-align:center; color: var(--muted); }
 
+/* Media info panel (ⓘ in the viewer). A right-hand sheet so the picture stays
+   visible while reading its metadata; scrolls on its own for long EXIF dumps. */
+.info-panel {
+  position: absolute; top: 0; right: 0; bottom: 0; width: min(380px, 92vw);
+  background: rgba(20,20,22,0.97); border-left: 1px solid rgba(255,255,255,0.12);
+  display: flex; flex-direction: column; z-index: 105; text-align: left;
+}
+.info-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 16px; border-bottom: 1px solid rgba(255,255,255,0.1);
+  font-weight: 600; flex: 0 0 auto;
+}
+.info-close { background: none; border: none; font-size: 18px; cursor: pointer; padding: 2px 6px; }
+.info-body { overflow-y: auto; padding: 4px 16px 20px; flex: 1 1 auto; }
+.info-section { margin-top: 16px; }
+.info-section h4 {
+  margin: 0 0 6px; font-size: 12px; text-transform: uppercase;
+  letter-spacing: 0.05em; color: var(--muted);
+}
+.info-section table { width: 100%; border-collapse: collapse; }
+.info-section td { padding: 3px 0; vertical-align: top; font-size: 13px; }
+.info-label { color: var(--muted); width: 45%; padding-right: 10px !important; }
+/* EXIF values can be long single tokens (serials, lens ids) — wrap, don't clip. */
+.info-value { word-break: break-word; }
+
 /* Misc */
 .actionbar { display: flex; gap: 8px; align-items: center; }
 .spinner { display:inline-block; width:14px;height:14px;border:2px solid var(--muted); border-top-color: transparent; border-radius:50%; animation: spin 0.7s linear infinite; }

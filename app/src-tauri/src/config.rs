@@ -69,6 +69,11 @@ pub struct AppConfig {
     /// `Some(false)` hands over the untouched original. Tri-state like
     /// `auto_update` so an old config file without the field still defaults on.
     pub convert_heic_on_export: Option<bool>,
+    /// Convert HEIC/HEIF photos to JPEG when SAVING them to a folder ("Save" /
+    /// decrypt-and-export). Separate from `convert_heic_on_export` (drag/copy)
+    /// because saving is often an archival copy where the untouched original is
+    /// wanted. `None` defaults to enabled, tri-state like the fields above.
+    pub convert_heic_on_save: Option<bool>,
     /// Continuously sync & download all originals in the background.
     pub sync_everything: bool,
     /// Periodically run a background sync while the app is idle. `None` defaults
@@ -149,6 +154,11 @@ impl AppConfig {
     /// Whether HEIC/HEIF is converted to JPEG on drag/copy export (defaults on).
     pub fn convert_heic_on_export_enabled(&self) -> bool {
         self.convert_heic_on_export.unwrap_or(true)
+    }
+
+    /// Whether HEIC/HEIF is converted to JPEG when saving to a folder (on).
+    pub fn convert_heic_on_save_enabled(&self) -> bool {
+        self.convert_heic_on_save.unwrap_or(true)
     }
 
     /// The effective idle-sync interval in seconds: the configured value clamped
