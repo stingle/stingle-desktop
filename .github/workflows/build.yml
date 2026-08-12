@@ -17,10 +17,19 @@ jobs:
         include:
           - platform: windows-latest
             features: vfs-winfsp
+            rust-targets: ""
+            extra-args: ""
           - platform: ubuntu-22.04
             features: vfs-fuse
+            rust-targets: ""
+            extra-args: ""
+          # `macos-latest` runners are Apple Silicon, so a plain build is
+          # arm64-ONLY and won't launch on an Intel Mac. Build a universal
+          # binary like release.yml does.
           - platform: macos-latest
             features: vfs-fuse
+            rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+            extra-args: "--target universal-apple-darwin"
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v7
@@ -54,6 +63,8 @@ jobs:
           Start-Process msiexec -Wait -ArgumentList '/i','winfsp.msi','/qn','ADDLOCAL=ALL'
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -79,15 +90,17 @@ jobs:
         uses: tauri-apps/tauri-action@v1
         with:
           projectPath: app
-          args: "--features ${{ matrix.features }} --config src-tauri/tauri.ci-build.conf.json"
+          args: "--features ${{ matrix.features }} --config src-tauri/tauri.ci-build.conf.json ${{ matrix.extra-args }}"
 
       # Installers land under <target>/release/bundle. The cargo workspace root
-      # is the repo root, so target/ is there; the second glob is a safety net.
+      # is the repo root, so target/ is there; a `--target` build nests under
+      # that triple instead. The last glob is a safety net.
       - name: Upload bundles
         uses: actions/upload-artifact@v4
         with:
           name: stingle-${{ matrix.platform }}
           path: |
             target/release/bundle/**
+            target/universal-apple-darwin/release/bundle/**
             app/src-tauri/target/release/bundle/**
           if-no-files-found: warn
