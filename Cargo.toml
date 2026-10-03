@@ -35,10 +35,10 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Media / platform
 image = "0.25"
-dirs = "6"
+dirs = "7"
 
 # Encoding / errors / logging
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"
 thiserror = "2"
 anyhow = "1"

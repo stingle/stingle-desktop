@@ -29,7 +29,7 @@ windows = { version = "0.62", optional = true, features = [
     "Win32_UI_Shell",
 ] }
 # Per-user DriveIcons registry key so the mounted drive shows the app icon.
-windows-registry = { version = "0.6", optional = true }
+windows-registry = { version = "0.100", optional = true }
 
 [features]
 default = []
